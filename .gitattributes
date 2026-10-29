@@ -1,0 +1,11 @@
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.wasm binary
+*.ttf binary
+*.woff binary
+# Preserve upstream source and license bytes, including their whitespace.
+vendor/momor/** -text -whitespace
+assets/licenses/** -text -whitespace
+assets/momor/icons/LICENSES -text -whitespace
+tests/reference/** -text -whitespace

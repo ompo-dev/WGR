@@ -1,0 +1,1 @@
+{"title":"Órbita","description":"Um pequeno jogo original de luzes e movimento. WebAssembly, Worker, Canvas, áudio e save local. Incluído para testar o WGR sem internet.","entry_url":"index.html","version":"1.0.0","requirements":{"webgpu":false,"shared_array_buffer":false,"wasm_memory64":false}}

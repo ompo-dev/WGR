@@ -1,0 +1,1 @@
+class OrbitTone extends AudioWorkletProcessor{constructor(){super();this.phase=0;}process(_,outputs){for(const channel of outputs[0])for(let i=0;i<channel.length;i++){channel[i]=Math.sin(this.phase)*.05;this.phase+=2*Math.PI*440/sampleRate;}return true;}}registerProcessor('orbit-tone',OrbitTone);

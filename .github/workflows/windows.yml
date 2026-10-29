@@ -1,0 +1,33 @@
+name: Windows
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Checks, tests, release and real WebView2 smoke
+        shell: pwsh
+        run: ./scripts/Validate.ps1
+      - name: Package portable
+        shell: pwsh
+        run: ./scripts/Package.ps1 -SkipBuild
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: WGR-Windows-evidence
+          path: |
+            artifacts/*.json
+            artifacts/*.png
+            artifacts/*.log
+            dist/*.zip
+            dist/*.sha256

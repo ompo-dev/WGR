@@ -1,0 +1,34 @@
+[package]
+name = "wgr-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+thiserror = "2.0.17"
+rusqlite = { version = "0.37.0", features = ["bundled", "backup"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls", "http2", "json", "stream"] }
+url = "2.5.7"
+sha2 = "0.10.9"
+sha1 = "0.10.6"
+flate2 = "1.1.5"
+miniz_oxide = "0.8.9"
+crc32fast = "1.5.0"
+zip = { version = "6.0.0", default-features = false, features = ["deflate"] }
+percent-encoding = "2.3.2"
+futures-util = "0.3.31"
+async-trait = "0.1.89"
+base64 = "0.22.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Security_Credentials", "Win32_Foundation"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"
+axum = "0.8.6"

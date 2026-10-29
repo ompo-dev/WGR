@@ -1,0 +1,1177 @@
+{
+  "mode": "dry-run",
+  "source_commit": "db7fcb1b6f590cdf0ba1d5323db2cac6b25f56ae",
+  "source_root": "C:\\Users\\maico\\OneDrive\\Documents\\GitHub\\MomorRust",
+  "destination_root": "C:\\Users\\maico\\OneDrive\\Documents\\GitHub\\WGR\\vendor\\momor",
+  "operations": [
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/Cargo.toml",
+      "target": "vendor/momor/crates/ui/Cargo.toml",
+      "sha256": "f1f66180471cb610ec1435a0a432932e3e66e810aea6d9ff062a9a64be145bfa",
+      "bytes": 780
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/LICENSE-GPL",
+      "target": "vendor/momor/crates/ui/LICENSE-GPL",
+      "sha256": "14bf4ab95059f55c914355e0fb9c7840f9af74135faf104f9ed8b1efcce4d060",
+      "bytes": 17
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/component_prelude.rs",
+      "target": "vendor/momor/crates/ui/src/component_prelude.rs",
+      "sha256": "1ec271b83b3554f0db771b11f04fc1b44f7c58fbef332325f25b681aa27f40d3",
+      "bytes": 222
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components.rs",
+      "target": "vendor/momor/crates/ui/src/components.rs",
+      "sha256": "8b3d1766ce542c35d0cfb03074b4b1ba23b4ee4b03dccae1fece0239286a0c7a",
+      "bytes": 1573
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/prelude.rs",
+      "target": "vendor/momor/crates/ui/src/prelude.rs",
+      "sha256": "bc9f9b392ba72e8d39d2dcf7f1bff44407890d0441c9c7dba028ced7b1c734ce",
+      "bytes": 1463
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/styles.rs",
+      "target": "vendor/momor/crates/ui/src/styles.rs",
+      "sha256": "ffc361a4212b8dce0e8fdcaffc21befc85b91e6dc1b3e74cb0ee14d3284ea341",
+      "bytes": 314
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/traits.rs",
+      "target": "vendor/momor/crates/ui/src/traits.rs",
+      "sha256": "95454438e624bf6fd56c0dcdf26e752b757a88ba4cea5c188b0db56312345007",
+      "bytes": 175
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/ui.rs",
+      "target": "vendor/momor/crates/ui/src/ui.rs",
+      "sha256": "06348af410edc3cbbac7c0eb7c083ce1b4a7a3279e06f609c62847e1768a966c",
+      "bytes": 526
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/utils.rs",
+      "target": "vendor/momor/crates/ui/src/utils.rs",
+      "sha256": "b8dd39c653a03f83182b27826e2359edd08ee8c8aaccf56deddaaf8afd59b004",
+      "bytes": 1596
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/ai.rs",
+      "target": "vendor/momor/crates/ui/src/components/ai.rs",
+      "sha256": "504cc47631e9b5cec4e7257a16eb00bbd5a2834cc2f89c2693d3ee3ac6a1d83f",
+      "bytes": 289
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/avatar.rs",
+      "target": "vendor/momor/crates/ui/src/components/avatar.rs",
+      "sha256": "8c95fa968fbbc85efa722851916fde2926a5e7763b839bc623b976455ce25e10",
+      "bytes": 11205
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/banner.rs",
+      "target": "vendor/momor/crates/ui/src/components/banner.rs",
+      "sha256": "7a7d49082ecf4f922921f1dc07bd8f54aa52730f27c268afcd78ef744bd46e2c",
+      "bytes": 6320
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/button.rs",
+      "target": "vendor/momor/crates/ui/src/components/button.rs",
+      "sha256": "4e57d185a01d8c538e27b4748a7c0b8556dd73b5825b9e9025e7c05ddcf4c601",
+      "bytes": 299
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/callout.rs",
+      "target": "vendor/momor/crates/ui/src/components/callout.rs",
+      "sha256": "298e459ffacc9e83b3211b386f12946b17653ba017f061dd9806d77e273f5a95",
+      "bytes": 14144
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/chip.rs",
+      "target": "vendor/momor/crates/ui/src/components/chip.rs",
+      "sha256": "0995f1e5d40b16312a9b60ceec00bcd53fbacce5612cc0a210d0faa80a338f37",
+      "bytes": 5123
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/collab.rs",
+      "target": "vendor/momor/crates/ui/src/components/collab.rs",
+      "sha256": "99ee608401d1541352df0cf679cb335057fbf903c1058d11f930eff8f0f5ee17",
+      "bytes": 108
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/context_menu.rs",
+      "target": "vendor/momor/crates/ui/src/components/context_menu.rs",
+      "sha256": "e8d1b66185527db0b46429e7a0a50a332904372b3130b16242c0bf6eb7ad9a89",
+      "bytes": 92662
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/count_badge.rs",
+      "target": "vendor/momor/crates/ui/src/components/count_badge.rs",
+      "sha256": "548d5b27dd1e0cff86265b9c3279f9bbf0c708bb0fc5740e3511e99e970bfa63",
+      "bytes": 2618
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/data_table.rs",
+      "target": "vendor/momor/crates/ui/src/components/data_table.rs",
+      "sha256": "fab2417ed1c203ce4ac6f73245e0526201ba7b8ddc7ec2942455ff81c7419877",
+      "bytes": 42708
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/diff_stat.rs",
+      "target": "vendor/momor/crates/ui/src/components/diff_stat.rs",
+      "sha256": "30b1460e8b8df4f2f8001c41545655037164eddf1ed384dbbeadc4a70b90b05f",
+      "bytes": 2373
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/disclosure.rs",
+      "target": "vendor/momor/crates/ui/src/components/disclosure.rs",
+      "sha256": "c07568bb5d600d6e17fb82614d8aac3ae778f13e0fbdb6e3b13113cba184fef8",
+      "bytes": 4710
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/divider.rs",
+      "target": "vendor/momor/crates/ui/src/components/divider.rs",
+      "sha256": "94134891a335db58f32c0c9675472bb5a0e7c20315eb4cc5e7b038b00226d8c4",
+      "bytes": 8451
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/dropdown_menu.rs",
+      "target": "vendor/momor/crates/ui/src/components/dropdown_menu.rs",
+      "sha256": "813ed27d17ef8ef219a83ee86ae2906962bc0429c10253e7b252edbbfe0b9d00",
+      "bytes": 11912
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/facepile.rs",
+      "target": "vendor/momor/crates/ui/src/components/facepile.rs",
+      "sha256": "4e829ebfd69e1a0659ec4d785f1f15ef3c6e6d04e4f6f86053509321094e635c",
+      "bytes": 4302
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/gradient_fade.rs",
+      "target": "vendor/momor/crates/ui/src/components/gradient_fade.rs",
+      "sha256": "ee86d9c24968e18dcfc48936a5f556dc539f15441686bf2f00a1a6b370112a93",
+      "bytes": 2814
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/group.rs",
+      "target": "vendor/momor/crates/ui/src/components/group.rs",
+      "sha256": "5175302fa763669c4409742ce941d43b63449a3a0493e732e1ce433e3e993f34",
+      "bytes": 1257
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/icon.rs",
+      "target": "vendor/momor/crates/ui/src/components/icon.rs",
+      "sha256": "117b1f2e1839ce92cb08a360389355450a904de277fb1c849189c51271a229b0",
+      "bytes": 11356
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/image.rs",
+      "target": "vendor/momor/crates/ui/src/components/image.rs",
+      "sha256": "229c02f806f822de982ac23f37e1b056f2e859aae43f923e88296313a98f7b79",
+      "bytes": 5793
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/indent_guides.rs",
+      "target": "vendor/momor/crates/ui/src/components/indent_guides.rs",
+      "sha256": "fb361cd85953b53944e6b4262e1ba1764e95156f1a49ccb76057b71a8f90e436",
+      "bytes": 20953
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/indicator.rs",
+      "target": "vendor/momor/crates/ui/src/components/indicator.rs",
+      "sha256": "e1e843428ab4af69001b4c73f181e1ce4842ee18ba3f349f32786558e592955f",
+      "bytes": 6221
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/keybinding_hint.rs",
+      "target": "vendor/momor/crates/ui/src/components/keybinding_hint.rs",
+      "sha256": "5534d79f83c47233b5b157161cd710a5f77f1777e58469cf819685e528b56bad",
+      "bytes": 11652
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/keybinding.rs",
+      "target": "vendor/momor/crates/ui/src/components/keybinding.rs",
+      "sha256": "d1b6fbc2b43d1ff5d43ca74148c6b193d48e52665cdf6a15410cc7492e3bf8e3",
+      "bytes": 24162
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/label.rs",
+      "target": "vendor/momor/crates/ui/src/components/label.rs",
+      "sha256": "05ae4b73781f63354ed9ae9adeec5c2b5fd860f767ca764452acfac831caf660",
+      "bytes": 223
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/list.rs",
+      "target": "vendor/momor/crates/ui/src/components/list.rs",
+      "sha256": "c35cfe3067a2d02dc6e68bc84dcba67867c479e4c7e445473f44e80b1ccc23c6",
+      "bytes": 266
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/modal.rs",
+      "target": "vendor/momor/crates/ui/src/components/modal.rs",
+      "sha256": "398b81b96a5aa3d75e590952f760f154eff532ad9631d736aade7370506decdb",
+      "bytes": 14036
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/navigable.rs",
+      "target": "vendor/momor/crates/ui/src/components/navigable.rs",
+      "sha256": "67877d06a3657d2330cfd80b430b272458022acc5d731b36f81f9d08c573158d",
+      "bytes": 3682
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/notification.rs",
+      "target": "vendor/momor/crates/ui/src/components/notification.rs",
+      "sha256": "5e2c59f0983ac0a7b0cbb49bcffcb9d02cf7a53ca68bef6e722bd36edbb74268",
+      "bytes": 102
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/popover_menu.rs",
+      "target": "vendor/momor/crates/ui/src/components/popover_menu.rs",
+      "sha256": "6ac1dce1e884fddb94e13fee731178d80ad24e6aead8ec6aaf85a8f20c61ec76",
+      "bytes": 19800
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/popover.rs",
+      "target": "vendor/momor/crates/ui/src/components/popover.rs",
+      "sha256": "bb946031094176b4bcb1cdd4707baec5a9d3e0f2bcb353aecd5f71308a40ea76",
+      "bytes": 3023
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/progress.rs",
+      "target": "vendor/momor/crates/ui/src/components/progress.rs",
+      "sha256": "b2bc455efb7357612ca6bcd9dc36f5365d90fd72ead7145e5cbaeda9c5953979",
+      "bytes": 102
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/redistributable_columns.rs",
+      "target": "vendor/momor/crates/ui/src/components/redistributable_columns.rs",
+      "sha256": "b5d07c068a396bde843d21719f593fcc9e51948a64224809658df3c41298a46e",
+      "bytes": 19753
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/right_click_menu.rs",
+      "target": "vendor/momor/crates/ui/src/components/right_click_menu.rs",
+      "sha256": "35224f4442d288e6805b1638e945cdb8e6c3eb9ce6effa8f55109a1fee47cb71",
+      "bytes": 10668
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/scrollbar.rs",
+      "target": "vendor/momor/crates/ui/src/components/scrollbar.rs",
+      "sha256": "ef4b2883e72177d766d7d8c021267361d976c5100d6c078f1d79799f07e44b77",
+      "bytes": 54047
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/stack.rs",
+      "target": "vendor/momor/crates/ui/src/components/stack.rs",
+      "sha256": "a5038640fb2da210b89851679237560a93aa05c4be48168633ed490970d78f5d",
+      "bytes": 326
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/sticky_items.rs",
+      "target": "vendor/momor/crates/ui/src/components/sticky_items.rs",
+      "sha256": "a0b4e2b63ba06b40cdd36e40b898de0e04abd38f7270ec22f831e20668b94d43",
+      "bytes": 11439
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/stories.rs",
+      "target": "vendor/momor/crates/ui/src/components/stories.rs",
+      "sha256": "af6f3e324e9459a69e187d248c0916ef1517c391f9e23b7655d81dbaccf7c099",
+      "bytes": 47
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/tab_bar.rs",
+      "target": "vendor/momor/crates/ui/src/components/tab_bar.rs",
+      "sha256": "c9ad547d7fbb245f806026476bb76e375a3ee7eeb5e075e076323e33b7dd08aa",
+      "bytes": 6862
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/tab.rs",
+      "target": "vendor/momor/crates/ui/src/components/tab.rs",
+      "sha256": "ed5b8e5ffa4b3be0d5bb48f3a4021dc7b730f1d64b79ff64d852b6a200b30016",
+      "bytes": 7879
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/toggle.rs",
+      "target": "vendor/momor/crates/ui/src/components/toggle.rs",
+      "sha256": "f8c65ef4fd395a0ef92a3b424a298a3e0d865456d01579b2955d62a037af1fe1",
+      "bytes": 41043
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/tooltip.rs",
+      "target": "vendor/momor/crates/ui/src/components/tooltip.rs",
+      "sha256": "e34f3a106f4a512df182e7aa2c69a45eaffe8a9fb22bbe8b90effa1a3c78dc79",
+      "bytes": 8895
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/tree_view_item.rs",
+      "target": "vendor/momor/crates/ui/src/components/tree_view_item.rs",
+      "sha256": "c0e5f1acdd074466254f1b1ddaf70607444ae3933793ac39076d0e008e0b4870",
+      "bytes": 11118
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/ai/agent_setup_button.rs",
+      "target": "vendor/momor/crates/ui/src/components/ai/agent_setup_button.rs",
+      "sha256": "a010dc86e1c0942231885e0b95bbde504be1ce8ea7da5a59a9fe332ef11540bf",
+      "bytes": 3364
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/ai/ai_setting_item.rs",
+      "target": "vendor/momor/crates/ui/src/components/ai/ai_setting_item.rs",
+      "sha256": "298327825a397ff7581b2df761c87d57e9ad03c287b46133de0d70e9ca3d01d6",
+      "bytes": 14525
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/ai/configured_api_card.rs",
+      "target": "vendor/momor/crates/ui/src/components/ai/configured_api_card.rs",
+      "sha256": "e3a9495e839b32d0f9963e267b0618acc81f9265820e2493c29b7d9049598680",
+      "bytes": 5027
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/ai/parallel_agents_illustration.rs",
+      "target": "vendor/momor/crates/ui/src/components/ai/parallel_agents_illustration.rs",
+      "sha256": "abf2e58f1c3271f912e743caf816e19a4d196c393367964170e5d4325204a28b",
+      "bytes": 10225
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/ai/thread_item.rs",
+      "target": "vendor/momor/crates/ui/src/components/ai/thread_item.rs",
+      "sha256": "45858c760b7a2443534b78d06f298ee78cf97173c3a362ce18416af9830beeb7",
+      "bytes": 39054
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/button/button_like.rs",
+      "target": "vendor/momor/crates/ui/src/components/button/button_like.rs",
+      "sha256": "3e6d19f42fe4be24d2500d9d7c4adc5c57ffb364d90e4093c4fccf3072edf831",
+      "bytes": 33812
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/button/button_link.rs",
+      "target": "vendor/momor/crates/ui/src/components/button/button_link.rs",
+      "sha256": "67cbb079bdecc96ed43bdadf21ea072a7f2ac96fa94d057107e52eb86d7a875c",
+      "bytes": 2988
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/button/button.rs",
+      "target": "vendor/momor/crates/ui/src/components/button/button.rs",
+      "sha256": "938a2b5b5db6e99d7d1557d25e6941b34c023379bda93f853d578488dcdc5f9c",
+      "bytes": 20582
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/button/copy_button.rs",
+      "target": "vendor/momor/crates/ui/src/components/button/copy_button.rs",
+      "sha256": "75d09731c52cb6bb3e9783b24b3fae099dbdace53cbb2af418616ad15e22f7e2",
+      "bytes": 6599
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/button/icon_button.rs",
+      "target": "vendor/momor/crates/ui/src/components/button/icon_button.rs",
+      "sha256": "dc3d1e17325f4aa25de58668cb12b3f2ea7de5c2053681e912f2e01a97416f55",
+      "bytes": 15065
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/button/split_button.rs",
+      "target": "vendor/momor/crates/ui/src/components/button/split_button.rs",
+      "sha256": "dd4186f0f25c832b5c42f8431e9108ebec2c707efc8af96b5991fc223dfe4535",
+      "bytes": 3132
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/button/toggle_button.rs",
+      "target": "vendor/momor/crates/ui/src/components/button/toggle_button.rs",
+      "sha256": "f6ba24bbb1f66e4ffdb26c7f1d830a41fa7449f9d56383dc18cfa4b5b3890248",
+      "bytes": 32048
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/collab/collab_notification.rs",
+      "target": "vendor/momor/crates/ui/src/components/collab/collab_notification.rs",
+      "sha256": "f6a30c5d633a51cdd5816012debca0663bc2aeb91998568a9ab85dd2ca1d264f",
+      "bytes": 6647
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/collab/update_button.rs",
+      "target": "vendor/momor/crates/ui/src/components/collab/update_button.rs",
+      "sha256": "633b275e863521be3ed8d217ea219c9b50d677e4f2aae22d9d679722e236a782",
+      "bytes": 7019
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/data_table/table_row.rs",
+      "target": "vendor/momor/crates/ui/src/components/data_table/table_row.rs",
+      "sha256": "47e8ac0217f74959f58e895066254519302da04662794ea86a297a5dc0da4837",
+      "bytes": 7290
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/data_table/tests.rs",
+      "target": "vendor/momor/crates/ui/src/components/data_table/tests.rs",
+      "sha256": "9c0e4ffcce94eebdcae747aa8322f565d03e0059016048c4cde7dc43bd314902",
+      "bytes": 10560
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/icon/decorated_icon.rs",
+      "target": "vendor/momor/crates/ui/src/components/icon/decorated_icon.rs",
+      "sha256": "374532f7e977acf6934beb2ed60b34749eb84e03f8f3de3a71c2f39dee6babac",
+      "bytes": 3441
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/icon/icon_decoration.rs",
+      "target": "vendor/momor/crates/ui/src/components/icon/icon_decoration.rs",
+      "sha256": "f1ca27afb569b5f4a8a996686b6fd3f0ec4b41bc27ef8aea1f354c94b92af2bf",
+      "bytes": 4764
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/label/highlighted_label.rs",
+      "target": "vendor/momor/crates/ui/src/components/label/highlighted_label.rs",
+      "sha256": "405cc5a18a2ba369d803cf6e15010138a92529f6dadeb4342b63ff2307674b21",
+      "bytes": 9862
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/label/label_like.rs",
+      "target": "vendor/momor/crates/ui/src/components/label/label_like.rs",
+      "sha256": "4162cc7e4a38c10f286b264fd2d8a34ac2ef0617535ee82ad9253c9ec229a4e7",
+      "bytes": 11666
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/label/label.rs",
+      "target": "vendor/momor/crates/ui/src/components/label/label.rs",
+      "sha256": "5a69538dfb9bea67b63097502242e4fe7581c68751779e1f2287a2a6be8e0da5",
+      "bytes": 13279
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/label/loading_label.rs",
+      "target": "vendor/momor/crates/ui/src/components/label/loading_label.rs",
+      "sha256": "9e65c6dcca7bb4234881383377da2f810884fda7ee1cc4fbd581dd6974b9d8ba",
+      "bytes": 3153
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/label/spinner_label.rs",
+      "target": "vendor/momor/crates/ui/src/components/label/spinner_label.rs",
+      "sha256": "57a862a423d0e00809fe37953e5a041448db7547768cdc44f11732e352f406be",
+      "bytes": 5613
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/list/list_bullet_item.rs",
+      "target": "vendor/momor/crates/ui/src/components/list/list_bullet_item.rs",
+      "sha256": "b2264a698d3c671221a5eea31b1e88a7d3f30a7d84b2f7780795db19ae64c350",
+      "bytes": 3884
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/list/list_header.rs",
+      "target": "vendor/momor/crates/ui/src/components/list/list_header.rs",
+      "sha256": "5d5f13a3bad9ea62c3539b7ea060af33f8460359038767503be4e479151a9ff8",
+      "bytes": 8380
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/list/list_item.rs",
+      "target": "vendor/momor/crates/ui/src/components/list/list_item.rs",
+      "sha256": "125cd989133bc43fe42cd0b0812d7e32984d9724464151925a2a76028e67dca6",
+      "bytes": 19392
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/list/list_separator.rs",
+      "target": "vendor/momor/crates/ui/src/components/list/list_separator.rs",
+      "sha256": "a284e8664b641580c9a197efc318637019f4ea548dfe4ca96db0eae446a7afeb",
+      "bytes": 367
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/list/list_sub_header.rs",
+      "target": "vendor/momor/crates/ui/src/components/list/list_sub_header.rs",
+      "sha256": "13d152095c8c62c2c10a470600a768120e3488e9eb476a48e39a8ad47b49f6e2",
+      "bytes": 5152
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/list/list.rs",
+      "target": "vendor/momor/crates/ui/src/components/list/list.rs",
+      "sha256": "952f35b5097428ac87f7e83ac47073723701a0a0d46b724c6f225a831396fafd",
+      "bytes": 4521
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/notification/alert_modal.rs",
+      "target": "vendor/momor/crates/ui/src/components/notification/alert_modal.rs",
+      "sha256": "f4c441c93a9ab120f363a07bcd436079dd2b28eba7382096eff1226eb2de9ad5",
+      "bytes": 9529
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/notification/announcement_toast.rs",
+      "target": "vendor/momor/crates/ui/src/components/notification/announcement_toast.rs",
+      "sha256": "b5e687608de34221467fa77821545c293722695e3289e51a4c48f5a52c35880d",
+      "bytes": 7412
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/progress/circular_progress.rs",
+      "target": "vendor/momor/crates/ui/src/components/progress/circular_progress.rs",
+      "sha256": "072ea1328729dceb25fe6a87cd7ff590b8b5142988852ee7044f789e666739a9",
+      "bytes": 8168
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/components/progress/progress_bar.rs",
+      "target": "vendor/momor/crates/ui/src/components/progress/progress_bar.rs",
+      "sha256": "38edd3e233f3f268f5abc4f7982542dd4c14ce1010091b680b12e34737ca3662",
+      "bytes": 4737
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/styles/animation.rs",
+      "target": "vendor/momor/crates/ui/src/styles/animation.rs",
+      "sha256": "f736b777c8c48a7c0a2cc1c6851d2e7d049cd61f9fa04b46912e54b271bf4a84",
+      "bytes": 11758
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/styles/appearance.rs",
+      "target": "vendor/momor/crates/ui/src/styles/appearance.rs",
+      "sha256": "4037db77c08da624824a61f612d274c87eda58d7d9d0c92b760fbc1f7242f597",
+      "bytes": 622
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/styles/color.rs",
+      "target": "vendor/momor/crates/ui/src/styles/color.rs",
+      "sha256": "33b83e4adc211e9810ba8e5fdd6a191dd36a3879f6371d4c303891b806035c2c",
+      "bytes": 11216
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/styles/elevation.rs",
+      "target": "vendor/momor/crates/ui/src/styles/elevation.rs",
+      "sha256": "edbc1938b8a0b625692ce528916e513092e591f7edb139fd8ce1e28fa81be754",
+      "bytes": 5704
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/styles/platform.rs",
+      "target": "vendor/momor/crates/ui/src/styles/platform.rs",
+      "sha256": "633f6fe33583b1a0a07fe733fec44e8b96ef782b6e7e21e1a70cc912d6a485e8",
+      "bytes": 710
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/styles/severity.rs",
+      "target": "vendor/momor/crates/ui/src/styles/severity.rs",
+      "sha256": "597692fe77b87ea909dc7979bcce1128b0214302bdda93f6fb636798efede67f",
+      "bytes": 312
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/styles/spacing.rs",
+      "target": "vendor/momor/crates/ui/src/styles/spacing.rs",
+      "sha256": "512514395cd2af0a9345c546739d106b1bc7b152bb6b2f3524fc130c463cc562",
+      "bytes": 1512
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/styles/typography.rs",
+      "target": "vendor/momor/crates/ui/src/styles/typography.rs",
+      "sha256": "8802ff527d4ad70525b92a8da0e785809e751777708345776cc4d05cd1540fd4",
+      "bytes": 9526
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/styles/units.rs",
+      "target": "vendor/momor/crates/ui/src/styles/units.rs",
+      "sha256": "7034e2f2c0dda2ced667244c0d1e5a0642ab8dae55076377c3bbf3aefe8f1bfb",
+      "bytes": 1107
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/traits/animation_ext.rs",
+      "target": "vendor/momor/crates/ui/src/traits/animation_ext.rs",
+      "sha256": "988d2768087de3f84759c8614a913564753d332a1ae809cfcf35ccb8aa634119",
+      "bytes": 1564
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/traits/clickable.rs",
+      "target": "vendor/momor/crates/ui/src/traits/clickable.rs",
+      "sha256": "fe88d07e41c1adb8e7822fbcc80de1ed20177e6a2da34763e1c630337169015b",
+      "bytes": 470
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/traits/disableable.rs",
+      "target": "vendor/momor/crates/ui/src/traits/disableable.rs",
+      "sha256": "a3830d0237be2956d5e70949e16ee9dcf2761ad075d884bff1c63d23640099df",
+      "bytes": 296
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/traits/fixed.rs",
+      "target": "vendor/momor/crates/ui/src/traits/fixed.rs",
+      "sha256": "6ca0c38f5699e26bb70c085e6ea8e402caf731848c5719bd78b9e2ab83aca881",
+      "bytes": 376
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/traits/styled_ext.rs",
+      "target": "vendor/momor/crates/ui/src/traits/styled_ext.rs",
+      "sha256": "45fcb97a64e2815a706703b3b90e8aec58ef5fb8d37464c4bab7904c3eb51346",
+      "bytes": 5377
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/traits/toggleable.rs",
+      "target": "vendor/momor/crates/ui/src/traits/toggleable.rs",
+      "sha256": "b431f4d7a0173746410e4544cde79f1676045e3d1a033709c307da6e625f12e4",
+      "bytes": 2079
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/traits/transformable.rs",
+      "target": "vendor/momor/crates/ui/src/traits/transformable.rs",
+      "sha256": "7b867779a92395fc799d095c5b4062a7bf3e7c8b9c42a3b0a222455612ccf4de",
+      "bytes": 227
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/traits/visible_on_hover.rs",
+      "target": "vendor/momor/crates/ui/src/traits/visible_on_hover.rs",
+      "sha256": "aa3750e94859771b6ed92a17742235f6e6e0e96c657c4963d0cf049376a8f735",
+      "bytes": 655
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/utils/apca_contrast.rs",
+      "target": "vendor/momor/crates/ui/src/utils/apca_contrast.rs",
+      "sha256": "4a8cc832ca9b22a2236f543bcf861de8dab37d488f1de910c1514f37a9b5193a",
+      "bytes": 15020
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/utils/color_contrast.rs",
+      "target": "vendor/momor/crates/ui/src/utils/color_contrast.rs",
+      "sha256": "62978f178f4f5b75dbb94374474639dfedbb95f497d46f7a24c0484f523a2ee5",
+      "bytes": 2475
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/utils/constants.rs",
+      "target": "vendor/momor/crates/ui/src/utils/constants.rs",
+      "sha256": "d2e67ee6471c956e1205da7b4dc5fa778fdb2aa624cf7be854789e76baaba8d1",
+      "bytes": 1026
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/utils/corner_solver.rs",
+      "target": "vendor/momor/crates/ui/src/utils/corner_solver.rs",
+      "sha256": "fc0a6955059379968a99d5ce8f5721e6c11f2277d7247a3d257d18e7177e91cb",
+      "bytes": 2079
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/utils/format_distance.rs",
+      "target": "vendor/momor/crates/ui/src/utils/format_distance.rs",
+      "sha256": "e631b44e85bb0b454b35f4c24e4f2d8e671e7491a3bb9dd2324c708160272855",
+      "bytes": 12420
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/utils/search_input.rs",
+      "target": "vendor/momor/crates/ui/src/utils/search_input.rs",
+      "sha256": "6a2dcf613ad975a2db5b90629ac26772da43a1d52c885c09d49e7eeee2e7a64f",
+      "bytes": 672
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui/src/utils/with_rem_size.rs",
+      "target": "vendor/momor/crates/ui/src/utils/with_rem_size.rs",
+      "sha256": "d52ad06c9b80352dfd9aaec471a58cce33b2deac712f2ba38adbc52bd83ac758",
+      "bytes": 3282
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/Cargo.toml",
+      "target": "vendor/momor/crates/theme/Cargo.toml",
+      "sha256": "fe6be65417d36443689a83aaf66e2b3a0970a624bbf5c99b1fef56132745a761",
+      "bytes": 869
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/LICENSE-GPL",
+      "target": "vendor/momor/crates/theme/LICENSE-GPL",
+      "sha256": "14bf4ab95059f55c914355e0fb9c7840f9af74135faf104f9ed8b1efcce4d060",
+      "bytes": 17
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/default_colors.rs",
+      "target": "vendor/momor/crates/theme/src/default_colors.rs",
+      "sha256": "7143842f13a319922be617af67a9c295b50792d114f1145adedd46b3ef89d482",
+      "bytes": 71922
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/fallback_themes.rs",
+      "target": "vendor/momor/crates/theme/src/fallback_themes.rs",
+      "sha256": "b384e664928d3ecc7d65e2dbababedb703f8c2301d0bf20dfc11f417a5343cad",
+      "bytes": 20153
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/font_family_cache.rs",
+      "target": "vendor/momor/crates/theme/src/font_family_cache.rs",
+      "sha256": "0692d84bc49a3e425f4d538684772ff7594da9d66b34fb245d995ad171415b54",
+      "bytes": 2970
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/icon_theme_schema.rs",
+      "target": "vendor/momor/crates/theme/src/icon_theme_schema.rs",
+      "sha256": "f3c1ffe15f4d9b6088a894875b6b2752c5180c92a5654f122315ef5e4d546c71",
+      "bytes": 1510
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/icon_theme.rs",
+      "target": "vendor/momor/crates/theme/src/icon_theme.rs",
+      "sha256": "8ff25381bd3d03cc8c2ca9a960e782df08bc2ad754c9b54319c35aab4f8b2753",
+      "bytes": 14778
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/registry.rs",
+      "target": "vendor/momor/crates/theme/src/registry.rs",
+      "sha256": "d26e3c7ac9bf16fdf6a8e6437dfc3be60d58bc842bef2a6f23b75cb43b9366aa",
+      "bytes": 11360
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/scale.rs",
+      "target": "vendor/momor/crates/theme/src/scale.rs",
+      "sha256": "da23cc610857837dc8eb812d93ae99a675212aa3fa1dea0355da9bd85c51f967",
+      "bytes": 8990
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/schema.rs",
+      "target": "vendor/momor/crates/theme/src/schema.rs",
+      "sha256": "14d3074915f4fa7b4805666fef9a8888223f21260fba1491993cd6fd683011d8",
+      "bytes": 839
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/styles.rs",
+      "target": "vendor/momor/crates/theme/src/styles.rs",
+      "sha256": "b81b8c75d5405f7cf479742e654d75981a92ddeb298e99e027a71d7140041a76",
+      "bytes": 204
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/theme_settings_provider.rs",
+      "target": "vendor/momor/crates/theme/src/theme_settings_provider.rs",
+      "sha256": "4f77523df5b427a7a75f5c66107755de3cdfcaaeed0c59f0b25ce10018907d30",
+      "bytes": 1648
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/theme.rs",
+      "target": "vendor/momor/crates/theme/src/theme.rs",
+      "sha256": "1970ba32870341eabc0c4f6ba5819d540b12e1f7033391581060c8e0b291e3ec",
+      "bytes": 9827
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/ui_density.rs",
+      "target": "vendor/momor/crates/theme/src/ui_density.rs",
+      "sha256": "d16487925a88de5d948a6236929aab0edabc451c986e7831e4fd6991dba6fc16",
+      "bytes": 1721
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/styles/accents.rs",
+      "target": "vendor/momor/crates/theme/src/styles/accents.rs",
+      "sha256": "9efb25729a3c33328e28072c66d8d406466a3734fd8d98a7fdc21afbe2084b26",
+      "bytes": 2067
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/styles/colors.rs",
+      "target": "vendor/momor/crates/theme/src/styles/colors.rs",
+      "sha256": "e48ee497962f846ae08bd458f000e2efb61440eb73c1ae0d041e7868829d7bbb",
+      "bytes": 32102
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/styles/players.rs",
+      "target": "vendor/momor/crates/theme/src/styles/players.rs",
+      "sha256": "347b208683681e14ad3da42d585f361cd9a431575a5021c9fa191ae85c9ba665",
+      "bytes": 5050
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/styles/status.rs",
+      "target": "vendor/momor/crates/theme/src/styles/status.rs",
+      "sha256": "c06bfce6c054c25a6ca9bd508a6afdc02fc038ab950aeb61f37cb49ed90cd45b",
+      "bytes": 7747
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/styles/syntax.rs",
+      "target": "vendor/momor/crates/theme/src/styles/syntax.rs",
+      "sha256": "9b39fb51d246e7d2eb7220406abe14059f539ab8e9341258aadc06b7acbc9719",
+      "bytes": 36
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/theme/src/styles/system.rs",
+      "target": "vendor/momor/crates/theme/src/styles/system.rs",
+      "sha256": "4806fa0cc6d3831bbe891b36bf16e5b4d7ebe7548100abed9e7a08fc8f9fc7ec",
+      "bytes": 641
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/component/Cargo.toml",
+      "target": "vendor/momor/crates/component/Cargo.toml",
+      "sha256": "af75565c2bb350eecc1f5cde2e2c0f37900e53b69cac1fda2a435d54735633d8",
+      "bytes": 453
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/component/LICENSE-GPL",
+      "target": "vendor/momor/crates/component/LICENSE-GPL",
+      "sha256": "14bf4ab95059f55c914355e0fb9c7840f9af74135faf104f9ed8b1efcce4d060",
+      "bytes": 17
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/component/src/component_layout.rs",
+      "target": "vendor/momor/crates/component/src/component_layout.rs",
+      "sha256": "a5e1582785a52be345bf94473dc9c694f6af3332fa6670fc89281e9a5dadcce1",
+      "bytes": 6429
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/component/src/component.rs",
+      "target": "vendor/momor/crates/component/src/component.rs",
+      "sha256": "93a7e5045e7e0e788f650aca6dc6dc728eb51aaf447f238c451f06eb6ae1d61e",
+      "bytes": 9972
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/icons/Cargo.toml",
+      "target": "vendor/momor/crates/icons/Cargo.toml",
+      "sha256": "e87a016b768394e8275bc6c1d3c74399cb76edf5df682dfe88ec13229f402a48",
+      "bytes": 255
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/icons/LICENSE-GPL",
+      "target": "vendor/momor/crates/icons/LICENSE-GPL",
+      "sha256": "14bf4ab95059f55c914355e0fb9c7840f9af74135faf104f9ed8b1efcce4d060",
+      "bytes": 17
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/icons/README.md",
+      "target": "vendor/momor/crates/icons/README.md",
+      "sha256": "f53c45ad81773286dbd242acc4666633256282fcb0cc2b28e2a6ae6174d0de82",
+      "bytes": 1833
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/icons/src/icons.rs",
+      "target": "vendor/momor/crates/icons/src/icons.rs",
+      "sha256": "cb21ce2730df1ab4e96796436b7a4ac5a06238ea5bbfc4a6f5a7619759581d66",
+      "bytes": 5082
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/menu/Cargo.toml",
+      "target": "vendor/momor/crates/menu/Cargo.toml",
+      "sha256": "bf4a5ca7c7ea4b39190db818b481c719a5954b317d7bbfc0d16b215ede6a759a",
+      "bytes": 245
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/menu/LICENSE-GPL",
+      "target": "vendor/momor/crates/menu/LICENSE-GPL",
+      "sha256": "14bf4ab95059f55c914355e0fb9c7840f9af74135faf104f9ed8b1efcce4d060",
+      "bytes": 17
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/menu/src/menu.rs",
+      "target": "vendor/momor/crates/menu/src/menu.rs",
+      "sha256": "cb121c20d2788afb8fdddb4a343b1e9c45ac06d6eb94f1e147bba3f4904a662c",
+      "bytes": 1176
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui_macros/Cargo.toml",
+      "target": "vendor/momor/crates/ui_macros/Cargo.toml",
+      "sha256": "dca83adc3275a2231ec357271a05b515a03178e00e424d1bcfceb17be8d9782c",
+      "bytes": 351
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui_macros/LICENSE-GPL",
+      "target": "vendor/momor/crates/ui_macros/LICENSE-GPL",
+      "sha256": "14bf4ab95059f55c914355e0fb9c7840f9af74135faf104f9ed8b1efcce4d060",
+      "bytes": 17
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui_macros/src/derive_register_component.rs",
+      "target": "vendor/momor/crates/ui_macros/src/derive_register_component.rs",
+      "sha256": "5cad1b0738e449131dffb546e09151ba11c321e3dbe7cdbdaeb0ff4b3946a5e3",
+      "bytes": 928
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui_macros/src/dynamic_spacing.rs",
+      "target": "vendor/momor/crates/ui_macros/src/dynamic_spacing.rs",
+      "sha256": "72592204898235519aaad22dcf9bb5d3d03e60557e30e8bc3746d7fa1bc863fa",
+      "bytes": 6521
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui_macros/src/ui_macros.rs",
+      "target": "vendor/momor/crates/ui_macros/src/ui_macros.rs",
+      "sha256": "3cbe7c52ced9c567dd74b042a3f0a563bdf128caa3a7d6e414b791ab0d36afdf",
+      "bytes": 1117
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/syntax_theme/Cargo.toml",
+      "target": "vendor/momor/crates/syntax_theme/Cargo.toml",
+      "sha256": "d609a38e1138754e207c6f16be2098b59d6a7f059e32d83b772eb5a922f49b41",
+      "bytes": 556
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/syntax_theme/LICENSE-APACHE",
+      "target": "vendor/momor/crates/syntax_theme/LICENSE-APACHE",
+      "sha256": "9cff568488e9d56aae60f162404acdb15d8533a0202cf01f6eb0843b264f20ff",
+      "bytes": 20
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/syntax_theme/LICENSE-GPL",
+      "target": "vendor/momor/crates/syntax_theme/LICENSE-GPL",
+      "sha256": "14bf4ab95059f55c914355e0fb9c7840f9af74135faf104f9ed8b1efcce4d060",
+      "bytes": 17
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/syntax_theme/src/syntax_theme.rs",
+      "target": "vendor/momor/crates/syntax_theme/src/syntax_theme.rs",
+      "sha256": "dd0647178d272bf874910896e4784985977c80f8164ce240ec698db4a3681056",
+      "bytes": 11104
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/gpui_util/Cargo.toml",
+      "target": "vendor/momor/crates/gpui_util/Cargo.toml",
+      "sha256": "db0d69eca3c1648fff915f682a99d44493e99bfa9df5d91a9ef5abfcaca66297",
+      "bytes": 196
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/gpui_util/LICENSE-APACHE",
+      "target": "vendor/momor/crates/gpui_util/LICENSE-APACHE",
+      "sha256": "9cff568488e9d56aae60f162404acdb15d8533a0202cf01f6eb0843b264f20ff",
+      "bytes": 20
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/gpui_util/src/arc_cow.rs",
+      "target": "vendor/momor/crates/gpui_util/src/arc_cow.rs",
+      "sha256": "2a930d3c9c2da5b5009af9ab6444736a1db53f285554bee6cedd7bd689be895c",
+      "bytes": 3492
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/gpui_util/src/lib.rs",
+      "target": "vendor/momor/crates/gpui_util/src/lib.rs",
+      "sha256": "bedf183d9f68c9772373d001086e36a87a3c86a674815b0718e08cea33c0da78",
+      "bytes": 11208
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/collections/Cargo.toml",
+      "target": "vendor/momor/crates/collections/Cargo.toml",
+      "sha256": "af11f8d90ab47e63ebfe63e423a1cfb87eb7200ae6a7086e49e25d83f2a8ef9b",
+      "bytes": 376
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/collections/LICENSE-APACHE",
+      "target": "vendor/momor/crates/collections/LICENSE-APACHE",
+      "sha256": "9cff568488e9d56aae60f162404acdb15d8533a0202cf01f6eb0843b264f20ff",
+      "bytes": 20
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/collections/src/collections.rs",
+      "target": "vendor/momor/crates/collections/src/collections.rs",
+      "sha256": "a1dc2e34ce7b3f01cd70642bc5333f65b6f22d417ee3b8f202e8121aa6afbcc4",
+      "bytes": 425
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/collections/src/vecmap_tests.rs",
+      "target": "vendor/momor/crates/collections/src/vecmap_tests.rs",
+      "sha256": "ddd70d121b5cd5ef3685fde9fd3fa77ff3517015d5c998a430f6ff26efd5483e",
+      "bytes": 6294
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/collections/src/vecmap.rs",
+      "target": "vendor/momor/crates/collections/src/vecmap.rs",
+      "sha256": "4d329c095cece098109585b0e8c48a50f283f081e0aa594ff61ff2febb1ac5ff",
+      "bytes": 5572
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/refineable/Cargo.toml",
+      "target": "vendor/momor/crates/refineable/Cargo.toml",
+      "sha256": "3cef7257cfb92be207b4433ea0b271d98a3e1d39638d3e66be2a62fb39ced068",
+      "bytes": 380
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/refineable/LICENSE-APACHE",
+      "target": "vendor/momor/crates/refineable/LICENSE-APACHE",
+      "sha256": "9cff568488e9d56aae60f162404acdb15d8533a0202cf01f6eb0843b264f20ff",
+      "bytes": 20
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/refineable/derive_refineable/Cargo.toml",
+      "target": "vendor/momor/crates/refineable/derive_refineable/Cargo.toml",
+      "sha256": "7eefe6f5b94333f1018295c3efd13d1c859bd24f725af2826df16c483cf9a345",
+      "bytes": 400
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/refineable/derive_refineable/LICENSE-APACHE",
+      "target": "vendor/momor/crates/refineable/derive_refineable/LICENSE-APACHE",
+      "sha256": "4219cae644a01759f302a926799038c303bc3bcdd71e033d468a591ea014ae27",
+      "bytes": 23
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/refineable/derive_refineable/src/derive_refineable.rs",
+      "target": "vendor/momor/crates/refineable/derive_refineable/src/derive_refineable.rs",
+      "sha256": "481868c7feb4773283f2fa5afb5dd72c619d81badd9d1ba00febbb52c470d264",
+      "bytes": 17973
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/refineable/src/refineable.rs",
+      "target": "vendor/momor/crates/refineable/src/refineable.rs",
+      "sha256": "2ddf7c12f35dd27103163650112bb55bb192e57485a5cce59e32bfa4c92f8d10",
+      "bytes": 5450
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui_input/Cargo.toml",
+      "target": "vendor/momor/crates/ui_input/Cargo.toml",
+      "sha256": "8de10515249b078458378247b1db22a8b6362a446c084474c5723737eb46dbb4",
+      "bytes": 313
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui_input/LICENSE-GPL",
+      "target": "vendor/momor/crates/ui_input/LICENSE-GPL",
+      "sha256": "14bf4ab95059f55c914355e0fb9c7840f9af74135faf104f9ed8b1efcce4d060",
+      "bytes": 17
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui_input/src/input_field.rs",
+      "target": "vendor/momor/crates/ui_input/src/input_field.rs",
+      "sha256": "e6365972a8300a88888c81e4604490bac3377ce9107f0197a70f91218c306cfd",
+      "bytes": 8537
+    },
+    {
+      "operation": "COPY_FILE",
+      "source": "crates/ui_input/src/ui_input.rs",
+      "target": "vendor/momor/crates/ui_input/src/ui_input.rs",
+      "sha256": "8257e7c5b4181dc610d5ab3b506a72884f57ba2862d64078ad422bb0f8697826",
+      "bytes": 1417
+    }
+  ]
+}

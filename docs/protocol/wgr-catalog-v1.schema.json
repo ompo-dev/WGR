@@ -1,0 +1,18 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://wgr.invalid/protocol/catalog-v1.schema.json",
+  "title":"WGR Catalog API v1 page",
+  "type":"object",
+  "required":["schema_version","items","next_cursor"],
+  "properties":{
+    "schema_version":{"const":"1.0"},
+    "items":{"type":"array","maxItems":200,"items":{"$ref":"#/$defs/game"}},
+    "next_cursor":{"type":["string","null"],"maxLength":2048}
+  },
+  "$defs":{
+    "https":{"type":"string","format":"uri","maxLength":4096,"pattern":"^https://"},
+    "requirements":{"type":"object","properties":{"webgpu":{"type":"boolean"},"wasm_memory64":{"type":"boolean"},"shared_array_buffer":{"type":"boolean"},"min_memory_gib":{"type":["number","null"],"exclusiveMinimum":0,"maximum":256}},"additionalProperties":true},
+    "game":{"type":"object","required":["id","title","entry_url","runtime"],"properties":{"id":{"type":"string","minLength":1,"maxLength":256},"title":{"type":"string","minLength":1,"maxLength":256},"description":{"type":"string","maxLength":8192},"entry_url":{"$ref":"#/$defs/https"},"cover_url":{"oneOf":[{"$ref":"#/$defs/https"},{"type":"null"}]},"runtime":{"const":"webview2"},"version":{"type":["string","null"],"maxLength":256},"requirements":{"$ref":"#/$defs/requirements"}},"additionalProperties":true}
+  },
+  "additionalProperties":true
+}

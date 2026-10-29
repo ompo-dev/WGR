@@ -1,0 +1,17 @@
+[package]
+name = "wgr-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+wasmparser = "0.261.0"
+wasmtime = { version = "=50.0.0", default-features = false, features = ["anyhow", "cranelift", "runtime", "std", "threads", "parallel-compilation", "demangle", "backtrace"] }
+rayon = "1.11.0"
+
+[dev-dependencies]
+wat = "1.261.0"

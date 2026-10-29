@@ -1,0 +1,51 @@
+[workspace]
+members = ["crates/ui", "crates/ui_input", "crates/theme", "crates/component", "crates/icons", "crates/menu", "crates/ui_macros", "crates/syntax_theme", "crates/gpui_util", "crates/collections", "crates/refineable", "crates/refineable/derive_refineable"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+publish = false
+
+[workspace.lints]
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(rust_analyzer)', 'cfg(macos_sdk_26)'] }
+linker_messages = "allow"
+
+[workspace.dependencies]
+ui_input = { path = "crates/ui_input" }
+ui = { path = "crates/ui" }
+theme = { path = "crates/theme" }
+component = { path = "crates/component" }
+icons = { path = "crates/icons" }
+menu = { path = "crates/menu" }
+ui_macros = { path = "crates/ui_macros" }
+syntax_theme = { path = "crates/syntax_theme" }
+gpui_util = { path = "crates/gpui_util" }
+collections = { path = "crates/collections" }
+refineable = { path = "crates/refineable" }
+derive_refineable = { path = "crates/refineable/derive_refineable" }
+gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
+gpui_macros = { package = "gpui-macros", version = "=0.2.2" }
+anyhow = "1.0.100"
+chrono = { version = "0.4.42", features = ["serde"] }
+documented = "0.9.1"
+itertools = "0.14.0"
+inventory = "0.3.21"
+parking_lot = "0.12.5"
+indexmap = { version = "2.12.0", features = ["serde"] }
+rustc-hash = "2.1.1"
+palette = { version = "0.7.5", default-features = false, features = ["std"] }
+schemars = { version = "1.0", features = ["indexmap2"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+serde_json_lenient = { version = "0.2", features = ["preserve_order", "raw_value"] }
+smallvec = { version = "1.15.1", features = ["serde", "const_generics", "const_new", "union"] }
+strum = { version = "0.27.2", features = ["derive"] }
+thiserror = "2.0.17"
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+log = "0.4.28"
+proc-macro2 = "1.0.103"
+quote = "1.0.41"
+syn = { version = "2.0.108", features = ["full", "extra-traits"] }
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

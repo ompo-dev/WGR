@@ -1,0 +1,15 @@
+{
+  "format": "wgr.port.v1",
+  "id": "fiveplay-gta5-8b0b5899ed",
+  "abi": "emscripten-rage64-v1",
+  "binary": {
+    "url": "https://cdn.fiveplay.lol/b/8b0b5899ed/game.wasm",
+    "sha256": "11ca8d2c04c5e843d18ff4aea4899d72c86973c6b031df334e67c446b2ae83e0"
+  },
+  "assets": {
+    "manifest": "https://fiveplay.lol/data/manifest.json",
+    "base": "https://fiveplay.lol/data/"
+  },
+  "shaders": { "base": "https://fiveplay.lol/b/8b0b5899ed/shaders/" },
+  "entry": "__main_argc_argv"
+}

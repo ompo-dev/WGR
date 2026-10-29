@@ -1,0 +1,10 @@
+BEGIN IMMEDIATE;
+CREATE TABLE sources(id TEXT PRIMARY KEY, kind TEXT NOT NULL, json TEXT NOT NULL, created_at INTEGER NOT NULL, position INTEGER NOT NULL);
+CREATE TABLE games(id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE, external_id TEXT, title TEXT NOT NULL, favorite INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, position INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE UNIQUE INDEX games_external ON games(source_id,external_id) WHERE external_id IS NOT NULL;
+CREATE INDEX games_title ON games(title COLLATE NOCASE);
+CREATE INDEX games_favorite ON games(favorite,created_at);
+CREATE TABLE sessions(id TEXT PRIMARY KEY, game_id TEXT NOT NULL, json TEXT NOT NULL);
+CREATE TABLE settings(key TEXT PRIMARY KEY,json TEXT NOT NULL);
+PRAGMA user_version=1;
+COMMIT;

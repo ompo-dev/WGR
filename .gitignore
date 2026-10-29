@@ -1,6 +1,7 @@
 /target/
 /dist/
 /portable-data/
+/artifacts/
 /artifacts/*.log
 /artifacts/*.png
 /artifacts/smoke-data/

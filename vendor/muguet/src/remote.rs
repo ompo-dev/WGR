@@ -75,7 +75,6 @@ pub fn prepare(support: &Path) -> Result<Option<PathBuf>> {
         .max_blocking_threads(4)
         .enable_all()
         .thread_name("native-net")
-        .on_thread_start(|| crate::bridge::thread_started("http"))
         .build()?;
     let http = HttpClient::new(NetworkPolicy {
         allowed_origins: vec![
@@ -159,7 +158,6 @@ pub fn prepare(support: &Path) -> Result<Option<PathBuf>> {
         background: rayon::ThreadPoolBuilder::new()
             .num_threads(8)
             .thread_name(|_| "native-prefetch".into())
-            .start_handler(|_| crate::bridge::thread_started("prefetch"))
             .build()?,
         network: tokio::sync::Semaphore::new(32),
         index,
@@ -174,23 +172,7 @@ pub fn prepare(support: &Path) -> Result<Option<PathBuf>> {
         .set(assets.clone())
         .map_err(|_| anyhow::anyhow!("Assets nativos já inicializados"))?;
     assets.prewarm_gpu_shaders()?;
-    // The origin's batch response and individual GET disagree for some FXC
-    // files (same length, different shader data). Old batches can trap the
-    // guest loader. Repair that derived cache once, retaining all map assets.
-    let shader_marker = data_dir.join("fxc-get-v1");
-    let shader_revision = sha256(format!("{BUILD}:{}", assets.version).as_bytes());
-    let repair = std::fs::metadata(&shader_marker)
-        .ok()
-        .filter(|m| m.len() == 64)
-        .and_then(|_| std::fs::read_to_string(&shader_marker).ok())
-        .as_deref()
-        != Some(shader_revision.as_str());
-    assets.prewarm_shaders(files, repair)?;
-    if repair {
-        let temporary = shader_marker.with_extension("partial");
-        std::fs::write(&temporary, &shader_revision)?;
-        std::fs::rename(temporary, shader_marker)?;
-    }
+    assets.prewarm_shaders(files)?;
     assets.prewarm_boot(files, &data_dir.join("bootset.json"))?;
     Ok(Some(wasm))
 }
@@ -261,8 +243,8 @@ impl Assets {
             }
             if size <= 8 << 20
                 && [
-                    ".meta", ".xml", ".dat", ".ymt", ".txt", ".csv", ".gfx", ".json", ".sps",
-                    ".cfg",
+                    ".fxc", ".meta", ".xml", ".dat", ".ymt", ".txt", ".csv", ".gfx", ".json",
+                    ".sps", ".cfg",
                 ]
                 .iter()
                 .any(|e| name.ends_with(e))
@@ -334,9 +316,11 @@ impl Assets {
         eprintln!("[native-assets] original boot set ready");
         Ok(())
     }
-    fn prewarm_shaders(&self, files: &[Value], repair: bool) -> Result<()> {
+    fn prewarm_shaders(&self, files: &[Value]) -> Result<()> {
         use rayon::prelude::*;
-        let mut pending = Vec::new();
+        let mut batches = Vec::new();
+        let mut batch = Vec::new();
+        let mut bytes = 0u64;
         for file in files {
             let Some(path) = file[0].as_str() else {
                 continue;
@@ -349,35 +333,32 @@ impl Assets {
             }
             let first = format!("{BUILD}:data:{path}:0:{size}");
             let last = format!("{BUILD}:data:{path}:{}:{size}", (size - 1) / BLOCK * BLOCK);
-            if !repair && self.cached(&first)?.is_some() && self.cached(&last)?.is_some() {
+            if self.cached(&first)?.is_some() && self.cached(&last)?.is_some() {
                 continue;
             }
-            pending.push((path.to_string(), size));
+            batch.push((path.to_string(), size));
+            bytes += size;
+            if bytes >= 4 << 20 || batch.len() >= 300 {
+                batches.push(std::mem::take(&mut batch));
+                bytes = 0;
+            }
+        }
+        if !batch.is_empty() {
+            batches.push(batch);
         }
         eprintln!(
-            "[native-assets] preparing shaders via canonical GET: {} files, repair={repair}",
-            pending.len()
+            "[native-assets] preparing shaders: {} compressed batches",
+            batches.len()
         );
-        let completed = std::sync::atomic::AtomicUsize::new(0);
         self.background.install(|| {
-            pending.par_iter().try_for_each(|(path, size)| {
-                let url = format!("{}{path}?v={}", self.data_base, self.version);
-                self.data_block_inner(path, *size, 0, *size, &url, true)?;
-                let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if done % 16 == 0 || done == pending.len() {
-                    crate::bridge::emit(serde_json::json!({"type":"game-progress","payload":{"label":format!("Preparando shaders: {done}/{}", pending.len())}}));
-                }
-                Ok::<(), anyhow::Error>(())
-            })
+            batches
+                .par_iter()
+                .try_for_each(|batch| self.fetch_batch(batch))
         })?;
         eprintln!("[native-assets] shader files ready in persistent cache");
         Ok(())
     }
     fn fetch_batch(&self, files: &[(String, u64)]) -> Result<()> {
-        ensure!(
-            !files.iter().any(|(path, _)| path.ends_with(".fxc")),
-            "FXC requires individual GET"
-        );
         let body = serde_json::to_vec(
             &files
                 .iter()
@@ -462,22 +443,9 @@ impl Assets {
         end: u64,
         url: &str,
     ) -> Result<Arc<Vec<u8>>> {
-        self.data_block_inner(path, size, start, end, url, false)
-    }
-    fn data_block_inner(
-        &self,
-        path: &str,
-        size: u64,
-        start: u64,
-        end: u64,
-        url: &str,
-        refresh: bool,
-    ) -> Result<Arc<Vec<u8>>> {
         let key = format!("{BUILD}:data:{path}:{start}:{size}");
-        if !refresh {
-            if let Some(data) = self.cached(&key)? {
-                return Ok(data);
-            }
+        if let Some(data) = self.cached(&key)? {
+            return Ok(data);
         }
         let lock = {
             let mut locks = self.locks.lock().unwrap();
@@ -493,10 +461,8 @@ impl Assets {
             lock
         };
         let _guard = lock.lock().unwrap();
-        if !refresh {
-            if let Some(data) = self.cached(&key)? {
-                return Ok(data);
-            }
+        if let Some(data) = self.cached(&key)? {
+            return Ok(data);
         }
         // One validated HTTP range for adjacent demand; retain the old 128 KiB
         // persistent block keys so previous downloads remain usable.
@@ -505,14 +471,13 @@ impl Assets {
             .saturating_mul(BLOCK)
             .min(size)
             .min(start + (4 << 20));
-        let whole = (path.ends_with(".fxc") && size <= 8 << 20)
-            || size <= 2 << 20
-                && [
-                    ".fxc", ".xml", ".meta", ".json", ".ymt", ".csv", ".dat", ".gfx", ".txt",
-                    ".sps", ".cfg",
-                ]
-                .iter()
-                .any(|extension| path.ends_with(extension));
+        let whole = size <= 2 << 20
+            && [
+                ".fxc", ".xml", ".meta", ".json", ".ymt", ".csv", ".dat", ".gfx", ".txt", ".sps",
+                ".cfg",
+            ]
+            .iter()
+            .any(|extension| path.ends_with(extension));
         let origin = if whole { 0 } else { start };
         FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let bytes = self.runtime.block_on(async {
@@ -763,104 +728,4 @@ pub fn read_data(path: &str, size: u64, offset: u64, length: u64) -> Result<Vec<
 
 pub fn enabled() -> bool {
     ASSETS.get().is_some()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Write};
-
-    #[test]
-    fn canonical_shader_refresh_replaces_same_length_legacy_cache() {
-        let expected = b"rgxe_WGR_ORIGINAL";
-        let legacy = b"rgxe_WGR_BAD_DATA";
-        assert_eq!(expected.len(), legacy.len());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        listener.set_nonblocking(true).unwrap();
-        let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                if let Ok((mut socket, _)) = listener.accept() {
-                    socket.set_nonblocking(false).unwrap();
-                    socket
-                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                        .unwrap();
-                    let mut request = [0u8; 4096];
-                    let bytes = socket.read(&mut request).unwrap();
-                    assert!(request[..bytes].starts_with(b"GET /fixture.fxc "));
-                    write!(
-                        socket,
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        expected.len()
-                    )
-                    .unwrap();
-                    socket.write_all(expected).unwrap();
-                    return;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "canonical GET was not requested"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        });
-        let root = std::env::temp_dir().join(format!(
-            "wgr-fxc-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&root).unwrap();
-        {
-            let assets = Assets {
-                runtime: tokio::runtime::Runtime::new().unwrap(),
-                http: HttpClient::new(NetworkPolicy {
-                    allowed_origins: vec![origin.clone()],
-                    development_loopback: true,
-                }),
-                cache: Mutex::new(DiskCache::open(root.clone(), 8 << 20).unwrap()),
-                cache_root: root.clone(),
-                hot: Mutex::new(Hot {
-                    entries: HashMap::new(),
-                    bytes: 0,
-                    clock: 0,
-                }),
-                locks: Mutex::new(HashMap::new()),
-                prefetching: Mutex::new(HashSet::new()),
-                hinting: Mutex::new(HashSet::new()),
-                hint_slots: tokio::sync::Semaphore::new(1),
-                background: rayon::ThreadPoolBuilder::new()
-                    .num_threads(1)
-                    .build()
-                    .unwrap(),
-                network: tokio::sync::Semaphore::new(1),
-                index: serde_json::json!({}),
-                data_base: format!("{origin}/"),
-                shader_base: format!("{origin}/"),
-                version: "fixture".into(),
-            };
-            let key = format!("{BUILD}:data:fixture.fxc:0:{}", legacy.len());
-            assets.cache.lock().unwrap().put(&key, legacy).unwrap();
-            assert_eq!(assets.cached(&key).unwrap().unwrap().as_slice(), legacy);
-            let bytes = assets
-                .data_block_inner(
-                    "fixture.fxc",
-                    expected.len() as u64,
-                    0,
-                    expected.len() as u64,
-                    &format!("{origin}/fixture.fxc"),
-                    true,
-                )
-                .unwrap();
-            assert_eq!(bytes.as_slice(), expected);
-            assert_eq!(assets.cached(&key).unwrap().unwrap().as_slice(), expected);
-            assert!(assets
-                .fetch_batch(&[("fixture.fxc".into(), expected.len() as u64)])
-                .is_err());
-        }
-        server.join().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    }
 }

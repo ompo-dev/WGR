@@ -587,7 +587,6 @@ fn engine_config_for(ios: bool) -> Config {
 }
 
 pub fn instantiate(rt: &Arc<Runtime>, pthread: u64) -> Result<(Store<HostState>, Instance)> {
-    crate::bridge::thread_started("guest");
     let mut store = Store::new(&rt.engine, HostState { pthread });
     let mut linker: Linker<HostState> = Linker::new(&rt.engine);
     linker.define(&store, "env", "memory", rt.mem.clone())?;

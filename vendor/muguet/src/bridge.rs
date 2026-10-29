@@ -8,38 +8,6 @@ use std::time::Instant;
 static COMMANDS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 static STARTED: AtomicBool = AtomicBool::new(false);
 pub static PRESENTED: AtomicU64 = AtomicU64::new(0);
-pub fn perf_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("WGR_PERF_DIAGNOSTICS").as_deref() == Ok("1"));
-    *ENABLED
-}
-pub fn timestamp_ms() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-}
-pub fn thread_started(role: &str) {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, GetCurrentThreadId, SetThreadDescription,
-        };
-        let thread = std::thread::current();
-        let name = format!("{role}: {}", thread.name().unwrap_or(role));
-        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-        unsafe {
-            SetThreadDescription(GetCurrentThread(), wide.as_ptr());
-        }
-        if perf_enabled() {
-            emit(
-                json!({"type":"native_thread","role":role,"name":name,"tid":unsafe {GetCurrentThreadId()}}),
-            );
-        }
-    }
-    #[cfg(not(windows))]
-    let _ = role;
-}
 pub fn emit(value: Value) {
     println!("WGR_EVENT {value}");
 }

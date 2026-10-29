@@ -338,17 +338,7 @@ pub fn call(
                     .unwrap()
                     .get_or_insert_with(|| line[at + 13..].to_string());
             }
-            // The engine emits these informational scene transitions every
-            // frame. Keep warnings and hang reports, without synchronous pipe
-            // writes for the same quiet audio scene hundreds of times/second.
-            let quiet_trace = name == "wasm_print_line_js"
-                && line.contains("[Audio_DynamicMixer]")
-                && (line.contains("QUIET_SCENE") || line.contains("QUIET_PATCH"))
-                && !line.to_ascii_lowercase().contains("warn")
-                && !line.to_ascii_lowercase().contains("error");
-            if !quiet_trace {
-                eprintln!("[eng] {line}");
-            }
+            eprintln!("[eng] {line}");
         }
         "wasm_module_int_js" => set_int(results, int(params, 1)),
         "wasm_has_page_js" => set_int(results, 1),

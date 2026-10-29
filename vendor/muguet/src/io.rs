@@ -202,7 +202,6 @@ fn serve_remote(mem: SharedMemory, table: u64) {
     let workers = rayon::ThreadPoolBuilder::new()
         .num_threads(32)
         .thread_name(|n| format!("native-io-{n}"))
-        .start_handler(|_| crate::bridge::thread_started("asset-io"))
         .build()
         .expect("I/O workers");
     loop {
@@ -232,18 +231,12 @@ fn serve_remote(mem: SharedMemory, table: u64) {
                 let result = (|| -> anyhow::Result<i32> {
                     let (path,size) = files.get(id).ok_or_else(|| anyhow::anyhow!("Unknown file id {id}"))?;
                     if offset >= *size { return Ok(0); }
-                    let length = requested.min(size-offset);
-                    if crate::bridge::perf_enabled() && path.ends_with(".fxc") {
-                        eprintln!("[native-shader-read] {path} offset={offset} length={length} destination={destination}");
-                    }
+                                        let length = requested.min(size-offset);
                     copy_to_guest(&mem,destination,offset,length,|position,bytes|crate::remote::read_data(path,*size,position,bytes))
                 })();
                 let value = match result { Ok(n) => n, Err(e) => { eprintln!("[native-io-error] file={id} offset={offset} length={requested}: {e:#}"); -1 } };
                 let elapsed = began.elapsed().as_secs_f64()*1000.0;
-                if elapsed >= 100.0 {
-                    eprintln!("[native-io-slow] file={id} offset={offset} length={requested} ms={elapsed:.1}");
-                    crate::bridge::emit(serde_json::json!({"type":"native_io_slow","timestamp_ms":crate::bridge::timestamp_ms(),"file_id":id,"path":files.get(id).map(|(path,_)|path),"offset":offset,"length":requested,"duration_ms":elapsed,"bytes":value}));
-                }
+                                if elapsed >= 100.0 { eprintln!("[native-io-slow] file={id} offset={offset} length={requested} ms={elapsed:.1}"); }
                 atomic_i32(&mem,row+28).store(value,Ordering::Release);
                 atomic_i32(&mem,row).store(2,Ordering::Release);
                 let _ = mem.atomic_notify(row,1);

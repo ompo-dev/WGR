@@ -133,8 +133,6 @@ struct App {
     launcher_shown: bool,
     locked: bool,
     focused: bool,
-    capture_requested: bool,
-    capture_attempted: bool,
     last_escape: Option<std::time::Instant>,
     mods: ModifiersState,
     wheel_accum: f64,
@@ -319,7 +317,6 @@ impl ApplicationHandler for App {
                     if event.state == ElementState::Pressed && !event.repeat {
                         if code == winit::keyboard::KeyCode::Escape {
                             if double_escape(&mut self.last_escape, std::time::Instant::now()) {
-                                self.capture_requested = false;
                                 self.unlock(el, &window);
                                 return;
                             }
@@ -336,7 +333,6 @@ impl ApplicationHandler for App {
                             && self.mods.control_key()
                             && self.mods.shift_key()
                         {
-                            self.capture_requested = false;
                             self.unlock(el, &window);
                             crate::bridge::emit(
                                 serde_json::json!({"type":"native_hotkey","action":"back"}),
@@ -359,8 +355,6 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 if state == ElementState::Pressed {
                     self.last_escape = None;
-                    self.capture_requested = true;
-                    self.capture_attempted = false;
                     focus_window(&window);
                     self.sync_focus(el, &window);
                     if self.focused && !self.locked {
@@ -452,28 +446,20 @@ impl ApplicationHandler for App {
 impl App {
     fn sync_focus(&mut self, el: &ActiveEventLoop, window: &Window) {
         let focused = has_input_focus(window);
-        if self.focused != focused {
-            self.focused = focused;
-            input::set_focus(focused);
-            if !focused {
-                self.last_escape = None;
-                self.mods = ModifiersState::empty();
-                self.wheel_accum = 0.0;
-                self.capture_attempted = false;
-                self.unlock(el, window);
-            }
-            crate::bridge::emit(
-                serde_json::json!({"type":"native_input_focus","focused":focused,"captured":self.locked}),
-            );
+        if self.focused == focused {
+            return;
         }
-        if focused
-            && self.started
-            && self.capture_requested
-            && !self.locked
-            && !self.capture_attempted
-        {
-            self.lock(el, window);
+        self.focused = focused;
+        input::set_focus(focused);
+        if !focused {
+            self.last_escape = None;
+            self.mods = ModifiersState::empty();
+            self.wheel_accum = 0.0;
+            self.unlock(el, window);
         }
+        crate::bridge::emit(
+            serde_json::json!({"type":"native_input_focus","focused":focused,"captured":self.locked}),
+        );
     }
     fn start_engine(&mut self) {
         let Some(window) = self.window.clone() else {
@@ -576,7 +562,6 @@ impl App {
         );
     }
     fn lock(&mut self, el: &ActiveEventLoop, window: &Window) {
-        self.capture_attempted = true;
         let ok = window
             .set_cursor_grab(CursorGrabMode::Locked)
             .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
@@ -630,8 +615,6 @@ pub fn run(
         launcher_shown: false,
         locked: false,
         focused: false,
-        capture_requested: true,
-        capture_attempted: false,
         last_escape: None,
         mods: ModifiersState::empty(),
         wheel_accum: 0.0,

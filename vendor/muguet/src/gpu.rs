@@ -35,11 +35,6 @@ const ZERO_VB_SIZE: u64 = 4096;
 const OCCLUSION_CAPACITY: u32 = 2048;
 const OCCLUSION_VISIBLE_COUNT: u64 = 65536;
 const BG_LIMIT: usize = 24000;
-#[derive(Clone, Copy, Default)]
-struct CommandTiming {
-    calls: u64,
-    nanos: u64,
-}
 
 pub struct SurfaceHandoff {
     pub instance: Instance,
@@ -540,7 +535,7 @@ enum Kind {
     Texture,
     StorageTexture,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Sample {
     Float,
     Uint,
@@ -830,10 +825,13 @@ fn pack_uniforms(text: &str) -> (String, Option<Pack>) {
             .replace_all(&out, format!("cbpack_v.{}", m.name).as_str())
             .into_owned();
     }
-    let st =
-        format!(
+    let st = format!(
         "struct cbpack_t {{\n{}\n}}\n@group({}u) @binding(0u) var<uniform> cbpack_v : cbpack_t;\n",
-        members.iter().map(|m| format!("  {} : {},", m.name, m.ty)).collect::<Vec<_>>().join("\n"),
+        members
+            .iter()
+            .map(|m| format!("  {} : {},", m.name, m.ty))
+            .collect::<Vec<_>>()
+            .join("\n"),
         group
     );
     let out = match RE_FIRST_FN.find(&out) {
@@ -1380,11 +1378,6 @@ pub struct Gpu {
     pipe_wait_left: Duration,
     compute: HashMap<String, Option<(ComputePipeline, BindGroupLayout, u64, Rc<Program>)>>,
     bind_groups: FxHashMap<Vec<u64>, (BindGroup, u64)>,
-    bg_hits: u64,
-    bg_misses: u64,
-    command_time: Duration,
-    command_timings: [CommandTiming; 64],
-    ped_probes: std::collections::HashSet<u64>,
     ubo_slots: Vec<Vec<Chunk>>,
     ubo_shared: Vec<(Buffer, u64)>,
     ubo_slot: usize,
@@ -1657,11 +1650,6 @@ impl Gpu {
             pipelines: FxHashMap::default(),
             compute: HashMap::new(),
             bind_groups: FxHashMap::default(),
-            bg_hits: 0,
-            bg_misses: 0,
-            command_time: Duration::ZERO,
-            command_timings: [CommandTiming::default(); 64],
-            ped_probes: Default::default(),
             ubo_slots: (0..FRAME_SLOTS).map(|_| Vec::new()).collect(),
             ubo_shared: Vec::new(),
             ubo_slot: 0,
@@ -1880,7 +1868,6 @@ impl Gpu {
     }
 
     fn run(&mut self) -> ! {
-        crate::bridge::thread_started("gpu");
         self.load_recipes();
         let mut tail = RING_DATA as i32;
         self.hdr(1).store(tail, Ordering::SeqCst);
@@ -1952,20 +1939,7 @@ impl Gpu {
                 continue;
             }
             let p = base + 2;
-            let began = crate::bridge::perf_enabled().then(Instant::now);
             self.exec(op, p, n);
-            if let Some(began) = began {
-                let duration = began.elapsed();
-                self.command_time += duration;
-                let timing = &mut self.command_timings[(op as usize).min(63)];
-                timing.calls += 1;
-                timing.nanos += duration.as_nanos() as u64;
-                if duration >= Duration::from_millis(20) {
-                    crate::bridge::emit(
-                        serde_json::json!({"type":"native_gpu_slow_command","op":op,"words":n,"duration_ms":duration.as_secs_f64()*1000.0,"frames":self.presents,"timestamp_ms":crate::bridge::timestamp_ms()}),
-                    );
-                }
-            }
             executed += 1;
             tail += (n * 4 + 8) as i32;
             since += 1;
@@ -4697,7 +4671,13 @@ impl Gpu {
                                         res_size = Some((num as u64 * stride).min(bytes - off));
                                     }
                                 } else if off != 0 {
-                                    log_once(&format!("bufoff{}", prog.label), &format!("{}: buffer view offset {off} is not 256-aligned; binding the whole buffer", prog.label));
+                                    log_once(
+                                        &format!("bufoff{}", prog.label),
+                                        &format!(
+                                            "{}: buffer view offset {off} is not 256-aligned; binding the whole buffer",
+                                            prog.label
+                                        ),
+                                    );
                                 }
                                 g
                             }
@@ -4773,34 +4753,13 @@ impl Gpu {
                 }
             }
         }
-        if crate::bridge::perf_enabled()
-            && stage == 1
-            && self.presents >= 3000
-            && (prog.label.contains("ped") || prog.label.contains("skin"))
-            && self.ped_probes.insert(prog.uid)
-        {
-            let textures: Vec<_> = bindings.iter().filter(|b| b.kind == Kind::Texture).map(|b| {
-                let id = self.s.srv[stage].get((b.binding as usize).wrapping_sub(32)).copied().unwrap_or(0);
-                let texture = self.view_obj(id).and_then(|v| self.tex(v.res));
-                serde_json::json!({"binding":b.binding,"srv":id,"format":texture.map(|t|format!("{:?}",t.format)),"dimensions":texture.map(|t|[t.desc.w,t.desc.h,t.desc.d])})
-            }).collect();
-            let constants: Vec<_> = self.s.cb[stage].iter().enumerate().filter(|(_, cb)| cb.buf != 0).map(|(slot, cb)| {
-                let shadow = self.buf(cb.buf).and_then(|b|b.shadow.as_ref());
-                serde_json::json!({"slot":slot,"buffer":cb.buf,"first":cb.first,"bytes":shadow.map(|s|s.len()),"nonzero":shadow.map(|s|s.iter().filter(|v|**v != 0).count())})
-            }).collect();
-            crate::bridge::emit(
-                serde_json::json!({"type":"native_ped_bindings","timestamp_ms":crate::bridge::timestamp_ms(),"program":prog.label,"textures":textures,"constants":constants}),
-            );
-        }
         if let Some((bg, uid)) = self.bind_groups.get(&key) {
-            self.bg_hits += 1;
             return Some(BgResult {
                 bg: bg.clone(),
                 uid: *uid,
                 dyn_off,
             });
         }
-        self.bg_misses += 1;
         let wentries: Vec<BindGroupEntry> = entries
             .iter()
             .map(|(binding, r)| BindGroupEntry {
@@ -5810,7 +5769,13 @@ impl Gpu {
                 d_count = d_count.min(ib_max as i64);
             }
             if d_count != count as i64 || d_inst != inst as i64 {
-                log_once(&format!("clamp{}", pl.label), &format!("draw clamped to its buffers ({}): {count} x {inst} -> {d_count} x {d_inst}", pl.label));
+                log_once(
+                    &format!("clamp{}", pl.label),
+                    &format!(
+                        "draw clamped to its buffers ({}): {count} x {inst} -> {d_count} x {d_inst}",
+                        pl.label
+                    ),
+                );
                 if d_count <= 0 || d_inst <= 0 {
                     self.skip();
                     return;
@@ -6981,7 +6946,12 @@ impl Gpu {
             }
         }
         if row_len < row_bytes {
-            log_once(&format!("rbpitch{fmt:?}"), &format!("readback rows of {row_bytes} bytes clamped to the game's pitch {row_pitch} ({fmt:?})"));
+            log_once(
+                &format!("rbpitch{fmt:?}"),
+                &format!(
+                    "readback rows of {row_bytes} bytes clamped to the game's pitch {row_pitch} ({fmt:?})"
+                ),
+            );
         }
         self.map_pending(rb, MapKind::Readback { flag, rows });
     }
@@ -7448,23 +7418,6 @@ impl Gpu {
         let dt = now.duration_since(self.fps_t0).as_secs_f64();
         if dt >= 10.0 {
             let frames = self.presents - self.fps_n0;
-            if crate::bridge::perf_enabled() {
-                let mut timings: Vec<_> = self
-                    .command_timings
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| t.calls > 0)
-                    .collect();
-                timings.sort_unstable_by_key(|(_, t)| std::cmp::Reverse(t.nanos));
-                let commands: Vec<_> = timings.into_iter().take(8).map(|(op, t)| serde_json::json!({"op":op,"calls_per_frame":t.calls as f64/frames.max(1) as f64,"wall_ms_per_frame":t.nanos as f64/1e6/frames.max(1) as f64})).collect();
-                crate::bridge::emit(
-                    serde_json::json!({"type":"native_gpu_sample","timestamp_ms":crate::bridge::timestamp_ms(),"frames":frames,"command_wall_ms_per_frame":self.command_time.as_secs_f64()*1000.0/frames.max(1) as f64,"commands":commands,"bind_group_hits":self.bg_hits,"bind_group_misses":self.bg_misses,"bind_groups":self.bind_groups.len(),"bind_group_limit":BG_LIMIT,"pending_pipelines":self.pipe_pending.len(),"validation_errors":self.errors.load(Ordering::Relaxed)}),
-                );
-                self.command_time = Duration::ZERO;
-                self.command_timings = [CommandTiming::default(); 64];
-                self.bg_hits = 0;
-                self.bg_misses = 0;
-            }
             let resident = if *MEM_STATS {
                 format!(" ({} MB resident)", crate::heap_resident_mb())
             } else {
@@ -7477,8 +7430,24 @@ impl Gpu {
             };
             log(&format!(
                 "fps: {:.1} ({} MB memory, game heap {} MB{resident}, gpu {} MB, compressed {} MB{malloc}, {} frames, {} clears folded, {} draws/frame, {} draws waiting for a compiling pipeline, {:.1} submits/frame, {:.1} passes/frame, {} skipped total, pipelines {}, bind groups cached {}, validation errors {})",
-                frames as f64 / dt, crate::footprint_mb(), crate::RT.get().map(|r| r.mem.data_size() >> 20).unwrap_or(0), crate::gpu_allocated_mb(), crate::compressed_mb(), frames, self.clears_folded, (self.draws - self.fps_d0) / frames.max(1), self.pending_skips - self.pending_skips0, (self.submits - self.submits0) as f64 / frames.max(1) as f64,
-                (self.passes - self.passes0) as f64 / frames.max(1) as f64, self.skipped, self.pipe_creates, self.bind_groups.len(), self.errors.load(Ordering::Relaxed)
+                frames as f64 / dt,
+                crate::footprint_mb(),
+                crate::RT
+                    .get()
+                    .map(|r| r.mem.data_size() >> 20)
+                    .unwrap_or(0),
+                crate::gpu_allocated_mb(),
+                crate::compressed_mb(),
+                frames,
+                self.clears_folded,
+                (self.draws - self.fps_d0) / frames.max(1),
+                self.pending_skips - self.pending_skips0,
+                (self.submits - self.submits0) as f64 / frames.max(1) as f64,
+                (self.passes - self.passes0) as f64 / frames.max(1) as f64,
+                self.skipped,
+                self.pipe_creates,
+                self.bind_groups.len(),
+                self.errors.load(Ordering::Relaxed)
             ));
             if *MEM_STATS {
                 let mut by: Vec<(TextureFormat, u64, u64, u64)> = Vec::new();
@@ -7516,10 +7485,17 @@ impl Gpu {
             };
             if let Some(r) = report {
                 let h = &r.hub;
-                log(&format!("live wgpu objects: buffers {} textures {} views {} bind groups {} samplers {} pipelines {} | engine objects {} (slots {})",
-                    h.buffers.num_kept_from_user, h.textures.num_kept_from_user, h.texture_views.num_kept_from_user,
-                    h.bind_groups.num_kept_from_user, h.samplers.num_kept_from_user, h.render_pipelines.num_kept_from_user,
-                    self.objs.iter().filter(|o| o.is_some()).count(), self.objs.len()));
+                log(&format!(
+                    "live wgpu objects: buffers {} textures {} views {} bind groups {} samplers {} pipelines {} | engine objects {} (slots {})",
+                    h.buffers.num_kept_from_user,
+                    h.textures.num_kept_from_user,
+                    h.texture_views.num_kept_from_user,
+                    h.bind_groups.num_kept_from_user,
+                    h.samplers.num_kept_from_user,
+                    h.render_pipelines.num_kept_from_user,
+                    self.objs.iter().filter(|o| o.is_some()).count(),
+                    self.objs.len()
+                ));
             }
             self.submits0 = self.submits;
             self.pending_skips0 = self.pending_skips;

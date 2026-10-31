@@ -184,6 +184,9 @@ impl NativeRuntime {
     pub fn interrupt(&self) {
         self.engine.increment_epoch();
     }
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
     pub fn compile(&self, bytes: &[u8]) -> Result<NativeModule> {
         let contract = BinaryContract::inspect(bytes)?;
         let module = self

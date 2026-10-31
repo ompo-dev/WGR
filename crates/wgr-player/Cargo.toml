@@ -1,0 +1,12 @@
+[package]
+name = "wgr-player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex = "1.13.1"
+wgr-runtime = { path = "../wgr-runtime" }

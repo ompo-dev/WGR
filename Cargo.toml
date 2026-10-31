@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/wgr-core", "crates/wgr-http", "crates/wgr-app", "crates/wgr-runtime"]
+members = ["crates/wgr-core", "crates/wgr-http", "crates/wgr-app", "crates/wgr-runtime", "crates/wgr-player"]
 exclude = ["vendor/momor", "vendor/muguet"]
 resolver = "2"
 

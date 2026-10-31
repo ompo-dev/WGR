@@ -1,11 +1,27 @@
-name: Windows
-on: [push, pull_request, workflow_dispatch]
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # audiopus_sys/Opus trazido pelo upstream exige a política legada do CMake.
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+
 jobs:
   validate:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -15,19 +31,51 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Checks, tests, release and real WebView2 smoke
-        shell: pwsh
-        run: ./scripts/Validate.ps1
-      - name: Package portable
-        shell: pwsh
-        run: ./scripts/Package.ps1 -SkipBuild
-      - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: WGR-Windows-evidence
+          shared-key: wgr-windows-release
+
+      - name: Formatação
+        shell: pwsh
+        run: cargo fmt --all -- --check
+
+      - name: Testes de contrato em Node
+        shell: pwsh
+        run: |
+          node tests/ram-io.mjs
+          node tests/session-observer.mjs
+
+      - name: Clippy
+        shell: pwsh
+        run: cargo clippy --release --workspace --all-targets --locked -- -D warnings
+
+      - name: Testes Rust
+        shell: pwsh
+        run: cargo test --release --workspace --locked
+
+      - name: Build release (launcher)
+        shell: pwsh
+        run: cargo build --release --workspace --locked
+
+      - name: Build release (runtime nativo)
+        shell: pwsh
+        run: cargo build --manifest-path vendor/muguet/Cargo.toml --bin wgr-rage --release --locked --target-dir target
+
+      - name: Conferir binários
+        shell: pwsh
+        run: |
+          foreach ($binary in @('target/release/WGR.exe', 'target/release/wgr-rage.exe')) {
+            if (-not (Test-Path -LiteralPath $binary)) { throw "Binário ausente: $binary" }
+          }
+          Get-FileHash -LiteralPath target/release/WGR.exe, target/release/wgr-rage.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } |
+            Set-Content -LiteralPath target/release/SHA256SUMS.txt
+          Get-Content -LiteralPath target/release/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wgr-windows-binaries
           path: |
-            artifacts/*.json
-            artifacts/*.png
-            artifacts/*.log
-            dist/*.zip
-            dist/*.sha256
+            target/release/WGR.exe
+            target/release/wgr-rage.exe
+            target/release/SHA256SUMS.txt
+          if-no-files-found: error

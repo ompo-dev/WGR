@@ -1,0 +1,74 @@
+name: Release Windows
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag da release (ex.: v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wgr-windows-release
+
+      - name: Build release (launcher)
+        shell: pwsh
+        run: cargo build --release --workspace --locked
+
+      - name: Build release (runtime nativo)
+        shell: pwsh
+        run: cargo build --manifest-path vendor/muguet/Cargo.toml --bin wgr-rage --release --locked --target-dir target
+
+      - name: Empacotar portable
+        shell: pwsh
+        run: |
+          Copy-Item -LiteralPath target/release/wgr-rage.exe -Destination wgr-rage.exe -Force
+          ./scripts/Package.ps1 -SkipBuild
+
+      - name: Conferir pacote
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -LiteralPath dist -Filter '*.zip' | Select-Object -First 1
+          if (-not $zip) { throw 'Pacote portable não foi gerado.' }
+          $sums = Join-Path $dist ($zip.BaseName + '.sha256')
+          if (-not (Test-Path -LiteralPath $sums)) { throw 'Arquivo de checksums ausente.' }
+          Get-Content -LiteralPath $sums
+
+      - name: Publicar release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          $files = Get-ChildItem -LiteralPath dist -File | Select-Object -ExpandProperty FullName
+          if (gh release view $env:RELEASE_TAG 2>$null) {
+            gh release upload $env:RELEASE_TAG @files --clobber
+          } else {
+            gh release create $env:RELEASE_TAG --target '${{ github.sha }}' --title "WGR $env:RELEASE_TAG" --generate-notes @files
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wgr-windows-portable
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error

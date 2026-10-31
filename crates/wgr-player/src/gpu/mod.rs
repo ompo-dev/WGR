@@ -13,3 +13,4 @@ pub mod resources;
 pub mod shaders;
 pub mod state;
 pub mod table;
+pub mod upload;

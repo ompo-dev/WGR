@@ -4753,31 +4753,6 @@ impl Gpu {
                 }
             }
         }
-        static PED_SAMPLE: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
-            std::sync::LazyLock::new(|| {
-                std::sync::atomic::AtomicBool::new(
-                    std::env::var("WGR_DIAG_PED").as_deref() == Ok("1"),
-                )
-            });
-        if stage == 1
-            && self.presents > 100
-            && prog.label.to_ascii_lowercase().contains("ped")
-            && PED_SAMPLE.swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            let constants: Vec<_> = self.s.cb[stage].iter().enumerate().filter_map(|(slot, cb)| {
-                let data = self.buf(cb.buf)?.shadow.as_ref()?;
-                let first = cb.first as usize * 16;
-                let vectors: Vec<_> = [0usize, 1, 2, 3, 4, 15].into_iter().filter_map(|index| {
-                    let bytes = data.get(first + index * 16 .. first + (index + 1) * 16)?;
-                    let values: Vec<_> = bytes.chunks_exact(4).map(|b|f32::from_le_bytes(b.try_into().unwrap())).collect();
-                    Some(serde_json::json!({"index":index,"values":values}))
-                }).collect();
-                Some(serde_json::json!({"slot":slot,"buffer":cb.buf,"first":cb.first,"vectors":vectors}))
-            }).collect();
-            crate::bridge::emit(
-                serde_json::json!({"type":"ped_material_sample","program":prog.label,"constants":constants}),
-            );
-        }
         if let Some((bg, uid)) = self.bind_groups.get(&key) {
             return Some(BgResult {
                 bg: bg.clone(),

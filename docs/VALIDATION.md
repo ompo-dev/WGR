@@ -43,3 +43,15 @@ FPS informado é a contagem de apresentações do host, não uma medição físi
 Permanecem por validar percursos controlados com cache frio, voos rápidos por regiões novas, toda a matriz de DPI/monitores, gamepad físico e escuta humana. Não foi afirmado que todos os travamentos desapareceram. Nenhum repositório de referência foi alterado, nem foram distribuídos assets proprietários do jogo.
 
 Após os testes, os intermediários de compilação foram removidos: 7,27 GiB liberados na medição, com 33,17 GiB livres naquele momento. Executáveis finais, cache persistente do jogo e saves foram mantidos. Evidência: artifacts/native-cleanup-summary.json. A engine continuou apresentando quadros após a limpeza.
+
+## Restauração do código anterior ao relato de 16 FPS
+
+Em 31/10/2026 o código foi auditado contra o registro da sessão de 27–29/10. As mudanças posteriores ao relato de 29/10 10:58 já tinham sido revertidas em `061b670` e `e9fd4a4`; restavam somente dois diagnósticos adicionados depois: a amostragem de parâmetros de personagens (`WGR_DIAG_PED`, em `vendor/muguet/src/gpu.rs`) e os contadores de unidades do mouse relativo (em `vendor/muguet/src/input.rs`). Ambos foram removidos, sem alterar o restante do runtime.
+
+O estado regredido foi preservado na branch `regressao/pos-16fps` e na tag `regressao-pos-16fps` antes da restauração. Os binários correspondentes ficaram em `artifacts/recovery-history/pos-16fps/`.
+
+O cache gráfico não precisou ser substituído: `artifacts/recovery-history/check_fxc.py` verificou os 1.134 contêineres FXC referenciados por `cache.sqlite` e não encontrou nenhum inválido. Nenhum save ou asset do jogo foi removido.
+
+Depois da restauração, os dois executáveis foram regravados a partir desse código. O smoke local passou em três execuções, com primeiro quadro entre 90 ms e 105 ms e save restaurado; o alvo continua sendo a fixture Órbita, não o GTA.
+
+Esta restauração recupera o código e os executáveis daquele momento; ela não corrige os problemas abertos então registrados (personagens com material escuro, eixo horizontal do mouse e quedas de FPS em regiões novas). O adaptador GTA continua em validação e não é declarado jogável.

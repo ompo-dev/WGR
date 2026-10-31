@@ -12,8 +12,6 @@ static HELD: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(Hash
 static CAPTURED: AtomicBool = AtomicBool::new(false);
 static KEY_EVENTS: AtomicU64 = AtomicU64::new(0);
 static MOUSE_EVENTS: AtomicU64 = AtomicU64::new(0);
-static MOUSE_X_UNITS: AtomicU64 = AtomicU64::new(0);
-static MOUSE_Y_UNITS: AtomicU64 = AtomicU64::new(0);
 
 const MX: u64 = 0;
 const MY: u64 = 1;
@@ -360,8 +358,6 @@ pub fn mouse_delta_f(dx: f64, dy: f64) {
 }
 
 fn mouse_delta(dx_: i32, dy_: i32) {
-    MOUSE_X_UNITS.fetch_add(dx_.unsigned_abs() as u64, Ordering::Relaxed);
-    MOUSE_Y_UNITS.fetch_add(dy_.unsigned_abs() as u64, Ordering::Relaxed);
     let (w, h) = size();
     if let (Some(mx), Some(my), Some(dx), Some(dy)) = (word(MX), word(MY), word(DX), word(DY)) {
         dx.fetch_add(dx_, Ordering::SeqCst);
@@ -386,5 +382,5 @@ pub fn wheel(notches: i32) {
 
 // Aggregate diagnostics only: no typed text or key identities are recorded.
 pub fn snapshot() -> serde_json::Value {
-    serde_json::json!({"ready":base().is_some(),"focused":crate::pad::FOCUSED.load(Ordering::Relaxed),"captured":CAPTURED.load(Ordering::Relaxed),"held_count":HELD.lock().unwrap().len(),"key_events":KEY_EVENTS.load(Ordering::Relaxed),"relative_mouse_events":MOUSE_EVENTS.load(Ordering::Relaxed),"relative_x_units":MOUSE_X_UNITS.load(Ordering::Relaxed),"relative_y_units":MOUSE_Y_UNITS.load(Ordering::Relaxed)})
+    serde_json::json!({"ready":base().is_some(),"focused":crate::pad::FOCUSED.load(Ordering::Relaxed),"captured":CAPTURED.load(Ordering::Relaxed),"held_count":HELD.lock().unwrap().len(),"key_events":KEY_EVENTS.load(Ordering::Relaxed),"relative_mouse_events":MOUSE_EVENTS.load(Ordering::Relaxed)})
 }

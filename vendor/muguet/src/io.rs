@@ -228,6 +228,7 @@ fn serve_remote(mem: SharedMemory, table: u64) {
                 let destination = word(4) | word(5) << 32;
                 let requested = word(6);
                 let began = std::time::Instant::now();
+                let file_path = files.get(id).map(|(p, _)| p.clone()).unwrap_or_default();
                 let result = (|| -> anyhow::Result<i32> {
                     let (path,size) = files.get(id).ok_or_else(|| anyhow::anyhow!("Unknown file id {id}"))?;
                     if offset >= *size { return Ok(0); }
@@ -236,7 +237,7 @@ fn serve_remote(mem: SharedMemory, table: u64) {
                 })();
                 let value = match result { Ok(n) => n, Err(e) => { eprintln!("[native-io-error] file={id} offset={offset} length={requested}: {e:#}"); -1 } };
                 let elapsed = began.elapsed().as_secs_f64()*1000.0;
-                                if elapsed >= 100.0 { eprintln!("[native-io-slow] file={id} offset={offset} length={requested} ms={elapsed:.1}"); }
+                if elapsed >= 100.0 { eprintln!("[native-io-slow] file={id} path={file_path} offset={offset} length={requested} ms={elapsed:.1}"); }
                 atomic_i32(&mem,row+28).store(value,Ordering::Release);
                 atomic_i32(&mem,row).store(2,Ordering::Release);
                 let _ = mem.atomic_notify(row,1);

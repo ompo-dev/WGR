@@ -5,7 +5,7 @@ use crate::mem_base_len;
 use regex::Regex;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -1309,6 +1309,7 @@ struct PendingMap {
     buf: Buffer,
     done: Arc<AtomicBool>,
     kind: MapKind,
+    started: std::time::Instant,
 }
 enum MapKind {
     Readback {
@@ -1384,6 +1385,7 @@ pub struct Gpu {
     ubo_chunk: usize,
     ubo_off: u64,
     dummy_tex: HashMap<String, TextureView>,
+    ped_probes: HashSet<(u64, u64)>,
     dummy_smp: Option<Sampler>,
     dummy_cmp: Option<Sampler>,
     dummy_bufs: HashMap<u32, Buffer>,
@@ -1439,6 +1441,7 @@ pub struct Gpu {
     submits0: u64,
     passes: u64,
     passes0: u64,
+    frame_size: (u32, u32),
 }
 
 unsafe impl Send for Gpu {}
@@ -1656,6 +1659,7 @@ impl Gpu {
             ubo_chunk: 0,
             ubo_off: 0,
             dummy_tex: HashMap::new(),
+            ped_probes: HashSet::new(),
             dummy_smp: None,
             dummy_cmp: None,
             dummy_bufs: HashMap::new(),
@@ -1705,6 +1709,7 @@ impl Gpu {
             submits0: 0,
             passes: 0,
             passes0: 0,
+            frame_size: (0, 0),
         })
     }
 
@@ -2534,6 +2539,17 @@ impl Gpu {
         }
         let three = t.desc.dim == TextureDimension::D3;
         let (tex, a8, bc, half, astc) = (t.tex.clone(), t.a8, t.bc, t.half, t.astc);
+        let small_format = t.format;
+        if w <= 8 && h <= 8 && d == 1 {
+            let n = size.min(32).max(8);
+            log_once(
+                &format!("small{small_format:?}"),
+                &format!(
+                    "small texture upload {w}x{h} {small_format:?} bytes={:02x?}",
+                    self.bytes(data_addr, n)
+                ),
+            );
+        }
         if astc {
             let origin = Origin3d {
                 x,
@@ -4753,6 +4769,59 @@ impl Gpu {
                 }
             }
         }
+        if stage == 1
+            && prog.label.to_ascii_lowercase().contains("ped")
+            && !self.ped_probes.contains(&(prog.uid, self.presents / 600))
+        {
+            self.ped_probes.insert((prog.uid, self.presents / 600));
+            let mut textures = Vec::new();
+            for b in bindings {
+                if b.kind == Kind::Texture {
+                    let id = *self.s.srv[stage]
+                        .get((b.binding as usize).wrapping_sub(32))
+                        .unwrap_or(&0);
+                    let view = self.view_obj(id);
+                    let tex = view.and_then(|v| self.tex(v.res));
+                    textures.push(serde_json::json!({
+                        "binding": b.binding,
+                        "srv": id,
+                        "present": view.is_some(),
+                        "buffer": view.map(|v| v.is_buf).unwrap_or(true),
+                        "format": tex.map(|t| format!("{:?}", t.format)),
+                        "size": tex.map(|t| [t.desc.w, t.desc.h, t.desc.d]),
+                    }));
+                }
+            }
+            let constants: Vec<_> = self.s.cb[stage]
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.buf != 0)
+                .map(|(slot, c)| {
+                    let shadow = self.buf(c.buf).and_then(|b| b.shadow.as_ref());
+                    let first = c.first as usize * 16;
+                    let values: Vec<f32> = shadow
+                        .and_then(|s| s.get(first..first.saturating_add(16)))
+                        .map(|b| {
+                            b.chunks_exact(4)
+                                .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    serde_json::json!({
+                        "slot": slot,
+                        "buffer": c.buf,
+                        "first": c.first,
+                        "first_vec4": values,
+                    })
+                })
+                .collect();
+            crate::bridge::emit(serde_json::json!({
+                "type": "ped_probe",
+                "program": prog.label,
+                "textures": textures,
+                "constants": constants,
+            }));
+        }
         if let Some((bg, uid)) = self.bind_groups.get(&key) {
             return Some(BgResult {
                 bg: bg.clone(),
@@ -6965,7 +7034,12 @@ impl Gpu {
             }
             d2.store(true, Ordering::SeqCst);
         });
-        self.pending_maps.push(PendingMap { buf, done, kind });
+        self.pending_maps.push(PendingMap {
+            buf,
+            done,
+            kind,
+            started: std::time::Instant::now(),
+        });
     }
 
     fn process_maps(&mut self, wait: bool) {
@@ -6987,6 +7061,17 @@ impl Gpu {
                 continue;
             }
             let pm = self.pending_maps.swap_remove(i);
+            let waited = pm.started.elapsed();
+            if waited >= Duration::from_millis(200) {
+                let label = match &pm.kind {
+                    MapKind::Readback { rows, .. } => format!("readback ({} rows)", rows.len()),
+                    MapKind::Occlusion { .. } => "occlusion".to_string(),
+                };
+                log(&format!(
+                    "slow map: {label} completed after {:.1} ms",
+                    waited.as_secs_f64() * 1000.0
+                ));
+            }
             {
                 let range = pm.buf.slice(..).get_mapped_range().expect("mapped range");
                 match &pm.kind {
@@ -7187,6 +7272,7 @@ impl Gpu {
             buf: map,
             done,
             kind: MapKind::Occlusion { list: out },
+            started: std::time::Instant::now(),
         })
     }
     fn apply_query_results(&mut self) {
@@ -7277,6 +7363,10 @@ impl Gpu {
 
     fn present(&mut self, id: u32) {
         self.materialize_clears(id);
+        self.frame_size = self
+            .tex(id)
+            .map(|t| (t.desc.w, t.desc.h))
+            .unwrap_or(self.frame_size);
         let visible = !OCCLUDED.load(Ordering::Relaxed);
         if let (Some(t), Some(_), true) = (self.tex(id), self.surface.as_ref(), visible) {
             let (w, h) = (t.desc.w, t.desc.h);
@@ -7429,7 +7519,7 @@ impl Gpu {
                 String::new()
             };
             log(&format!(
-                "fps: {:.1} ({} MB memory, game heap {} MB{resident}, gpu {} MB, compressed {} MB{malloc}, {} frames, {} clears folded, {} draws/frame, {} draws waiting for a compiling pipeline, {:.1} submits/frame, {:.1} passes/frame, {} skipped total, pipelines {}, bind groups cached {}, validation errors {})",
+                "fps: {:.1} ({} MB memory, game heap {} MB{resident}, gpu {} MB, compressed {} MB{malloc}, surface {}x{} game {}x{}, {} frames, {} clears folded, {} draws/frame, {} draws waiting for a compiling pipeline, {:.1} submits/frame, {:.1} passes/frame, {} skipped total, pipelines {}, bind groups cached {}, validation errors {})",
                 frames as f64 / dt,
                 crate::footprint_mb(),
                 crate::RT
@@ -7438,6 +7528,10 @@ impl Gpu {
                     .unwrap_or(0),
                 crate::gpu_allocated_mb(),
                 crate::compressed_mb(),
+                self.surface_size.0,
+                self.surface_size.1,
+                self.frame_size.0,
+                self.frame_size.1,
                 frames,
                 self.clears_folded,
                 (self.draws - self.fps_d0) / frames.max(1),

@@ -12,6 +12,11 @@ static HELD: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(Hash
 static CAPTURED: AtomicBool = AtomicBool::new(false);
 static KEY_EVENTS: AtomicU64 = AtomicU64::new(0);
 static MOUSE_EVENTS: AtomicU64 = AtomicU64::new(0);
+static MOUSE_X_UNITS: AtomicU64 = AtomicU64::new(0);
+static MOUSE_Y_UNITS: AtomicU64 = AtomicU64::new(0);
+static MOUSE_RAW_X_EVENTS: AtomicU64 = AtomicU64::new(0);
+static MOUSE_RAW_Y_EVENTS: AtomicU64 = AtomicU64::new(0);
+static MOUSE_ABS_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 const MX: u64 = 0;
 const MY: u64 = 1;
@@ -314,6 +319,7 @@ pub fn button(dom_button: usize, pressed: bool) {
 }
 
 pub fn mouse_pos(x: i32, y: i32) {
+    MOUSE_ABS_EVENTS.fetch_add(1, Ordering::Relaxed);
     let (w, h) = size();
     let (x, y) = (x.clamp(0, w - 1), y.clamp(0, h - 1));
     if let (Some(mx), Some(my), Some(dx), Some(dy)) = (word(MX), word(MY), word(DX), word(DY)) {
@@ -343,6 +349,14 @@ static FRAC: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 
 pub fn mouse_delta_f(dx: f64, dy: f64) {
     MOUSE_EVENTS.fetch_add(1, Ordering::Relaxed);
+    MOUSE_X_UNITS.fetch_add(dx.abs() as u64, Ordering::Relaxed);
+    MOUSE_Y_UNITS.fetch_add(dy.abs() as u64, Ordering::Relaxed);
+    if dx != 0.0 {
+        MOUSE_RAW_X_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+    if dy != 0.0 {
+        MOUSE_RAW_Y_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
     let (ix, iy) = {
         let mut f = FRAC.lock().unwrap();
         f.0 += dx * *SENS;
@@ -382,5 +396,5 @@ pub fn wheel(notches: i32) {
 
 // Aggregate diagnostics only: no typed text or key identities are recorded.
 pub fn snapshot() -> serde_json::Value {
-    serde_json::json!({"ready":base().is_some(),"focused":crate::pad::FOCUSED.load(Ordering::Relaxed),"captured":CAPTURED.load(Ordering::Relaxed),"held_count":HELD.lock().unwrap().len(),"key_events":KEY_EVENTS.load(Ordering::Relaxed),"relative_mouse_events":MOUSE_EVENTS.load(Ordering::Relaxed)})
+    serde_json::json!({"ready":base().is_some(),"focused":crate::pad::FOCUSED.load(Ordering::Relaxed),"captured":CAPTURED.load(Ordering::Relaxed),"held_count":HELD.lock().unwrap().len(),"key_events":KEY_EVENTS.load(Ordering::Relaxed),"relative_mouse_events":MOUSE_EVENTS.load(Ordering::Relaxed),"relative_x_units":MOUSE_X_UNITS.load(Ordering::Relaxed),"relative_y_units":MOUSE_Y_UNITS.load(Ordering::Relaxed),"raw_x_events":MOUSE_RAW_X_EVENTS.load(Ordering::Relaxed),"raw_y_events":MOUSE_RAW_Y_EVENTS.load(Ordering::Relaxed),"absolute_events":MOUSE_ABS_EVENTS.load(Ordering::Relaxed)})
 }

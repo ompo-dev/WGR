@@ -1117,7 +1117,7 @@ pub fn script_tick(
                 let ped = c.i("PlayerPedId", &[]);
                 if c.exists(ped) {
                     crate::bridge::emit(
-                        serde_json::json!({"type":"native_input_probe","position":c.v("GetEntityCoords",&[i(ped),b(true)]),"heading":c.f("GetEntityHeading",&[i(ped)]),"input":crate::input::snapshot()}),
+                        serde_json::json!({"type":"native_input_probe","position":c.v("GetEntityCoords",&[i(ped),b(true)]),"heading":c.f("GetEntityHeading",&[i(ped)]),"camera":c.v("GetGameplayCamRot",&[i(2)]),"input":crate::input::snapshot()}),
                     );
                 }
             }

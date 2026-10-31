@@ -64,7 +64,10 @@ impl NativeChild {
             .env("WGR_NONINTERACTIVE", "1")
             .env(
                 "WGR_INPUT_DIAGNOSTICS",
-                if options.diagnostic || std::env::args().any(|arg| arg == "--gta-smoke") {
+                if options.diagnostic
+                    || std::env::args().any(|arg| arg == "--gta-smoke")
+                    || std::env::var("WGR_INPUT_DIAGNOSTICS").map_or(true, |v| v != "0")
+                {
                     "1"
                 } else {
                     "0"

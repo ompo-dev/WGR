@@ -139,8 +139,18 @@ struct App {
 }
 
 fn backbuffer_size(window: &Window) -> (i32, i32) {
+    // The guest keeps one render target for the whole session (its own resize
+    // path traps), so a small window would stay low resolution after being
+    // enlarged. On Windows start from the physical monitor size: the
+    // presentation letterboxes it into whatever pane the launcher shows.
+    // MUGUET_RES and MUGUET_SCALE still override this.
     let s = if cfg!(target_os = "ios") {
         window.outer_size()
+    } else if cfg!(windows) {
+        window
+            .current_monitor()
+            .map(|m| m.size())
+            .unwrap_or_else(|| window.inner_size())
     } else {
         window.inner_size()
     };
@@ -470,6 +480,11 @@ impl App {
         }
         self.started = true;
         let (w, h) = backbuffer_size(&window);
+        let inner = window.inner_size();
+        eprintln!(
+            "[host] render buffer {w}x{h}; window {}x{}",
+            inner.width, inner.height
+        );
         input::set_size(w, h);
         let (rt, startup) = (self.rt.clone(), self.startup.clone());
         let mut args = self.args.clone();

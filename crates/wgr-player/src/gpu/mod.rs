@@ -14,3 +14,4 @@ pub mod shaders;
 pub mod state;
 pub mod table;
 pub mod upload;
+pub mod worker;

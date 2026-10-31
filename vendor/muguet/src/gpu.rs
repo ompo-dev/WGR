@@ -4760,8 +4760,8 @@ impl Gpu {
                 )
             });
         if stage == 1
-            && self.presents > 3000
-            && prog.label.contains("ped_wrinkle")
+            && self.presents > 100
+            && prog.label.to_ascii_lowercase().contains("ped")
             && PED_SAMPLE.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
             let constants: Vec<_> = self.s.cb[stage].iter().enumerate().filter_map(|(slot, cb)| {

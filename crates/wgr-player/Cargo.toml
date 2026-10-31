@@ -17,4 +17,5 @@ wasmtime = { version = "=50.0.0", default-features = false, features = ["anyhow"
 
 [dev-dependencies]
 pollster = "1.0"
+wat = "1.261.0"
 

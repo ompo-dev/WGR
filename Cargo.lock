@@ -7804,6 +7804,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "wasmtime",
+ "wat",
  "wgpu",
  "wgr-runtime",
  "winit",

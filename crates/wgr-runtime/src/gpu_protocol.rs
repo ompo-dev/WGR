@@ -5,6 +5,8 @@ const DATA: u32 = 64;
 pub struct Command {
     pub opcode: u32,
     pub words: Vec<u32>,
+    /// Endereço absoluto do início do payload na memória da engine.
+    pub address: u64,
     next: u32,
 }
 pub struct Ring {
@@ -58,6 +60,7 @@ impl Ring {
             return Ok(Some(Command {
                 opcode,
                 words: vec![],
+                address: 0,
                 next: DATA,
             }));
         }
@@ -76,6 +79,7 @@ impl Ring {
         Ok(Some(Command {
             opcode,
             words,
+            address: self.base + u64::from(self.tail) + 8,
             next,
         }))
     }

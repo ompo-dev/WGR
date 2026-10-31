@@ -1,22 +1,23 @@
-//! Hospedagem da engine: memória64 compartilhada, linker dinâmico dos imports
-//! Emscripten/WASI/pthreads e chamada de `__main_argc_argv`.
-//!
-//! O host liga os pontos de entrada que o `wgpu_worker.js` recebe do
-//! `browser_main`: `wgpu_start_worker` (ring da GPU), `wasm_input_publish_js`
-//! (bloco de input), `wasm_httpfs_io_start_js` (IO) e `wasm_audio_publish_js`
-//! (áudio). Nesta etapa os pontos são registrados e sinalizados; a drenagem do
-//! ring usa o `Worker` do crate.
+//! Hospedagem da engine: memória64 compartilhada, linker dinâmico, pthreads
+//! (uma instância Wasmtime por thread sobre a mesma memória) e chamada de
+//! `__main_argc_argv`.
 
 use anyhow::{Context, Result, bail, ensure};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Instant;
-use wasmtime::{Caller, ExternType, Linker, Module, Store, Val};
+use wasmtime::{Caller, Engine, ExternType, Linker, Module, Store, Val};
 use wgr_runtime::BinaryContract;
 use wgr_runtime::NativeRuntime;
 use wgr_runtime::shared::GuestMemory;
+
+pub struct Shared {
+    pub module: Module,
+    pub linker: Arc<Linker<Arc<Host>>>,
+    pub engine: Engine,
+}
 
 pub struct Host {
     pub memory: GuestMemory,
@@ -24,13 +25,16 @@ pub struct Host {
     pub cores: u32,
     pub gpu_started: AtomicBool,
     pub io_started: AtomicBool,
-    pub input_block: AtomicU64,
     pub gpu_ring: AtomicU64,
+    pub gpu_ring_size: AtomicU64,
+    pub input_block: AtomicU64,
     pub messages: Mutex<Vec<String>>,
+    pub shared: OnceLock<Arc<Shared>>,
 }
 
 pub struct EngineHost {
     pub runtime: Arc<NativeRuntime>,
+    pub shared: Arc<Shared>,
     pub store: Store<Arc<Host>>,
     pub instance: wasmtime::Instance,
     pub memory: GuestMemory,
@@ -74,6 +78,132 @@ fn argument_i64(params: &[Val], index: usize) -> i64 {
     }
 }
 
+fn export_call(
+    store: &mut Store<Arc<Host>>,
+    instance: &wasmtime::Instance,
+    name: &str,
+    params: &[Val],
+) -> Result<Vec<Val>> {
+    let function = instance
+        .get_func(&mut *store, name)
+        .with_context(|| format!("export {name}"))?;
+    let mut results = vec![Val::I64(0); function.ty(&*store).results().len()];
+    function
+        .call(&mut *store, params, &mut results)
+        .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
+    Ok(results)
+}
+
+fn call_table(
+    store: &mut Store<Arc<Host>>,
+    instance: &wasmtime::Instance,
+    index: u64,
+    argument: u64,
+) -> Result<()> {
+    let table = instance
+        .get_table(&mut *store, "__indirect_function_table")
+        .context("tabela de funções")?;
+    let function = table
+        .get(&mut *store, index)
+        .and_then(|value| value.as_func().flatten().cloned())
+        .context("índice de função nulo")?;
+    function
+        .call(&mut *store, &[Val::I64(argument as i64)], &mut [])
+        .map_err(|error| anyhow::anyhow!("thread: {error:?}"))?;
+    Ok(())
+}
+
+fn run_pthread(host: Arc<Host>, shared: Arc<Shared>, ptr: u64, start: u64, arg: u64) -> Result<()> {
+    let mut store = Store::new(&shared.engine, host.clone());
+    store.set_epoch_deadline(1);
+    let instance = shared
+        .linker
+        .instantiate(&mut store, &shared.module)
+        .map_err(|error| anyhow::anyhow!("instância da thread: {error:?}"))?;
+    let high = host
+        .memory
+        .read(ptr + 80, 8)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(0);
+    let size = host
+        .memory
+        .read(ptr + 88, 8)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(0);
+    let _ = export_call(
+        &mut store,
+        &instance,
+        "emscripten_stack_set_limits",
+        &[
+            Val::I64(high as i64),
+            Val::I64(high.saturating_sub(size) as i64),
+        ],
+    );
+    let _ = export_call(
+        &mut store,
+        &instance,
+        "_emscripten_stack_restore",
+        &[Val::I64(high as i64)],
+    );
+    export_call(
+        &mut store,
+        &instance,
+        "_emscripten_thread_init",
+        &[
+            Val::I64(ptr as i64),
+            Val::I32(0),
+            Val::I32(0),
+            Val::I32(1),
+            Val::I64(0),
+            Val::I32(0),
+        ],
+    )?;
+    call_table(&mut store, &instance, start, arg)
+}
+
+fn spawn_pthread(host: &Arc<Host>, ptr: u64, start: u64, arg: u64) -> i32 {
+    let Some(shared) = host.shared.get().cloned() else {
+        return 6;
+    };
+    let name = host
+        .memory
+        .c_string(arg.wrapping_add(24), 64)
+        .ok()
+        .filter(|name| !name.is_empty() && name.len() <= 40)
+        .unwrap_or_else(|| format!("pthread-{ptr:x}"));
+    let host = host.clone();
+    let spawned = std::thread::Builder::new()
+        .name(name)
+        .stack_size(16 << 20)
+        .spawn(move || {
+            if let Err(error) = run_pthread(host, shared, ptr, start, arg) {
+                eprintln!("[player] pthread 0x{ptr:x}: {error:#}");
+            }
+        });
+    if spawned.is_ok() { 0 } else { 6 }
+}
+
+fn invoke(
+    caller: &mut Caller<'_, Arc<Host>>,
+    params: &[Val],
+    results: &mut [Val],
+) -> wasmtime::Result<()> {
+    let index = argument_i64(params, 0) as u64;
+    let table = caller
+        .get_export("__indirect_function_table")
+        .and_then(|export| export.into_table())
+        .ok_or_else(|| wasmtime::Error::msg("sem tabela de funções"))?;
+    let function = table
+        .get(&mut *caller, index)
+        .and_then(|value| value.as_func().flatten().cloned())
+        .ok_or_else(|| wasmtime::Error::msg(format!("invoke: índice nulo {index}")))?;
+    function.call(&mut *caller, &params[1..], results)
+}
+
 fn dispatch(
     name: &str,
     caller: &mut Caller<'_, Arc<Host>>,
@@ -82,6 +212,9 @@ fn dispatch(
 ) -> wasmtime::Result<()> {
     for result in results.iter_mut() {
         zero(result);
+    }
+    if name.starts_with("invoke_") {
+        return invoke(caller, params, results);
     }
     let host = caller.data().clone();
     match name {
@@ -97,10 +230,7 @@ fn dispatch(
             result_f64(results, millis);
         }
         "emscripten_num_logical_cores" => result_i32(results, host.cores.clamp(1, 64) as i32),
-        "emscripten_get_heap_max" => {
-            let max = host.memory.len() as i64;
-            result_i64(results, max);
-        }
+        "emscripten_get_heap_max" => result_i64(results, host.memory.len() as i64),
         "emscripten_resize_heap" => result_i32(results, 1),
         "wasm_print_line_js" | "wasm_hang_line_js" => {
             let pointer = argument_i64(params, 0);
@@ -120,6 +250,8 @@ fn dispatch(
         "wgpu_start_worker" => {
             host.gpu_ring
                 .store(argument_i64(params, 0) as u64, Ordering::Release);
+            host.gpu_ring_size
+                .store(argument_i64(params, 1) as u64, Ordering::Release);
             host.gpu_started.store(true, Ordering::Release);
             result_i32(results, 0);
         }
@@ -127,7 +259,12 @@ fn dispatch(
             host.io_started.store(true, Ordering::Release);
             result_i32(results, 0);
         }
-        "wasm_audio_publish_js" => result_i32(results, 0),
+        "__pthread_create_js" => {
+            let pointer = argument_i64(params, 0) as u64;
+            let start = argument_i64(params, 2) as u64;
+            let argument = argument_i64(params, 3) as u64;
+            result_i32(results, spawn_pthread(&host, pointer, start, argument));
+        }
         _ => {
             for result in results.iter_mut() {
                 zero(result);
@@ -149,14 +286,15 @@ pub fn load(bytes: &[u8], cores: u32, memory_budget: u64) -> Result<EngineHost> 
         "game.wasm não usa memória compartilhada"
     );
     let runtime = NativeRuntime::new()?;
-    let module = Module::new(runtime.engine(), bytes)
+    let engine = runtime.engine().clone();
+    let module = Module::new(&engine, bytes)
         .map_err(|error| anyhow::anyhow!("Compilação do game.wasm: {error:?}"))?;
     let min_pages = memory_contract.minimum_bytes.div_ceil(65536);
     let max_pages = memory_contract
         .maximum_bytes
         .unwrap_or(min_pages * 4)
         .div_ceil(65536);
-    let memory = GuestMemory::new64(runtime.engine(), min_pages, max_pages, memory_budget)
+    let memory = GuestMemory::new64(&engine, min_pages, max_pages, memory_budget)
         .context("Memória compartilhada da engine")?;
     let host = Arc::new(Host {
         memory: memory.clone(),
@@ -164,14 +302,16 @@ pub fn load(bytes: &[u8], cores: u32, memory_budget: u64) -> Result<EngineHost> 
         cores,
         gpu_started: AtomicBool::new(false),
         io_started: AtomicBool::new(false),
-        input_block: AtomicU64::new(0),
         gpu_ring: AtomicU64::new(0),
+        gpu_ring_size: AtomicU64::new(0),
+        input_block: AtomicU64::new(0),
         messages: Mutex::new(Vec::new()),
+        shared: OnceLock::new(),
     });
-    let mut store = Store::new(runtime.engine(), host.clone());
+    let mut store = Store::new(&engine, host.clone());
     store.set_epoch_deadline(1);
     let import_count = module.imports().count();
-    let mut linker = Linker::new(runtime.engine());
+    let mut linker: Linker<Arc<Host>> = Linker::new(&engine);
     linker
         .define(&mut store, "env", "memory", memory.shared())
         .map_err(|error| anyhow::anyhow!("Import env.memory: {error:?}"))?;
@@ -210,11 +350,21 @@ pub fn load(bytes: &[u8], cores: u32, memory_budget: u64) -> Result<EngineHost> 
             ),
         }
     }
+    let linker = Arc::new(linker);
+    let shared = Arc::new(Shared {
+        module: module.clone(),
+        linker: linker.clone(),
+        engine: engine.clone(),
+    });
+    host.shared
+        .set(shared.clone())
+        .map_err(|_| anyhow::anyhow!("shared já definido"))?;
     let instance = linker
         .instantiate(&mut store, &module)
         .map_err(|error| anyhow::anyhow!("Instanciação do game.wasm: {error:?}"))?;
     Ok(EngineHost {
         runtime,
+        shared,
         store,
         instance,
         memory,
@@ -224,7 +374,6 @@ pub fn load(bytes: &[u8], cores: u32, memory_budget: u64) -> Result<EngineHost> 
 }
 
 impl EngineHost {
-    /// Monta `argv` na pilha linear e chama o ponto de entrada do port.
     pub fn start(&mut self, args: &[String]) -> Result<i32> {
         let alloc = self
             .instance

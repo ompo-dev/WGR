@@ -410,6 +410,22 @@ impl ApplicationHandler for App {
             self.sync_focus(el, &window);
         }
         crate::bridge::sample();
+        {
+            static INJECTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !INJECTED.load(std::sync::atomic::Ordering::Relaxed)
+                && crate::bridge::PRESENTED.load(std::sync::atomic::Ordering::Relaxed) > 1500
+            {
+                if let Ok(axis) = std::env::var("WGR_INPUT_INJECT") {
+                    INJECTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    match axis.as_str() {
+                        "dx" => crate::input::inject(20000, 0),
+                        "dy" => crate::input::inject(0, 20000),
+                        _ => {}
+                    }
+                }
+            }
+        }
         if let Some(reason) = crate::host::stop_reason() {
             eprintln!("[native-error] {reason}");
             std::process::exit(75);

@@ -6596,6 +6596,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgr-player"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "regex",
+ "serde",
+ "serde_json",
+ "wgr-runtime",
+]
+
+[[package]]
 name = "wgr-runtime"
 version = "0.1.0"
 dependencies = [

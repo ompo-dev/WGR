@@ -394,6 +394,14 @@ pub fn wheel(notches: i32) {
     }
 }
 
+/// Diagnostic only: adds a known delta to the engine input block.
+pub fn inject(dx: i32, dy: i32) {
+    if let (Some(x), Some(y)) = (word(DX), word(DY)) {
+        x.fetch_add(dx, Ordering::SeqCst);
+        y.fetch_add(dy, Ordering::SeqCst);
+    }
+}
+
 // Aggregate diagnostics only: no typed text or key identities are recorded.
 pub fn snapshot() -> serde_json::Value {
     serde_json::json!({"ready":base().is_some(),"focused":crate::pad::FOCUSED.load(Ordering::Relaxed),"captured":CAPTURED.load(Ordering::Relaxed),"held_count":HELD.lock().unwrap().len(),"key_events":KEY_EVENTS.load(Ordering::Relaxed),"relative_mouse_events":MOUSE_EVENTS.load(Ordering::Relaxed),"relative_x_units":MOUSE_X_UNITS.load(Ordering::Relaxed),"relative_y_units":MOUSE_Y_UNITS.load(Ordering::Relaxed),"raw_x_events":MOUSE_RAW_X_EVENTS.load(Ordering::Relaxed),"raw_y_events":MOUSE_RAW_Y_EVENTS.load(Ordering::Relaxed),"absolute_events":MOUSE_ABS_EVENTS.load(Ordering::Relaxed)})

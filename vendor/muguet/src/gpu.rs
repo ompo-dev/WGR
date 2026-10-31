@@ -6144,6 +6144,17 @@ impl Gpu {
                 .unwrap_or(false)
     }
     fn clear_rt(&mut self, id: u32, mip: u32, slice: u32, c: [f32; 4]) {
+        if let Some(t) = self.tex(id) {
+            if t.desc.w <= 8 && t.desc.h <= 8 {
+                log_once(
+                    &format!("clearsmall{}x{}{c:?}", t.desc.w, t.desc.h),
+                    &format!(
+                        "clear small texture {}x{} color={c:?}",
+                        t.desc.w, t.desc.h
+                    ),
+                );
+            }
+        }
         let Some(three) = self.tex(id).map(|t| t.desc.dim == TextureDimension::D3) else {
             return;
         };

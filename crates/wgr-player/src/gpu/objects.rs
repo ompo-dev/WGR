@@ -120,7 +120,7 @@ pub fn parse_state(words: &[u32]) -> Option<StateRequest> {
     Some(StateRequest {
         id: *words.first()?,
         kind: *words.get(1)?,
-        first_word: *words.get(2)?,
+        first_word: words.get(2).copied().unwrap_or(0),
     })
 }
 

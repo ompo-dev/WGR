@@ -203,7 +203,12 @@ impl State {
 
     /// `SET_VERTEX_BUFFERS`: buffer, offset e stride por slot.
     pub fn set_vertex_buffers(&mut self, entries: &[(u32, u32, u32)]) {
-        for (slot, &(buffer, offset, stride)) in entries.iter().enumerate() {
+        self.set_vertex_buffers_at(0, entries);
+    }
+
+    pub fn set_vertex_buffers_at(&mut self, start: usize, entries: &[(u32, u32, u32)]) {
+        for (index, &(buffer, offset, stride)) in entries.iter().enumerate() {
+            let slot = start + index;
             if slot < MAX_VERTEX_BUFFER {
                 self.vertex_buffers[slot] = VertexBuffer {
                     buffer,

@@ -5,6 +5,7 @@
 //! ring de comandos. Este crate começa por esses contratos, sem depender de
 //! WebView, HTML ou JavaScript.
 
+pub mod engine;
 pub mod gpu;
 pub mod input;
 pub mod loader;

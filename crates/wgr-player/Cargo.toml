@@ -12,6 +12,8 @@ regex = "1.13.1"
 tracing.workspace = true
 wgpu = "30.0.1"
 wgr-runtime = { path = "../wgr-runtime" }
+wasmtime = { version = "=50.0.0", default-features = false, features = ["anyhow", "cranelift", "runtime", "std", "threads", "parallel-compilation", "demangle", "backtrace"] }
 
 [dev-dependencies]
 pollster = "1.0"
+

@@ -5,6 +5,7 @@ pub mod assembly;
 pub mod bind;
 pub mod formats;
 pub mod layout;
+pub mod pipeline;
 pub mod pipeline_state;
 pub mod recipe;
 pub mod resources;

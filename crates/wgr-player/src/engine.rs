@@ -8,7 +8,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Instant;
-use wasmtime::{Caller, Engine, ExternType, Linker, Module, Store, Val};
+use wasmtime::{Caller, Engine, ExternType, Linker, Module, Store, Val, ValType};
 use wgr_runtime::BinaryContract;
 use wgr_runtime::NativeRuntime;
 use wgr_runtime::shared::GuestMemory;
@@ -42,16 +42,15 @@ pub struct EngineHost {
     pub imports: usize,
 }
 
-fn zero(value: &mut Val) {
-    let replacement = match &*value {
-        Val::I32(_) => Val::I32(0),
-        Val::I64(_) => Val::I64(0),
-        Val::F32(_) => Val::F32(0),
-        Val::F64(_) => Val::F64(0),
-        Val::V128(_) => Val::V128(0u128.into()),
-        other => *other,
-    };
-    *value = replacement;
+fn default_val(ty: &ValType) -> Val {
+    match ty {
+        ValType::I32 => Val::I32(0),
+        ValType::I64 => Val::I64(0),
+        ValType::F32 => Val::F32(0),
+        ValType::F64 => Val::F64(0),
+        ValType::V128 => Val::V128(0u128.into()),
+        ValType::Ref(_) => Val::null_any_ref(),
+    }
 }
 
 fn result_i32(results: &mut [Val], value: i32) {
@@ -67,6 +66,14 @@ fn result_i64(results: &mut [Val], value: i64) {
 fn result_f64(results: &mut [Val], value: f64) {
     if let Some(slot) = results.first_mut() {
         *slot = Val::F64(value.to_bits());
+    }
+}
+
+fn argument_i32(params: &[Val], index: usize) -> i32 {
+    match params.get(index) {
+        Some(Val::I32(value)) => *value,
+        Some(Val::I64(value)) => *value as i32,
+        _ => 0,
     }
 }
 
@@ -204,17 +211,31 @@ fn invoke(
     function.call(&mut *caller, &params[1..], results)
 }
 
+fn trace_imports() -> bool {
+    static TRACE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("WGR_TRACE_IMPORTS").as_deref() == Ok("1"));
+    *TRACE
+}
+
 fn dispatch(
     name: &str,
+    result_types: &[ValType],
     caller: &mut Caller<'_, Arc<Host>>,
     params: &[Val],
     results: &mut [Val],
 ) -> wasmtime::Result<()> {
-    for result in results.iter_mut() {
-        zero(result);
+    for (result, ty) in results.iter_mut().zip(result_types) {
+        *result = default_val(ty);
+    }
+    if trace_imports() {
+        eprintln!("[import] {name} params={params:?}");
     }
     if name.starts_with("invoke_") {
-        return invoke(caller, params, results);
+        let called = invoke(caller, params, results);
+        if trace_imports() {
+            eprintln!("[import] {name} -> {results:?}");
+        }
+        return called;
     }
     let host = caller.data().clone();
     match name {
@@ -231,7 +252,47 @@ fn dispatch(
         }
         "emscripten_num_logical_cores" => result_i32(results, host.cores.clamp(1, 64) as i32),
         "emscripten_get_heap_max" => result_i64(results, host.memory.len() as i64),
-        "emscripten_resize_heap" => result_i32(results, 1),
+        "emscripten_resize_heap" => {
+            let size = argument_i64(params, 0);
+            if size <= 0 {
+                result_i32(results, 0);
+            } else {
+                let memory = host.memory.shared();
+                let current = memory.size();
+                let pages = (size as u64).div_ceil(65536);
+                let grown = pages <= current || memory.grow(pages - current).is_ok();
+                result_i32(results, i32::from(grown));
+            }
+        }
+        "fd_write" => {
+            let iovs = argument_i64(params, 1) as u64;
+            let count = argument_i32(params, 2).max(0) as usize;
+            let written = argument_i64(params, 3) as u64;
+            let mut total = 0u64;
+            for index in 0..count {
+                let at = iovs + index as u64 * 16;
+                let pointer = host
+                    .memory
+                    .read(at, 8)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .unwrap_or(0);
+                let length = host
+                    .memory
+                    .read(at + 8, 8)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .unwrap_or(0);
+                if let Ok(bytes) = host.memory.read(pointer, length as usize) {
+                    eprint!("{}", String::from_utf8_lossy(&bytes));
+                    total += length;
+                }
+            }
+            let _ = host.memory.write(written, &total.to_le_bytes());
+            result_i32(results, 0);
+        }
         "wasm_print_line_js" | "wasm_hang_line_js" => {
             let pointer = argument_i64(params, 0);
             if let Ok(text) = host.memory.c_string(pointer as u64, 16384)
@@ -266,10 +327,13 @@ fn dispatch(
             result_i32(results, spawn_pthread(&host, pointer, start, argument));
         }
         _ => {
-            for result in results.iter_mut() {
-                zero(result);
+            for (result, ty) in results.iter_mut().zip(result_types) {
+                *result = default_val(ty);
             }
         }
+    }
+    if trace_imports() {
+        eprintln!("[import] {name} -> {results:?}");
     }
     Ok(())
 }
@@ -329,15 +393,23 @@ pub fn load(bytes: &[u8], cores: u32, memory_budget: u64) -> Result<EngineHost> 
         match import.ty() {
             ExternType::Func(ty) => {
                 let name = import.name().to_string();
+                if trace_imports() {
+                    let params: Vec<_> = ty.params().collect();
+                    let results: Vec<_> = ty.results().collect();
+                    eprintln!(
+                        "[define] {module_name}.{name} params={params:?} results={results:?}"
+                    );
+                }
                 let dispatch_name = name.clone();
                 let error_name = name.clone();
+                let result_types: Vec<ValType> = ty.results().collect();
                 linker
                     .func_new(
                         module_name,
                         &name,
                         ty,
                         move |mut caller, params, results| {
-                            dispatch(&dispatch_name, &mut caller, params, results)
+                            dispatch(&dispatch_name, &result_types, &mut caller, params, results)
                         },
                     )
                     .map_err(|error| {
@@ -375,6 +447,32 @@ pub fn load(bytes: &[u8], cores: u32, memory_budget: u64) -> Result<EngineHost> 
 
 impl EngineHost {
     pub fn start(&mut self, args: &[String]) -> Result<i32> {
+        // Emscripten initializes a tabela de funções e os dados no ctors; sem
+        // ele, call_indirect/invoke caem em funcref nulo.
+        for name in ["__wasm_apply_data_relocs", "__wasm_init_memory"] {
+            if let Ok(init) = self
+                .instance
+                .get_typed_func::<(), ()>(&mut self.store, name)
+            {
+                init.call(&mut self.store, ())
+                    .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
+            }
+        }
+        if let Ok(tls) = self
+            .instance
+            .get_typed_func::<(), ()>(&mut self.store, "_emscripten_tls_init")
+        {
+            tls.call(&mut self.store, ())
+                .map_err(|error| anyhow::anyhow!("_emscripten_tls_init: {error:?}"))?;
+        }
+        if let Ok(ctors) = self
+            .instance
+            .get_typed_func::<(), ()>(&mut self.store, "__wasm_call_ctors")
+        {
+            ctors
+                .call(&mut self.store, ())
+                .map_err(|error| anyhow::anyhow!("__wasm_call_ctors: {error:?}"))?;
+        }
         let alloc = self
             .instance
             .get_typed_func::<i64, i64>(&mut self.store, "_emscripten_stack_alloc")
@@ -442,12 +540,12 @@ mod tests {
     }
 
     #[test]
-    fn val_types_are_zeroed_for_unknown_imports() {
-        let mut value = Val::F64(7f64.to_bits());
-        zero(&mut value);
-        assert!(matches!(value, Val::F64(bits) if bits == 0));
-        let mut value = Val::I32(9);
-        zero(&mut value);
-        assert!(matches!(value, Val::I32(0)));
+    fn result_defaults_follow_the_declared_type() {
+        assert!(matches!(default_val(&ValType::I32), Val::I32(0)));
+        assert!(matches!(
+            default_val(&ValType::F64),
+            Val::F64(bits) if bits == 0
+        ));
+        assert!(matches!(default_val(&ValType::I64), Val::I64(0)));
     }
 }

@@ -11,6 +11,7 @@ const DISK_BUDGET: u64 = 2 << 30;
 const HOT_BUDGET: usize = 48 << 20;
 const BLOCK: u64 = 128 << 10;
 const FETCH_WINDOW: u64 = 1 << 20;
+const BOOT_PREFETCH_BUDGET: u64 = 64 << 20;
 const BUILD: &str = "8b0b5899ed";
 
 fn fetch_window(start: u64, size: u64) -> (u64, u64) {
@@ -19,6 +20,13 @@ fn fetch_window(start: u64, size: u64) -> (u64, u64) {
         window_start,
         window_start.saturating_add(FETCH_WINDOW).min(size),
     )
+}
+
+fn boot_range_end(position: u64, end: u64, budget_left: u64) -> u64 {
+    position
+        .saturating_add(1 << 20)
+        .min(end)
+        .min(position.saturating_add(budget_left))
 }
 
 #[cfg(test)]
@@ -31,6 +39,12 @@ mod tests {
         assert_eq!(fetch_window(128 << 10, 3 << 20), (0, 1 << 20));
         assert_eq!(fetch_window(1 << 20, 3 << 20), (1 << 20, 2 << 20));
         assert_eq!(fetch_window((3 << 20) - 64, 3 << 20), (2 << 20, 3 << 20));
+    }
+
+    #[test]
+    fn caps_boot_preload_without_splitting_the_final_range() {
+        assert_eq!(boot_range_end(63 << 20, 100 << 20, 1 << 20), 64 << 20);
+        assert_eq!(boot_range_end(60 << 20, 61 << 20, 4 << 20), 61 << 20);
     }
 }
 
@@ -256,6 +270,7 @@ impl Assets {
         let mut batch = Vec::new();
         let mut batch_bytes = 0;
         let mut ranges = Vec::new();
+        let mut range_bytes = 0;
         for (name, mut spans) in boot {
             safe_relative(&name)?;
             let Some(&size) = sizes.get(&name) else {
@@ -299,9 +314,11 @@ impl Assets {
                         .saturating_mul(BLOCK)
                         .min(size);
                     let mut position = start;
-                    while position < end {
-                        let finish = (position + (1 << 20)).min(end);
+                    while position < end && range_bytes < BOOT_PREFETCH_BUDGET {
+                        let remaining = BOOT_PREFETCH_BUDGET - range_bytes;
+                        let finish = boot_range_end(position, end, remaining);
                         ranges.push((name.clone(), size, position, finish));
+                        range_bytes += finish - position;
                         position = finish;
                     }
                     covered = covered.max(end);
@@ -315,9 +332,10 @@ impl Assets {
             serde_json::json!({"type":"game-progress","payload":{"label":"Preparando os dados iniciais do jogo"}}),
         );
         eprintln!(
-            "[native-assets] boot: {} metadata batches, {} range jobs",
+            "[native-assets] boot: {} metadata batches, {} range jobs ({} MiB initial; rest on demand)",
             batches.len(),
-            ranges.len()
+            ranges.len(),
+            range_bytes >> 20
         );
         self.background.install(|| {
             batches

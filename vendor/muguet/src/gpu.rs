@@ -578,7 +578,9 @@ static RE_UNIFORM_DECL: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 static RE_ARRAY_N: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"array<[^>]*>,\s*(\d+)u?>").unwrap());
+    LazyLock::new(|| Regex::new(r"array<[^,>]+,\s*(\d+)u?\s*>").unwrap());
+static RE_MATRIX_COLUMNS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"mat(\d)x\d(?:<[^>]+>|[a-z]+)?").unwrap());
 static RE_FIRST_FN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n(?:@\w+|fn)\s").unwrap());
 static RE_FLAT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"@location\((\d+)u?\)\s*@interpolate\(flat[^)]*\)").unwrap());
@@ -768,6 +770,33 @@ struct Pack {
     size: u64,
 }
 
+fn uniform_registers(body: &str) -> u64 {
+    body.split(';')
+        .filter(|field| field.contains(':'))
+        .map(|field| {
+            if let Some(array) = RE_ARRAY_N.captures(field) {
+                return array[1].parse::<u64>().unwrap_or(1);
+            }
+            RE_MATRIX_COLUMNS
+                .captures(field)
+                .and_then(|matrix| matrix[1].parse::<u64>().ok())
+                .unwrap_or(1)
+        })
+        .sum::<u64>()
+        .max(1)
+}
+
+#[cfg(test)]
+mod uniform_tests {
+    use super::*;
+
+    #[test]
+    fn retains_every_ped_material_register() {
+        let body = "base: vec4f; tint: array<vec4f, 6>; transform: mat4x4f;";
+        assert_eq!(uniform_registers(body), 11);
+    }
+}
+
 fn pack_uniforms(text: &str) -> (String, Option<Pack>) {
     struct M {
         binding: u32,
@@ -790,11 +819,7 @@ fn pack_uniforms(text: &str) -> (String, Option<Pack>) {
         ))
         .ok()
         .and_then(|st| st.captures(text).map(|s| s[1].to_string()))
-        .and_then(|body| {
-            RE_ARRAY_N
-                .captures(&body)
-                .map(|a| a[1].parse::<u64>().unwrap_or(1) * 16)
-        })
+        .map(|body| uniform_registers(&body) * 16)
         .unwrap_or(16);
         members.push(M {
             binding: b,

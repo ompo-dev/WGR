@@ -10,7 +10,30 @@ use wgr_core::security::{rooted_file, safe_relative, HttpClient, NetworkPolicy};
 const DISK_BUDGET: u64 = 2 << 30;
 const HOT_BUDGET: usize = 48 << 20;
 const BLOCK: u64 = 128 << 10;
+const FETCH_WINDOW: u64 = 1 << 20;
 const BUILD: &str = "8b0b5899ed";
+
+fn fetch_window(start: u64, size: u64) -> (u64, u64) {
+    let window_start = start / FETCH_WINDOW * FETCH_WINDOW;
+    (
+        window_start,
+        window_start.saturating_add(FETCH_WINDOW).min(size),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn groups_adjacent_blocks_in_one_bounded_window() {
+        assert_eq!(fetch_window(0, 3 << 20), (0, 1 << 20));
+        assert_eq!(fetch_window(128 << 10, 3 << 20), (0, 1 << 20));
+        assert_eq!(fetch_window(1 << 20, 3 << 20), (1 << 20, 2 << 20));
+        assert_eq!(fetch_window((3 << 20) - 64, 3 << 20), (2 << 20, 3 << 20));
+    }
+}
+
 static ASSETS: OnceLock<Arc<Assets>> = OnceLock::new();
 static HOT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DISK_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -306,7 +329,7 @@ impl Assets {
             let url=format!("{}{path}?v={}",self.data_base,self.version);
             let mut position=*start;
             while position<*end {
-                self.data_block(path,*size,position,*end,&url)?;
+                self.data_block(path, *size, position, &url)?;
                 position=(position+BLOCK).min(*end);
             }
             let done=completed.fetch_add(1,std::sync::atomic::Ordering::Relaxed)+1;
@@ -435,24 +458,18 @@ impl Assets {
         }
         Ok(None)
     }
-    fn data_block(
-        &self,
-        path: &str,
-        size: u64,
-        start: u64,
-        end: u64,
-        url: &str,
-    ) -> Result<Arc<Vec<u8>>> {
+    fn data_block(&self, path: &str, size: u64, start: u64, url: &str) -> Result<Arc<Vec<u8>>> {
         let key = format!("{BUILD}:data:{path}:{start}:{size}");
         if let Some(data) = self.cached(&key)? {
             return Ok(data);
         }
+        let (window_start, finish) = fetch_window(start, size);
         let lock = {
             let mut locks = self.locks.lock().unwrap();
             if locks.len() > 1024 {
                 locks.retain(|_, value| value.strong_count() != 0);
             }
-            let lock_key = format!("data-file:{path}:{start}");
+            let lock_key = format!("data-file:{path}:{window_start}");
             let lock = locks
                 .get(&lock_key)
                 .and_then(Weak::upgrade)
@@ -464,13 +481,8 @@ impl Assets {
         if let Some(data) = self.cached(&key)? {
             return Ok(data);
         }
-        // One validated HTTP range for adjacent demand; retain the old 128 KiB
-        // persistent block keys so previous downloads remain usable.
-        let finish = end
-            .div_ceil(BLOCK)
-            .saturating_mul(BLOCK)
-            .min(size)
-            .min(start + (4 << 20));
+        // One shared, bounded range per window prevents concurrent neighbouring
+        // reads from fetching the same data repeatedly.
         let whole = size <= 2 << 20
             && [
                 ".fxc", ".xml", ".meta", ".json", ".ymt", ".csv", ".dat", ".gfx", ".txt", ".sps",
@@ -478,7 +490,7 @@ impl Assets {
             ]
             .iter()
             .any(|extension| path.ends_with(extension));
-        let origin = if whole { 0 } else { start };
+        let origin = if whole { 0 } else { window_start };
         FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let bytes = self.runtime.block_on(async {
             let _permit = self.network.acquire().await?;
@@ -491,7 +503,7 @@ impl Assets {
                 );
                 return Ok(reply.body);
             }
-            self.http.range(url, start, finish - 1, size).await
+            self.http.range(url, window_start, finish - 1, size).await
         })?;
         DECODED_BYTES.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let mut first = None;
@@ -687,7 +699,7 @@ pub fn prefetch_data(path: &str, size: u64, offset: u64, length: u64, low: bool)
             let url = format!("{}{path}?v={}", owned.data_base, owned.version);
             let mut at = start;
             while at < end {
-                owned.data_block(&path, size, at, end, &url)?;
+                owned.data_block(&path, size, at, &url)?;
                 at += BLOCK;
             }
             Ok(())
@@ -713,7 +725,7 @@ pub fn read_data(path: &str, size: u64, offset: u64, length: u64) -> Result<Vec<
     while position < end {
         let start = position / BLOCK * BLOCK;
         let finish = (start + BLOCK).min(size);
-        let data = assets.data_block(path, size, start, end, &url)?;
+        let data = assets.data_block(path, size, start, &url)?;
         ensure!(
             data.len() as u64 == finish - start,
             "Bloco de dados truncado"

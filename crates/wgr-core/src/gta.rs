@@ -165,6 +165,7 @@ pub struct RemoteArchive {
 }
 impl RemoteArchive {
     pub fn new(index: ZipIndex, policy: NetworkPolicy, cache: Arc<DiskCache>) -> Result<Self> {
+        ensure!(index.size > 30, "Índice ZIP inválido");
         policy.validate(&index.url)?;
         let prefix = index.prefix()?;
         let identity = sha256(&serde_json::to_vec(&index)?);
@@ -219,6 +220,10 @@ impl RemoteArchive {
         Ok(bytes)
     }
     async fn header(&self, name: &str, entry: &ZipEntry) -> Result<(u64, Option<u32>)> {
+        ensure!(
+            matches!(entry.method, 0 | 8) && (entry.method != 0 || entry.csize == entry.usize),
+            "Método ou tamanhos do membro ZIP inválidos"
+        );
         if let Some(value) = self.offsets.lock().await.get(name).copied() {
             return Ok(value);
         }
@@ -233,7 +238,7 @@ impl RemoteArchive {
             )
             .await?;
         ensure!(
-            header[..4] == [0x50, 0x4b, 0x03, 0x04],
+            header.len() >= 30 && header[..4] == [0x50, 0x4b, 0x03, 0x04],
             "Assinatura ZIP local inválida"
         );
         let word = |i| u16::from_le_bytes([header[i], header[i + 1]]);
@@ -247,7 +252,9 @@ impl RemoteArchive {
             name_len > 0 && name_len < 4096 && name_len as usize == name.len(),
             "Nome ZIP inválido"
         );
-        let filename = &header[30..30 + name_len as usize];
+        let filename = header
+            .get(30..30 + name_len as usize)
+            .context("Nome ZIP truncado")?;
         ensure!(
             filename == name.as_bytes(),
             "Nome do header ZIP difere do índice"
@@ -638,8 +645,15 @@ pub async fn read_file(path: &Path, start: u64, end: u64) -> Result<Vec<u8>> {
 mod tests {
     #[test]
     fn directory_entry_is_not_a_build_id() -> anyhow::Result<()> {
-        let index: super::ZipIndex =
-            serde_json::from_str(include_str!("../../../assets/gta/zip_index.json"))?;
+        let index: super::ZipIndex = serde_json::from_value(serde_json::json!({
+            "url":"https://example.org/authorized.zip",
+            "size": 100000,
+            "entries": {
+                "authorized/mirror/playgta5.com/index.html": {"csize":8,"usize":8,"method":0,"lho":10},
+                "authorized/mirror/playgta5.com/b/8b0b5899ed/game.wasm": {"csize":8,"usize":8,"method":0,"lho":50},
+                "authorized/mirror/playgta5.com/b/8b0b5899ed/": {"csize":0,"usize":0,"method":0,"lho":70}
+            }
+        }))?;
         assert_eq!(index.builds()?, vec!["8b0b5899ed"]);
         Ok(())
     }

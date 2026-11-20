@@ -69,10 +69,12 @@ pub fn parse_texture_upload(payload_address: u64, words: &[u32]) -> Option<Textu
 }
 
 /// Confere a geometria de um upload de textura contra o formato e o tamanho.
-/// Devolve `false` quando a cópia sairia da textura ou da memória.
+/// Limites do recurso e da memória são conferidos pelo Worker.
 pub fn valid_texture_upload(upload: &TextureUpload, format: TextureFormat) -> bool {
     let (block_w, block_h) = format.block_dimensions();
-    let block_bytes = format.block_copy_size(None).unwrap_or(4);
+    let Some(block_bytes) = format.block_copy_size(None) else {
+        return false;
+    };
     let (Some(row_bytes), Some(min_rows)) = (
         upload.width.div_ceil(block_w).checked_mul(block_bytes),
         Some(upload.height.div_ceil(block_h)),
@@ -82,12 +84,21 @@ pub fn valid_texture_upload(upload: &TextureUpload, format: TextureFormat) -> bo
     if upload.width == 0 || upload.height == 0 || upload.depth == 0 {
         return false;
     }
-    if upload.bytes_per_row < row_bytes || upload.rows < min_rows {
+    if upload.bytes_per_row < row_bytes
+        || upload.rows < min_rows
+        || !upload.bytes_per_row.is_multiple_of(block_bytes)
+        || !upload.x.is_multiple_of(block_w)
+        || !upload.y.is_multiple_of(block_h)
+    {
         return false;
     }
     let Some(required) = (upload.bytes_per_row as u64)
         .checked_mul(u64::from(upload.rows))
-        .and_then(|value| value.checked_mul(u64::from(upload.depth)))
+        .and_then(|value| value.checked_mul(u64::from(upload.depth - 1)))
+        .and_then(|value| {
+            value.checked_add(u64::from(upload.bytes_per_row) * u64::from(min_rows - 1))
+        })
+        .and_then(|value| value.checked_add(u64::from(row_bytes)))
     else {
         return false;
     };
@@ -152,5 +163,21 @@ mod tests {
             ..rgba
         };
         assert!(valid_texture_upload(&bc1, TextureFormat::Bc1RgbaUnorm));
+    }
+
+    #[test]
+    fn last_row_needs_no_trailing_padding() {
+        let mut upload = parse_texture_upload(0, &[1, 0, 0, 0, 0, 0, 3, 2, 1, 16, 4, 28]).unwrap();
+        assert!(valid_texture_upload(&upload, TextureFormat::Rgba8Unorm));
+        upload.size = 27;
+        assert!(!valid_texture_upload(&upload, TextureFormat::Rgba8Unorm));
+        upload.depth = 2;
+        upload.size = 92;
+        assert!(valid_texture_upload(&upload, TextureFormat::Rgba8Unorm));
+        upload.size = 91;
+        assert!(!valid_texture_upload(&upload, TextureFormat::Rgba8Unorm));
+        upload.bytes_per_row = 13;
+        upload.size = 1000;
+        assert!(!valid_texture_upload(&upload, TextureFormat::Rgba8Unorm));
     }
 }

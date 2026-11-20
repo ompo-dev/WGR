@@ -71,14 +71,16 @@ pub enum StartMode {
     Menu,
     Story,
     Sandbox,
+    SandboxEnvTest,
 }
 
 impl StartMode {
-    fn word(self) -> i32 {
+    pub(crate) fn word(self) -> i32 {
         match self {
             Self::Menu => 0,
             Self::Story => 1,
             Self::Sandbox => 2,
+            Self::SandboxEnvTest => 3,
         }
     }
 }
@@ -162,9 +164,6 @@ pub fn engine_args(launch: &Launch) -> Vec<String> {
             "-shadowQuality=-1".into()
         });
     }
-    if launch.start_mode != StartMode::Menu {
-        args.push(format!("-wasmstartchoice={}", launch.start_mode.word()));
-    }
     args
 }
 
@@ -196,7 +195,6 @@ mod tests {
             "-fastscriptcore",
             "-frameLimit=0",
             "-numCores=2",
-            "-wasmstartchoice=2",
         ] {
             assert!(args.iter().any(|arg| arg == expected), "faltou {expected}");
         }

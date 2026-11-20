@@ -13,9 +13,13 @@ tracing.workspace = true
 wgpu = "30.0.1"
 winit = "0.30.13"
 wgr-runtime = { path = "../wgr-runtime" }
+wgr-core = { path = "../wgr-core" }
+tokio.workspace = true
+cpal = "0.18.2"
 wasmtime = { version = "=50.0.0", default-features = false, features = ["anyhow", "cranelift", "runtime", "std", "threads", "parallel-compilation", "demangle", "backtrace"] }
 
 [dev-dependencies]
 pollster = "1.0"
 wat = "1.261.0"
-
+tempfile = "3.23"
+wgr-http = { path = "../wgr-http" }

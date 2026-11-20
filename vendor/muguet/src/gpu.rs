@@ -6,7 +6,7 @@ use regex::Regex;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -18,7 +18,11 @@ use wgpu::*;
 const RING_DATA: u64 = 64;
 pub fn native_backends() -> Backends {
     if cfg!(windows) {
-        Backends::DX12 | Backends::VULKAN
+        match std::env::var("WGR_GPU_BACKEND").ok().as_deref() {
+            Some("dx12") => Backends::DX12,
+            Some("vulkan") => Backends::VULKAN,
+            _ => Backends::DX12 | Backends::VULKAN,
+        }
     } else {
         Backends::METAL
     }
@@ -31,10 +35,206 @@ const RING_CHUNK: u64 = 8 << 20;
 const UBO_WINDOW: u64 = 65536;
 const FRAME_SLOTS: usize = 3;
 const PIPELINE_WAIT: Duration = Duration::from_millis(8);
+const SHADER_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+fn shader_retry_ready(failed_at: Option<&Instant>, now: Instant) -> bool {
+    failed_at.is_none_or(|last| now.saturating_duration_since(*last) >= SHADER_RETRY_DELAY)
+}
+
+#[cfg(test)]
+mod shader_retry_tests {
+    use super::*;
+
+    #[test]
+    fn transient_shader_failures_retry_after_cooldown() {
+        let now = Instant::now();
+        assert!(shader_retry_ready(None, now));
+        assert!(!shader_retry_ready(
+            Some(&(now - Duration::from_secs(4))),
+            now
+        ));
+        assert!(shader_retry_ready(Some(&(now - SHADER_RETRY_DELAY)), now));
+    }
+}
+/// Browser parity: never drop a cold deferred-lighting draw solely because a
+/// normal frame already spent its 8 ms compilation allowance.
+const LIGHT_PIPELINE_WAIT: Duration = Duration::from_millis(1200);
+static PED_GBUFFER_DUMPED: AtomicBool = AtomicBool::new(false);
+/// Diagnostic A/B only. A native occlusion query that incorrectly reports
+/// zero can hide an entire block of city geometry without a WebGPU error.
+static FORCE_OCCLUSION_VISIBLE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("MUGUET_DIAG_OCCLUSION_VISIBLE").as_deref() == Ok("1"));
+static OCCLUSION_ZERO: AtomicU64 = AtomicU64::new(0);
+static OCCLUSION_NONZERO: AtomicU64 = AtomicU64::new(0);
+static OCCLUSION_EMPTY: AtomicU64 = AtomicU64::new(0);
+static OCCLUSION_INCOMPLETE: AtomicU64 = AtomicU64::new(0);
+static PED_GBUFFER_DUMP_AFTER_PRESENTS: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("MUGUET_PED_GBUFFER_AFTER_PRESENTS")
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+        .unwrap_or(5000)
+});
+
+fn critical_lighting_pipeline(vs: &str, ps: Option<&str>) -> bool {
+    [Some(vs), ps].into_iter().flatten().any(|label| {
+        let effect = label.split("::").next().unwrap_or("");
+        effect == "deferred_lighting"
+            || effect == "deferred_lightingMS"
+            || effect == "deferred_lightingMS0"
+            || effect == "tiled_lighting"
+            || effect == "tiled_lightingMS"
+            || effect == "tiled_lightingMS0"
+            || effect.contains("emissive")
+            || (effect == "im" && (label.contains("corona") || label.contains("DistantLights")))
+    })
+}
+
+#[cfg(test)]
+mod lighting_wait_tests {
+    #[test]
+    fn only_wait_for_lighting_and_emissive_draws() {
+        assert!(super::critical_lighting_pipeline(
+            "im::VS_Blit",
+            Some("deferred_lighting::PS_DeferredLighting")
+        ));
+        assert!(super::critical_lighting_pipeline(
+            "tiled_lightingMS0::VS_Fullscreen",
+            None
+        ));
+        assert!(super::critical_lighting_pipeline(
+            "tiled_lightingMS::VS_Fullscreen",
+            None
+        ));
+        assert!(super::critical_lighting_pipeline(
+            "im::VS_Blit",
+            Some("vehicle_emissive::PS_Deferred")
+        ));
+        assert!(!super::critical_lighting_pipeline(
+            "ped::VS_PedTransformSkinD",
+            Some("ped::PS_DeferredPedTexturedC")
+        ));
+    }
+}
 const ZERO_VB_SIZE: u64 = 4096;
 const OCCLUSION_CAPACITY: u32 = 2048;
 const OCCLUSION_VISIBLE_COUNT: u64 = 65536;
-const BG_LIMIT: usize = 24000;
+const BG_LIMIT: usize = 48000;
+static PERF_DIAGNOSTICS: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("MUGUET_PERF_DIAGNOSTICS").as_deref() == Ok("1"));
+static UNIFORM_CACHE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("MUGUET_UNIFORM_CACHE").as_deref() != Ok("0"));
+static UNIFORM_CACHE_AB: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("MUGUET_UNIFORM_CACHE_AB").as_deref() == Ok("1"));
+
+fn can_stage_ordered_buffer_upload(offset: u64, bytes: u64) -> bool {
+    offset.is_multiple_of(4) && bytes.is_multiple_of(4) && bytes <= RING_CHUNK - UBO_WINDOW
+}
+
+#[cfg(test)]
+mod ordered_buffer_upload_tests {
+    use super::*;
+
+    #[test]
+    fn stages_regular_updates_only_when_gpu_copy_is_aligned_and_bounded() {
+        assert!(can_stage_ordered_buffer_upload(0, 0));
+        assert!(can_stage_ordered_buffer_upload(1024, 4096));
+        assert!(!can_stage_ordered_buffer_upload(3, 4096));
+        assert!(!can_stage_ordered_buffer_upload(1024, 4095));
+        assert!(!can_stage_ordered_buffer_upload(0, RING_CHUNK));
+    }
+}
+
+struct OpcodeCounts([u64; 48]);
+
+impl Default for OpcodeCounts {
+    fn default() -> Self {
+        Self([0; 48])
+    }
+}
+
+impl std::ops::Deref for OpcodeCounts {
+    type Target = [u64; 48];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for OpcodeCounts {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[derive(Default)]
+struct PerfCounters {
+    frame_ms: f64,
+    max_frame_ms: f64,
+    frames: u64,
+    submit_ms: f64,
+    acquire_ms: f64,
+    fence_wait_ms: f64,
+    bind_group_ms: f64,
+    bind_hits: u64,
+    bind_misses: u64,
+    bind_trims: u64,
+    staged_buffer_updates: u64,
+    upload_fallback_flushes: u64,
+    uniform_cache_hits: u64,
+    uniform_cache_misses: u64,
+    uniform_bytes_saved: u64,
+    flush_sync: u64,
+    flush_destroy: u64,
+    flush_texture_upload: u64,
+    flush_readback: u64,
+    flush_idle_query: u64,
+    opcode_ns: OpcodeCounts,
+    opcode_calls: OpcodeCounts,
+    idle_wait_ns: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UniformBindingStamp {
+    buffer: u32,
+    generation: u64,
+    version: u64,
+    first: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UniformCacheKey {
+    program: u64,
+    stage: u32,
+    bindings: smallvec::SmallVec<[UniformBindingStamp; 4]>,
+}
+
+#[cfg(test)]
+mod uniform_cache_key_tests {
+    use super::*;
+
+    #[test]
+    fn buffer_content_versions_and_recycled_ids_cannot_share_uniform_payloads() {
+        let mut key = UniformCacheKey {
+            program: 14,
+            stage: 1,
+            bindings: smallvec::smallvec![UniformBindingStamp {
+                buffer: 31,
+                generation: 7,
+                version: 12,
+                first: 4,
+            }],
+        };
+        let before = key.clone();
+        key.bindings[0].version += 1;
+        assert_ne!(before, key);
+        let next = key.clone();
+        key.bindings[0].generation += 1;
+        assert_ne!(next, key);
+        let next = key.clone();
+        key.bindings[0].first += 1;
+        assert_ne!(next, key);
+    }
+}
 
 pub struct SurfaceHandoff {
     pub instance: Instance,
@@ -77,6 +277,31 @@ fn log(s: &str) {
     eprintln!("[wgpu] {s}");
 }
 
+fn mark_resource_created(generations: &mut Vec<u64>, id: usize) {
+    if generations.len() <= id {
+        generations.resize(id + 1, 0);
+    }
+    generations[id] = generations[id].wrapping_add(1).max(1);
+}
+
+#[cfg(test)]
+mod resource_generation_tests {
+    #[test]
+    fn recycled_view_and_texture_ids_get_distinct_bind_group_cache_keys() {
+        let mut generations = Vec::new();
+        super::mark_resource_created(&mut generations, 3);
+        super::mark_resource_created(&mut generations, 7);
+        let old_key = [3, generations[3], generations[7]];
+        // Guest destroys both and recreates them with the same numeric IDs.
+        super::mark_resource_created(&mut generations, 3);
+        super::mark_resource_created(&mut generations, 7);
+        let new_key = [3, generations[3], generations[7]];
+        assert_ne!(old_key, new_key);
+        assert_eq!(generations[3], 2);
+        assert_eq!(generations[7], 2);
+    }
+}
+
 fn atomic(mem: &SharedMemory, addr: u64) -> &AtomicI32 {
     let (base, _) = mem_base_len(mem);
     unsafe { &*(base.add(addr as usize) as *const AtomicI32) }
@@ -90,6 +315,10 @@ struct Fmt {
 }
 
 static BC_SOFT: AtomicBool = AtomicBool::new(false);
+static PACKED_UNORM_TEXTURES: AtomicU64 = AtomicU64::new(0);
+static PACKED_BC_COPIES: AtomicU64 = AtomicU64::new(0);
+static EAGER_CLEARS: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("MUGUET_EAGER_CLEARS").as_deref() == Ok("1"));
 static BC1_ASTC: AtomicBool = AtomicBool::new(false);
 static F32_HALF: AtomicBool = AtomicBool::new(false);
 static CLOUD_SHADOWS: LazyLock<bool> =
@@ -282,7 +511,14 @@ fn map_format(f: u32, bind: u32) -> Fmt {
     let ds = bind & BIND_DS != 0;
     let (format, views, a8) = match f {
         2 => (T::Rgba32Float, vec![], false),
-        9 | 10 | 11 => (T::Rgba16Float, vec![], false),
+        9 | 10 => (T::Rgba16Float, vec![], false),
+        // R16G16B16A16_UNORM: the browser uses rgba16unorm only when
+        // texture-formats-tier1 is enabled. wgpu 30 does not expose that
+        // optional feature, so rendering to rgba16unorm fails validation.
+        // Use float32 and quantize into BC1 words explicitly on GPU during
+        // raw-to-BC copies, matching FivePlay's bcPackedUnorm fallback.
+        // float16 would irreversibly corrupt the 16-bit compressed words.
+        11 => (T::Rgba32Float, vec![], false),
         16 => (T::Rg32Float, vec![], false),
         23 | 24 => (T::Rgb10a2Unorm, vec![], false),
         26 => (T::Rg11b10Ufloat, vec![], false),
@@ -348,6 +584,61 @@ fn map_format(f: u32, bind: u32) -> Fmt {
         views,
         a8,
         bc: None,
+    }
+}
+
+fn unpack_rgba16_unorm(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    depth: u32,
+    bytes_per_row: u32,
+    rows_per_image: u32,
+) -> Vec<u8> {
+    let mut output = vec![0u8; width as usize * height as usize * depth.max(1) as usize * 16];
+    let rows = rows_per_image.max(height) as usize;
+    for z in 0..depth.max(1) as usize {
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                for c in 0..4usize {
+                    let from = (z * rows + y) * bytes_per_row as usize + x * 8 + c * 2;
+                    let value = data
+                        .get(from..from + 2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]) as f32 / 65535.0)
+                        .unwrap_or(0.0);
+                    let to = ((z * height as usize + y) * width as usize + x) * 16 + c * 4;
+                    output[to..to + 4].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod native_format_parity_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_bit_exact_head_blend_compressor_target() {
+        let packed = map_format(11, BIND_RT);
+        assert_eq!(packed.format, TextureFormat::Rgba32Float);
+        assert_eq!(texel_bytes(packed.format), 16);
+        assert_eq!(block_bytes(TextureFormat::Bc1RgbaUnorm), 8);
+        assert_eq!(map_format(10, BIND_RT).format, TextureFormat::Rgba16Float);
+    }
+
+    #[test]
+    fn roundtrip_all_rgba16_unorm_words_via_float32_without_precision_loss() {
+        let input: Vec<u8> = (0..=65535u32)
+            .flat_map(|v| (v as u16).to_le_bytes())
+            .collect();
+        let floats = super::unpack_rgba16_unorm(&input, 16384, 1, 1, 131072, 1);
+        for (index, pixel) in floats.chunks_exact(4).enumerate() {
+            let v = f32::from_le_bytes(pixel.try_into().unwrap());
+            let repacked = (v.clamp(0.0, 1.0) * 65535.0 + 0.5).floor() as u16;
+            assert_eq!(repacked, index as u16);
+        }
     }
 }
 
@@ -548,6 +839,7 @@ enum Sample {
 struct Binding {
     group: u32,
     binding: u32,
+    name: String,
     kind: Kind,
     dim: TextureViewDimension,
     sample: Sample,
@@ -577,8 +869,6 @@ static RE_UNIFORM_DECL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"@group\((\d+)u?\)\s*@binding\((\d+)u?\)\s*var<uniform>\s+(\w+)\s*:\s*(\w+)\s*;")
         .unwrap()
 });
-static RE_ARRAY_N: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"array<[^,>]+,\s*(\d+)u?\s*>").unwrap());
 static RE_MATRIX_COLUMNS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"mat(\d)x\d(?:<[^>]+>|[a-z]+)?").unwrap());
 static RE_FIRST_FN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n(?:@\w+|fn)\s").unwrap());
@@ -590,6 +880,167 @@ static RE_VS_MAIN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"@vertex\s*fn\s+main\s*\([\s\S]*?\)\s*->\s*(\w+)\s*\{").unwrap());
 static RE_PS_MAIN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(@fragment\s*fn\s+main\s*\()([\s\S]*?)(\)\s*->)").unwrap());
+
+/// Mirror the browser port's clip-plane fallback on wgpu adapters without
+/// CLIP_DISTANCES (notably the DX12 adapter of this Windows configuration).
+/// The translated vertex WGSL uses plain register names in its return struct.
+fn lower_clip_distances(source: &str) -> Option<(String, Vec<u32>)> {
+    static ENABLE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^\s*enable\s+clip_distances\s*;\s*").unwrap());
+    static MAIN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)@vertex\s+fn\s+main\s*\(.*?\)\s*->\s*(\w+)\s*\{").unwrap()
+    });
+    static CLIP: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"@builtin\(clip_distances\)\s*(\w+)\s*:\s*array<f32,\s*(\d+)u?>\s*,").unwrap()
+    });
+    static FIELDS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:@\w+\([^)]*\)\s*)*(\w+)\s*:\s*(?:array<[^>]*>|[^,]+),").unwrap()
+    });
+    let clean = ENABLE.replace_all(source, "").into_owned();
+    if !clean.contains("@builtin(clip_distances)") {
+        return Some((clean, Vec::new()));
+    }
+    let output = MAIN.captures(&clean)?.get(1)?.as_str().to_owned();
+    let struct_re = Regex::new(&format!(
+        r"struct\s+{}\s*\{{([^}}]*)\}}",
+        regex::escape(&output)
+    ))
+    .ok()?;
+    let struct_capture = struct_re.captures(&clean)?;
+    let original_decl = struct_capture.get(0)?.as_str();
+    let body = struct_capture.get(1)?.as_str();
+    let field = CLIP.captures(body)?;
+    let field_text = field.get(0)?.as_str();
+    let name = field.get(1)?.as_str();
+    let count = field.get(2)?.as_str().parse::<usize>().ok()?;
+    if !(1..=8).contains(&count) {
+        return None;
+    }
+    let names: Vec<_> = FIELDS
+        .captures_iter(body)
+        .filter_map(|m| m.get(1).map(|s| s.as_str().to_owned()))
+        .collect();
+    let index = names.iter().position(|n| n == name)?;
+    let locations: Vec<u32> = (0..count.div_ceil(4)).map(|i| 32 + i as u32).collect();
+    let replacement = locations
+        .iter()
+        .enumerate()
+        .map(|(i, loc)| format!("@location({loc}u) gtaClip{i}: vec4<f32>,"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let new_decl = original_decl.replace(field_text, &replacement);
+    let rewritten = clean.replacen(original_decl, &new_decl, 1);
+    let ctor_re = Regex::new(&format!(
+        r"(?s)return\s+{}\s*\(([^;]*)\)\s*;",
+        regex::escape(&output)
+    ))
+    .ok()?;
+    let constructor = ctor_re.captures(&rewritten)?;
+    let original_return = constructor.get(0)?.as_str();
+    let mut args: Vec<String> = constructor
+        .get(1)?
+        .as_str()
+        .split(',')
+        .map(|arg| arg.trim().to_owned())
+        .collect();
+    if args.len() != names.len() {
+        return None;
+    }
+    let clip_array = args.get(index)?.clone();
+    let vectors: Vec<String> = locations
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let components = (0..4)
+                .map(|j| {
+                    let at = i * 4 + j;
+                    if at < count {
+                        format!("{clip_array}[{at}u]")
+                    } else {
+                        "1.0f".to_owned()
+                    }
+                })
+                .collect::<Vec<_>>();
+            format!("vec4<f32>({})", components.join(", "))
+        })
+        .collect();
+    args.splice(index..=index, vectors);
+    let new_return = format!("return {output}({});", args.join(", "));
+    Some((
+        rewritten.replacen(original_return, &new_return, 1),
+        locations,
+    ))
+}
+
+fn clip_fragment(source: &str, locations: &[u32]) -> Option<String> {
+    if locations.is_empty() {
+        return Some(source.to_owned());
+    }
+    let parameters = locations
+        .iter()
+        .enumerate()
+        .map(|(i, loc)| format!("@location({loc}u) gtaClip{i}: vec4<f32>"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let test = locations
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("any(gtaClip{i} < vec4<f32>(0.0f))"))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    let body = format!("if ({test}) {{ discard; }}");
+    if source.is_empty() {
+        return Some(format!("@fragment fn main({parameters}) {{ {body} }}"));
+    }
+    static FRAGMENT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)(@fragment\s+fn\s+main\s*\()(.*?)(\)\s*->\s*(?:@\w+\([^)]*\)\s*)*\w+(?:<[^>]*>)?\s*\{)").unwrap()
+    });
+    let fragment = FRAGMENT.captures(source)?;
+    let original = fragment.get(0)?.as_str();
+    let preceding = fragment.get(2)?.as_str();
+    let modified = format!(
+        "{}{}{}{}\n {body}\n",
+        fragment.get(1)?.as_str(),
+        preceding,
+        if preceding.trim().is_empty() {
+            ""
+        } else {
+            ", "
+        },
+        format!("{parameters}{}", fragment.get(3)?.as_str())
+    );
+    Some(source.replacen(original, &modified, 1))
+}
+
+#[cfg(test)]
+mod clip_compat_tests {
+    #[test]
+    fn rewrites_vertex_clip_array_and_fragment_discard_for_dx12() {
+        let vertex = "enable clip_distances;\nstruct VSOut {
+            @builtin(position) pos: vec4<f32>,
+            @builtin(clip_distances) clip: array<f32, 4u>,
+            @location(0u) uv: vec4<f32>,
+        }
+        @vertex fn main(@location(0u) pos: vec4<f32>) -> VSOut {
+            return VSOut(o0, o12, o1);
+        }";
+        let (result, locations) = super::lower_clip_distances(vertex).unwrap();
+        assert_eq!(locations, vec![32]);
+        assert!(!result.contains("enable clip_distances"));
+        assert!(!result.contains("@builtin(clip_distances)"));
+        assert!(result.contains("@location(32u) gtaClip0"));
+        assert!(result.contains("o12[0u]"));
+        let fragment = super::clip_fragment(
+            "@fragment fn main(@location(0u) uv: vec4<f32>) -> @location(0u) vec4<f32> { return uv; }",
+            &locations,
+        ).unwrap();
+        assert!(fragment.contains("gtaClip0"));
+        assert!(fragment.contains("discard"));
+        let depth = super::clip_fragment("", &locations).unwrap();
+        assert!(depth.contains("@fragment fn main"));
+        assert!(depth.contains("discard"));
+    }
+}
 static RE_MAIN_INNER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\n\s*main_inner\([^;]*\);)").unwrap());
 
@@ -681,6 +1132,7 @@ fn parse_wgsl(text: &str) -> Info {
         let mut b = Binding {
             group,
             binding,
+            name: m[4].to_string(),
             kind: Kind::Texture,
             dim: TextureViewDimension::D2,
             sample: Sample::Float,
@@ -770,20 +1222,54 @@ struct Pack {
     size: u64,
 }
 
+/// WGSL struct fields are comma-separated (some legacy translated shaders
+/// use semicolons). Commas *inside* generics, as in array<vec4<f32>, 22u>,
+/// are not field separators. A previous split(';') silently packed that array
+/// as one 16-byte register, causing thousands of GPU validation errors.
 fn uniform_registers(body: &str) -> u64 {
-    body.split(';')
-        .filter(|field| field.contains(':'))
-        .map(|field| {
-            if let Some(array) = RE_ARRAY_N.captures(field) {
-                return array[1].parse::<u64>().unwrap_or(1);
+    let mut fields = Vec::new();
+    let (mut depth, mut start) = (0i32, 0usize);
+    for (i, ch) in body.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' | ';' if depth == 0 => {
+                fields.push(&body[start..i]);
+                start = i + ch.len_utf8();
             }
-            RE_MATRIX_COLUMNS
-                .captures(field)
-                .and_then(|matrix| matrix[1].parse::<u64>().ok())
-                .unwrap_or(1)
-        })
+            _ => {}
+        }
+    }
+    fields.push(&body[start..]);
+    fields
+        .iter()
+        .filter_map(|field| field.split_once(':').map(|(_, ty)| ty.trim()))
+        .map(uniform_type_registers)
         .sum::<u64>()
         .max(1)
+}
+
+fn uniform_type_registers(ty: &str) -> u64 {
+    if let Some(inner) = ty.strip_prefix("array<").and_then(|s| s.strip_suffix('>')) {
+        let mut depth = 0i32;
+        for (i, ch) in inner.char_indices() {
+            match ch {
+                '<' => depth += 1,
+                '>' => depth -= 1,
+                ',' if depth == 0 => {
+                    let length = inner[i + 1..].trim().trim_end_matches('u');
+                    if let Ok(n) = length.parse::<u64>() {
+                        return n.saturating_mul(uniform_type_registers(inner[..i].trim()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    RE_MATRIX_COLUMNS
+        .captures(ty)
+        .and_then(|matrix| matrix[1].parse::<u64>().ok())
+        .unwrap_or(1)
 }
 
 #[cfg(test)]
@@ -794,6 +1280,31 @@ mod uniform_tests {
     fn retains_every_ped_material_register() {
         let body = "base: vec4f; tint: array<vec4f, 6>; transform: mat4x4f;";
         assert_eq!(uniform_registers(body), 11);
+    }
+
+    #[test]
+    fn wgsl_comma_separated_uniform_array_gets_full_gpu_binding_size() {
+        // Previous code returned two 16-byte registers (32 B) for a shader
+        // whose GPU validation expects 22 registers (352 B).
+        let body = "values: array<vec4<f32>, 20u>, base: vec4<f32>, tint: vec4<f32>,";
+        assert_eq!(uniform_registers(body), 22);
+        assert_eq!(uniform_registers(body) * 16, 352);
+    }
+
+    #[test]
+    fn nested_generic_arrays_and_matrices_keep_correct_register_counts() {
+        assert_eq!(
+            uniform_registers("first: array<vec4<f32>, 3u>, second: mat4x4<f32>, last: vec4<f32>,"),
+            8
+        );
+        assert_eq!(
+            uniform_registers("matrix_bank: array<mat4x4<f32>, 3u>, x: vec4f;"),
+            13
+        );
+        assert_eq!(
+            uniform_registers("nested: array<array<vec4<f32>, 2u>, 3u>,"),
+            6
+        );
     }
 }
 
@@ -872,6 +1383,36 @@ fn pack_uniforms(text: &str) -> (String, Option<Pack>) {
     )
 }
 
+/// An explicitly opt-in parity probe for the GTA deferred ped pass: force
+/// magenta albedo into RT0, preserving the other three G-buffer outputs.
+/// If the final character remains black, the defect is downstream from
+/// diffuse texture sampling, in the G-buffer/lighting/compositing path.
+fn debug_ped_gbuffer_albedo(source: &str) -> Option<String> {
+    static PED_RETURN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"return\s+(\w+)\(o0,\s*o1,\s*o2,\s*o3\);").unwrap());
+    let matches: Vec<_> = PED_RETURN.captures_iter(source).collect();
+    let last = matches.last()?;
+    let entire = last.get(0)?.as_str();
+    let name = last.get(1)?.as_str();
+    let replacement = format!("return {name}(vec4<f32>(1.0f, 0.0f, 1.0f, 1.0f), o1, o2, o3);");
+    Some(source.replacen(entire, &replacement, 1))
+}
+
+#[cfg(test)]
+mod ped_gbuffer_diagnostic_tests {
+    #[test]
+    fn only_replaces_ped_albedo_not_other_targets() {
+        let source = "@fragment fn main() -> F { main_inner(); return F(o0, o1, o2, o3); }";
+        let out = super::debug_ped_gbuffer_albedo(source).unwrap();
+        assert!(out.contains("vec4<f32>(1.0f, 0.0f, 1.0f, 1.0f)"));
+        assert!(out.contains(", o1, o2, o3);"));
+        assert_eq!(
+            super::debug_ped_gbuffer_albedo("@fragment fn main() {}"),
+            None
+        );
+    }
+}
+
 fn vs_output_struct(text: &str) -> Option<Regex> {
     let m = RE_VS_MAIN.captures(text)?;
     Regex::new(&format!(
@@ -946,6 +1487,9 @@ struct Tex {
     format: TextureFormat,
     views: HashMap<(TextureFormat, u32, u32), TextureView>,
     a8: bool,
+    /// The guest requested DXGI 11 (RGBA16_UNORM) but the wgpu 30 backend
+    /// renders to RGBA32_FLOAT. BC1 block copies must explicitly quantize.
+    packed_unorm: bool,
     bc: Option<TextureFormat>,
     half: usize,
     enc: u64,
@@ -957,6 +1501,11 @@ struct Tex {
     blit_bg: Option<BindGroup>,
     mip_passes: Option<Vec<(TextureView, BindGroup)>>,
     astc: bool,
+    /// Writes observed by the host: uploads, clears, copies and render passes.
+    writes: u32,
+    /// First uploaded bytes for tiny textures, to tell "black placeholder"
+    /// apart from "never received data".
+    first_bytes: Option<Vec<u8>>,
 }
 struct Buf {
     size: u64,
@@ -979,7 +1528,7 @@ struct ShaderObj {
     stage: u32,
     hash: String,
     sig: Vec<SigEl>,
-    program: Option<Option<Rc<Program>>>,
+    program: Option<Rc<Program>>,
 }
 struct Program {
     module: ShaderModule,
@@ -999,6 +1548,7 @@ struct Program {
     out_locs: Vec<u32>,
     in_locs: Vec<u32>,
     clip: bool,
+    clip_locs: Vec<u32>,
 }
 #[derive(Clone, Copy)]
 struct El {
@@ -1049,6 +1599,7 @@ struct QueryObj {
     qtype: u32,
     addr: u64,
     slots: Vec<u32>,
+    skipped_draw: bool,
 }
 
 enum Obj {
@@ -1375,10 +1926,13 @@ pub struct Gpu {
     surface_format: TextureFormat,
     surface_size: (u32, u32),
     objs: Vec<Option<Box<Obj>>>,
+    /// A numeric guest ID can be destroyed and reused for a different GPU
+    /// object. Cached bind groups must not alias the previous allocation.
+    obj_gen: Vec<u64>,
     enc: Option<CommandEncoder>,
     enc_epoch: u64,
     pass: Option<RenderPass<'static>>,
-    pass_key: Option<Vec<u32>>,
+    pass_key: Option<smallvec::SmallVec<[u32; 40]>>,
     pass_info: Option<PassInfo>,
     pass_st: PassSt,
     s: State,
@@ -1388,7 +1942,8 @@ pub struct Gpu {
     shader_dir: PathBuf,
     map_programs: HashMap<String, Rc<Program>>,
     warm: std::collections::VecDeque<serde_json::Value>,
-    warm_programs: HashMap<String, Option<Rc<Program>>>,
+    warm_programs: HashMap<String, Rc<Program>>,
+    shader_failures: HashMap<String, Instant>,
     warmed: u64,
     warm_t0: Option<Instant>,
     recipe_bytes: u64,
@@ -1402,6 +1957,7 @@ pub struct Gpu {
     pending_skips: u64,
     pending_skips0: u64,
     pipe_wait_left: Duration,
+    lighting_waited: HashSet<Vec<i64>>,
     compute: HashMap<String, Option<(ComputePipeline, BindGroupLayout, u64, Rc<Program>)>>,
     bind_groups: FxHashMap<Vec<u64>, (BindGroup, u64)>,
     ubo_slots: Vec<Vec<Chunk>>,
@@ -1409,6 +1965,9 @@ pub struct Gpu {
     ubo_slot: usize,
     ubo_chunk: usize,
     ubo_off: u64,
+    packed_uniform_cache: FxHashMap<UniformCacheKey, (usize, u64)>,
+    uniform_cache_on: bool,
+    uniform_ab_epoch: Instant,
     dummy_tex: HashMap<String, TextureView>,
     ped_probes: HashSet<(u64, u64)>,
     dummy_smp: Option<Sampler>,
@@ -1417,6 +1976,7 @@ pub struct Gpu {
     zero_vb: Option<Buffer>,
     zero_src: Option<Buffer>,
     scratch: Option<Buffer>,
+    packed_bc_pipeline: Option<ComputePipeline>,
     proxy_pipelines: HashMap<&'static str, RenderPipeline>,
     unfilt: HashMap<u64, (u128, u128)>,
     nearest: HashMap<u32, Sampler>,
@@ -1455,6 +2015,8 @@ pub struct Gpu {
     fps_t0: Instant,
     fps_n0: u64,
     fps_d0: u64,
+    perf: PerfCounters,
+    perf_frame_start: Instant,
     errors: Arc<AtomicU64>,
 
     inflight: Arc<AtomicU64>,
@@ -1583,6 +2145,16 @@ impl Gpu {
         }
         let info = adapter.get_info();
         log(&format!(
+            "diagnostic flags: lighting_trace={} skip_trace={} ped_probe={} stencil_bypass={}",
+            std::env::var("MUGUET_DIAG_LIGHTING_TRACE").as_deref() == Ok("1"),
+            std::env::var("MUGUET_DIAG_SKIPPED_DRAWS").as_deref() == Ok("1"),
+            std::env::var("MUGUET_PED_DEBUG_ALBEDO").as_deref() == Ok("1"),
+            std::env::var("MUGUET_DIAG_LIGHTING_STENCIL").as_deref() == Ok("off"),
+        ));
+        if std::env::var("MUGUET_PED_DEBUG_ALBEDO").as_deref() == Ok("1") {
+            log("DIAGNOSTIC PED PROBE ACTIVE: native GPU process received MUGUET_PED_DEBUG_ALBEDO=1");
+        }
+        log(&format!(
             "device ready: {} ({:?}), features {:?}",
             info.name, info.backend, features
         ));
@@ -1644,7 +2216,10 @@ impl Gpu {
             pipe_pending: HashMap::new(),
             pending_skips: 0,
             pending_skips0: 0,
+            perf: PerfCounters::default(),
+            perf_frame_start: Instant::now(),
             pipe_wait_left: PIPELINE_WAIT,
+            lighting_waited: HashSet::new(),
             base,
             mem,
             ring,
@@ -1655,6 +2230,7 @@ impl Gpu {
             surface_format,
             surface_size: (0, 0),
             objs: Vec::new(),
+            obj_gen: Vec::new(),
             enc: None,
             enc_epoch: 1,
             pass: None,
@@ -1664,6 +2240,7 @@ impl Gpu {
             map_programs: HashMap::new(),
             warm: Default::default(),
             warm_programs: HashMap::new(),
+            shader_failures: HashMap::new(),
             warmed: 0,
             warm_t0: None,
             recipe_bytes: 0,
@@ -1683,6 +2260,9 @@ impl Gpu {
             ubo_slot: 0,
             ubo_chunk: 0,
             ubo_off: 0,
+            packed_uniform_cache: FxHashMap::default(),
+            uniform_cache_on: *UNIFORM_CACHE_ENABLED,
+            uniform_ab_epoch: Instant::now(),
             dummy_tex: HashMap::new(),
             ped_probes: HashSet::new(),
             dummy_smp: None,
@@ -1691,6 +2271,7 @@ impl Gpu {
             zero_vb: None,
             zero_src: None,
             scratch: None,
+            packed_bc_pipeline: None,
             proxy_pipelines: HashMap::new(),
             unfilt: HashMap::new(),
             nearest: HashMap::new(),
@@ -1774,7 +2355,11 @@ impl Gpu {
         if self.objs.len() <= i {
             self.objs.resize_with(i + 1, || None);
         }
+        mark_resource_created(&mut self.obj_gen, i);
         self.objs[i] = Some(Box::new(o));
+    }
+    fn obj_generation(&self, id: u32) -> u64 {
+        self.obj_gen.get(id as usize).copied().unwrap_or(0)
     }
     fn tex(&self, id: u32) -> Option<&Tex> {
         match self.obj(id) {
@@ -1885,7 +2470,11 @@ impl Gpu {
             self.record_resolves()
         };
         if let Some(enc) = self.enc.take() {
+            let perf_start = Instant::now();
             let idx = self.queue.submit([enc.finish()]);
+            if *PERF_DIAGNOSTICS {
+                self.perf.submit_ms += perf_start.elapsed().as_secs_f64() * 1000.0;
+            }
             self.last_submit = Some(idx);
             self.submits += 1;
             self.on_submitted();
@@ -1921,6 +2510,9 @@ impl Gpu {
             let head = self.hdr(0).load(Ordering::SeqCst);
             if head == tail {
                 if !self.pending_events.is_empty() || !self.pending_resolve.is_empty() {
+                    if *PERF_DIAGNOSTICS {
+                        self.perf.flush_idle_query += 1;
+                    }
                     self.flush();
                 }
                 self.hdr(5).store(1, Ordering::SeqCst);
@@ -1942,11 +2534,15 @@ impl Gpu {
                 } else {
                     1
                 };
+                let idle_start = Instant::now();
                 let _ = self.mem.atomic_wait32(
                     self.ring,
                     tail as u32,
                     Some(Duration::from_millis(timeout)),
                 );
+                if *PERF_DIAGNOSTICS {
+                    self.perf.idle_wait_ns += idle_start.elapsed().as_nanos() as u64;
+                }
                 self.hdr(5).store(0, Ordering::SeqCst);
                 continue;
             }
@@ -1969,7 +2565,14 @@ impl Gpu {
                 continue;
             }
             let p = base + 2;
+            let op_start = (*PERF_DIAGNOSTICS).then(Instant::now);
             self.exec(op, p, n);
+            if let Some(start) = op_start {
+                if let Some(slot) = self.perf.opcode_ns.get_mut(op as usize) {
+                    *slot += start.elapsed().as_nanos() as u64;
+                    self.perf.opcode_calls[op as usize] += 1;
+                }
+            }
             executed += 1;
             tail += (n * 4 + 8) as i32;
             since += 1;
@@ -2007,6 +2610,9 @@ impl Gpu {
             6 => self.clear_ds(u(0), u(1), u(2), u(3), self.f(p + 4), u(5)),
             7 => self.present(u(0)),
             8 => {
+                if *PERF_DIAGNOSTICS {
+                    self.perf.flush_sync += 1;
+                }
                 self.flush();
                 let _ = self.device.poll(PollType::Wait {
                     submission_index: None,
@@ -2248,6 +2854,9 @@ impl Gpu {
             return;
         }
         if self.used(id) {
+            if *PERF_DIAGNOSTICS {
+                self.perf.flush_destroy += 1;
+            }
             self.flush();
         }
         if let Some(o) = self.objs.get_mut(id as usize).and_then(|o| o.take()) {
@@ -2294,8 +2903,13 @@ impl Gpu {
         samples: u32,
     ) {
         let mut m = map_format(dxgi, bind);
+        let packed_unorm = dxgi == 11;
         let mut half = 0;
-        if F32_HALF.load(Ordering::Relaxed) && bind & BIND_SRV != 0 && bind & BIND_UAV == 0 {
+        if !packed_unorm
+            && F32_HALF.load(Ordering::Relaxed)
+            && bind & BIND_SRV != 0
+            && bind & BIND_UAV == 0
+        {
             if let Some((h, n)) = half_of(m.format) {
                 m.format = h;
                 m.views.clear();
@@ -2305,6 +2919,15 @@ impl Gpu {
         let mut usage = TextureUsages::COPY_SRC | TextureUsages::COPY_DST;
         if bind & BIND_SRV != 0 {
             usage |= TextureUsages::TEXTURE_BINDING;
+        }
+        if packed_unorm {
+            // The BC1 pack compute pass must sample the float backing even
+            // when the D3D guest declared only a render-target binding.
+            usage |= TextureUsages::TEXTURE_BINDING;
+            log_once(
+                "unorm16-float-backend",
+                "DXGI RGBA16_UNORM uses float32 RT + GPU quantization for BC1; native wgpu 30 has no tier1 render feature",
+            );
         }
         if bind & (BIND_RT | BIND_DS) != 0 {
             usage |= TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING;
@@ -2369,6 +2992,10 @@ impl Gpu {
                 && mips >= 2
                 && bind & (BIND_RT | BIND_DS | BIND_UAV) == 0
                 && w.min(h) >= 512
+                // Chromium retains the top BC mip by default. Native-only
+                // unconditional mip dropping loses important character/
+                // terrain texture detail. Low-memory opt-in is separate.
+                && std::env::var_os("MUGUET_LOW_MIPS").is_some()
                 && std::env::var_os("MUGUET_FULL_MIPS").is_none(),
         );
         let (w, h, mips) = (w >> skip, h >> skip, mips - skip);
@@ -2419,6 +3046,9 @@ impl Gpu {
             self.bc_live.insert(id, (f, packed, expanded));
         }
         let tex = match self.scoped(&format!("createTexture id={id} dim={dim} {}x{}x{} mips={mips} dxgi={dxgi} bind=0x{bind:x} samples={samples} -> {:?} usage {:?}", size.width, size.height, size.depth_or_array_layers, m.format, usage), |d| d.create_texture(&desc)) { Some(t) => t, None => return };
+        if packed_unorm {
+            PACKED_UNORM_TEXTURES.fetch_add(1, Ordering::Relaxed);
+        }
         self.set_obj(
             id,
             Obj::Tex(Tex {
@@ -2435,6 +3065,7 @@ impl Gpu {
                 format: m.format,
                 views: HashMap::new(),
                 a8: m.a8,
+                packed_unorm,
                 bc: m.bc,
                 half,
                 enc: 0,
@@ -2446,6 +3077,8 @@ impl Gpu {
                 blit_bg: None,
                 mip_passes: None,
                 astc,
+                writes: 0,
+                first_bytes: None,
             }),
         );
     }
@@ -2510,7 +3143,24 @@ impl Gpu {
             b.version += 1;
         }
         let Some(g) = b.gpu.clone() else { return };
-        if !no_overwrite && used {
+        if used {
+            // A normal UpdateSubresource can also be represented as a GPU
+            // copy ordered after previously encoded draws. Avoid queue
+            // submission just to overwrite a vertex/index/storage buffer:
+            // its old contents must stay visible to earlier commands, while
+            // subsequent draws consume the new copy. This is the same
+            // ordering already used for NO_OVERWRITE uploads.
+            if self.stage_ordered_buffer_upload(&g, offset, &data) {
+                if *PERF_DIAGNOSTICS && !no_overwrite {
+                    self.perf.staged_buffer_updates += 1;
+                }
+                return;
+            }
+            // Preserve legacy semantics for unaligned or oversized uploads.
+            // These cannot use the bounded, four-byte-aligned staging ring.
+            if *PERF_DIAGNOSTICS {
+                self.perf.upload_fallback_flushes += 1;
+            }
             self.flush();
         }
         let n = size & !3;
@@ -2546,9 +3196,15 @@ impl Gpu {
         }
         if self.pending_clears.contains_key(&id) {
             self.materialize_clears(id);
+            if *PERF_DIAGNOSTICS {
+                self.perf.flush_texture_upload += 1;
+            }
             self.flush();
         }
         if self.used(id) {
+            if *PERF_DIAGNOSTICS {
+                self.perf.flush_texture_upload += 1;
+            }
             self.flush();
         }
         let t = self.tex_mut(id).unwrap();
@@ -2563,14 +3219,15 @@ impl Gpu {
             p.dirty = true;
         }
         let three = t.desc.dim == TextureDimension::D3;
-        let (tex, a8, bc, half, astc) = (t.tex.clone(), t.a8, t.bc, t.half, t.astc);
+        let (tex, a8, bc, half, astc, packed_unorm) =
+            (t.tex.clone(), t.a8, t.bc, t.half, t.astc, t.packed_unorm);
         let small_format = t.format;
-        if w <= 8 && h <= 8 && d == 1 {
+        if std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some() && w <= 8 && h <= 8 && d == 1 {
             let n = size.min(32).max(8);
             log_once(
-                &format!("small{small_format:?}"),
+                &format!("small{id}"),
                 &format!(
-                    "small texture upload {w}x{h} {small_format:?} bytes={:02x?}",
+                    "small texture upload id={id} {w}x{h} {small_format:?} bytes={:02x?}",
                     self.bytes(data_addr, n)
                 ),
             );
@@ -2594,9 +3251,14 @@ impl Gpu {
                 data_addr,
                 size,
             );
+            if let Some(t) = self.tex_mut(id) {
+                t.writes = t.writes.saturating_add(1);
+            }
             return;
         }
-        let mut data = self.bytes(data_addr, size).to_vec();
+        // Avoid a second CPU copy of the guest's texture bytes when no
+        // decompression/format conversion is required. wgpu stages the upload.
+        let mut data = std::borrow::Cow::Borrowed(self.bytes(data_addr, size));
         let (mut bpr, mut rows, mut w, mut h) = (bpr, rows, w, h);
         if let Some(bc) = bc {
             let m = tex.size().mip_level_size(mip, tex.dimension());
@@ -2605,7 +3267,15 @@ impl Gpu {
             if w == 0 || h == 0 {
                 return;
             }
-            (data, bpr) = bc_decode(bc, &data, bpr, rows.max(1), d.max(1), w, h);
+            let (decoded, decoded_bpr) = bc_decode(bc, &data, bpr, rows.max(1), d.max(1), w, h);
+            data = std::borrow::Cow::Owned(decoded);
+            bpr = decoded_bpr;
+            rows = h;
+        }
+        if packed_unorm {
+            let out = unpack_rgba16_unorm(&data, w, h, d, bpr, rows);
+            data = std::borrow::Cow::Owned(out);
+            bpr = w * 16;
             rows = h;
         }
         if half != 0 {
@@ -2622,7 +3292,7 @@ impl Gpu {
                     out.extend_from_slice(&f32_to_f16(v).to_le_bytes());
                 }
             }
-            data = out;
+            data = std::borrow::Cow::Owned(out);
             bpr = (row * 2) as u32;
             rows = h;
         }
@@ -2634,7 +3304,7 @@ impl Gpu {
                         data.get(r * bpr as usize + c).copied().unwrap_or(0);
                 }
             }
-            data = out;
+            data = std::borrow::Cow::Owned(out);
             bpr = w * 4;
         }
         self.queue.write_texture(
@@ -2660,6 +3330,17 @@ impl Gpu {
                 depth_or_array_layers: d.max(1),
             },
         );
+        let first_bytes = if w <= 8 && h <= 8 {
+            Some(data.iter().copied().take(16).collect())
+        } else {
+            None
+        };
+        if let Some(t) = self.tex_mut(id) {
+            t.writes = t.writes.saturating_add(1);
+            if t.first_bytes.is_none() {
+                t.first_bytes = first_bytes;
+            }
+        }
     }
 
     const ASTC_BATCH_JOBS: usize = 1024;
@@ -2998,7 +3679,7 @@ impl Gpu {
         let (hash, stage) = match self.obj(id) {
             Some(Obj::Shader(s)) => {
                 if let Some(p) = &s.program {
-                    return p.clone();
+                    return Some(p.clone());
                 }
                 (s.hash.clone(), s.stage)
             }
@@ -3006,7 +3687,8 @@ impl Gpu {
         };
         let prog = self.warm_program(&hash, stage);
         if let Some(Obj::Shader(s)) = self.obj_mut(id) {
-            s.program = Some(prog.clone());
+            // A failed network fetch is not a permanent shader failure.
+            s.program = prog.clone();
         }
         prog
     }
@@ -3059,6 +3741,42 @@ impl Gpu {
             "radar::PS_TexturedUnlitAA" => radar_compat(&source)?,
             _ => source,
         };
+        // Insert the diagnostic at the fragment entry's *return*, not at
+        // the start of main_inner. The original probe was overwritten by
+        // later shader operations and could not isolate the true failure.
+        let source = if stage == 1
+            && label.to_ascii_lowercase().contains("ped")
+            && label.contains("PS_DeferredPedTextured")
+            && std::env::var("MUGUET_PED_DEBUG_ALBEDO").as_deref() == Ok("1")
+        {
+            match debug_ped_gbuffer_albedo(&source) {
+                Some(changed) => {
+                    log_once(
+                        "ped-gbuffer-magenta",
+                        "DIAGNOSTIC: GTA ped G-buffer albedo set to magenta after material calculations",
+                    );
+                    changed
+                }
+                None => source,
+            }
+        } else {
+            source
+        };
+        let (source, clip_locs) =
+            if stage == 0 && !self.device.features().contains(Features::CLIP_DISTANCES) {
+                match lower_clip_distances(&source) {
+                    Some(lowered) => lowered,
+                    None => {
+                        log_once(
+                            &format!("clip-{hash}"),
+                            &format!("unsupported clip-distance output in shader {label}"),
+                        );
+                        return None;
+                    }
+                }
+            } else {
+                (source, Vec::new())
+            };
         let (text, pack) = pack_uniforms(&source);
         let module = self.scoped(&format!("shader {label}"), |d| {
             d.create_shader_module(ShaderModuleDescriptor {
@@ -3120,7 +3838,7 @@ impl Gpu {
         } else {
             vec![]
         };
-        let clip = text.contains("@builtin(clip_distances)");
+        let clip = text.contains("@builtin(clip_distances)") || !clip_locs.is_empty();
         let stable = stable_hash(&(hash, stage, pause));
         Some(Rc::new(Program {
             module,
@@ -3144,6 +3862,7 @@ impl Gpu {
             out_locs,
             in_locs,
             clip,
+            clip_locs,
         }))
     }
 
@@ -3270,18 +3989,21 @@ impl Gpu {
         ps: &Program,
         a2c: bool,
         remap: Option<&(HashMap<u32, u32>, String, bool)>,
+        clip_locs: &[u32],
     ) -> Option<ShaderModule> {
-        let remap = remap.filter(|r| r.2);
-        if remap.is_none() && !a2c {
+        let remap = remap.filter(|r| r.2 || !clip_locs.is_empty());
+        if remap.is_none() && !a2c && clip_locs.is_empty() {
             return Some(ps.module.clone());
         }
         let key = format!(
-            "{}{}",
+            "{}{}|clip{:?}",
             remap.map(|r| format!("remap|{}", r.1)).unwrap_or_default(),
-            if a2c { "|a2c" } else { "" }
+            if a2c { "|a2c" } else { "" },
+            clip_locs
         );
-        let m = self.variant(ps, &key, |text| {
-            let mut t = text.to_string();
+        let source = clip_fragment(&ps.text, clip_locs)?;
+        let m = self.variant(ps, &key, |_| {
+            let mut t = source;
             if a2c {
                 t = RE_MAIN_INNER
                     .replace(&t, "$1\n  if (o0.w < 0.5f) { discard; }")
@@ -3292,7 +4014,7 @@ impl Gpu {
                 None => t,
             }
         });
-        if m.is_none() && remap.is_none() {
+        if m.is_none() && remap.is_none() && clip_locs.is_empty() {
             Some(ps.module.clone())
         } else {
             m
@@ -3479,7 +4201,10 @@ impl Gpu {
     }
 
     fn ensure_pass(&mut self) -> bool {
-        let mut key = Vec::with_capacity(37);
+        // Eight color targets (4 words each) plus five depth/stencil words.
+        // This key is computed on every draw; keeping it inline avoids an
+        // otherwise unconditional heap allocation in the render hot path.
+        let mut key = smallvec::SmallVec::<[u32; 40]>::new();
         for r in &self.s.rt {
             key.extend([r.tex, r.mip, r.slice, r.fmt]);
         }
@@ -3639,6 +4364,22 @@ impl Gpu {
         });
         self.pass_st = PassSt::default();
         self.begin_occlusion_in_pass();
+        for i in 0..colors.len() {
+            let id = self.s.rt[i].tex;
+            if id != 0 {
+                if let Some(t) = self.tex_mut(id) {
+                    t.writes = t.writes.saturating_add(1);
+                }
+            }
+        }
+        if ds_att.is_some() {
+            let id = self.s.ds.tex;
+            if id != 0 {
+                if let Some(t) = self.tex_mut(id) {
+                    t.writes = t.writes.saturating_add(1);
+                }
+            }
+        }
         true
     }
 
@@ -4274,7 +5015,11 @@ impl Gpu {
                     let buf = self.device.create_buffer(&BufferDescriptor {
                         label: Some("uniform ring"),
                         size: RING_CHUNK * FRAME_SLOTS as u64,
-                        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                        // The browser's safe buffer-update path reuses this
+                        // fenced ring to copy data in GPU command order.
+                        usage: BufferUsages::UNIFORM
+                            | BufferUsages::COPY_DST
+                            | BufferUsages::COPY_SRC,
                         mapped_at_creation: false,
                     });
                     let id = self.uid();
@@ -4315,6 +5060,49 @@ impl Gpu {
         }
     }
 
+    /// Queue::write_buffer on a buffer referenced by the current encoder is
+    /// executed *before* that encoder when it is submitted. The browser port
+    /// preserves D3D11 NO_OVERWRITE semantics with a staged COPY_SRC and an
+    /// ordered copy between draws; do the same for the native runtime.
+    fn stage_ordered_buffer_upload(
+        &mut self,
+        destination: &Buffer,
+        destination_offset: u64,
+        data: &[u8],
+    ) -> bool {
+        let size = data.len() as u64;
+        if !can_stage_ordered_buffer_upload(destination_offset, size) {
+            return false;
+        }
+        if size == 0 {
+            return true;
+        }
+        let (ci, off) = self.uniform_alloc(size);
+        let (source, source_offset) = {
+            let chunk = &mut self.ubo_slots[self.ubo_slot][ci];
+            let end = (off + size) as usize;
+            if chunk.stage.len() < end {
+                chunk.stage.resize(
+                    end.max(262144).next_power_of_two().min(RING_CHUNK as usize),
+                    0,
+                );
+            }
+            chunk.stage[off as usize..end].copy_from_slice(data);
+            chunk.lo = chunk.lo.min(off);
+            chunk.hi = chunk.hi.max(off + size);
+            (chunk.buf.clone(), chunk.base + off)
+        };
+        self.end_pass();
+        self.encoder().copy_buffer_to_buffer(
+            &source,
+            source_offset,
+            destination,
+            destination_offset,
+            size,
+        );
+        true
+    }
+
     fn pack_copy(&mut self, prog: &Program, stage: usize) -> Option<(usize, u64)> {
         let pack = prog.pack.as_ref()?;
         if pack.size > UBO_WINDOW {
@@ -4326,6 +5114,43 @@ impl Gpu {
                 ),
             );
             return None;
+        }
+        // Two draws sharing a shader and unchanged constant buffers produce
+        // byte-identical data. The original path allocated and copied every
+        // register for every draw even if the source never changed. Buffer
+        // generations prevent stale reuse after a D3D resource ID is recycled;
+        // versions and CB offsets track subsequent writes and subranges.
+        let key = self.uniform_cache_on.then(|| UniformCacheKey {
+            program: prog.uid,
+            stage: stage as u32,
+            bindings: pack
+                .members
+                .iter()
+                .map(|member| {
+                    let cb = self.s.cb[stage]
+                        .get(member.binding as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                    UniformBindingStamp {
+                        buffer: cb.buf,
+                        generation: self.obj_generation(cb.buf),
+                        version: self.buf(cb.buf).map_or(0, |buffer| buffer.version),
+                        first: cb.first,
+                    }
+                })
+                .collect(),
+        });
+        if let Some(key) = &key {
+            if let Some(&(ci, off)) = self.packed_uniform_cache.get(key) {
+                if *PERF_DIAGNOSTICS {
+                    self.perf.uniform_cache_hits += 1;
+                    self.perf.uniform_bytes_saved += pack.size;
+                }
+                return Some((ci, off));
+            }
+        }
+        if *PERF_DIAGNOSTICS && self.uniform_cache_on {
+            self.perf.uniform_cache_misses += 1;
         }
         let (ci, off) = self.uniform_alloc(pack.size);
         let end = (off + pack.size) as usize;
@@ -4366,6 +5191,12 @@ impl Gpu {
         chunk.stage = stage_buf;
         chunk.lo = chunk.lo.min(off);
         chunk.hi = chunk.hi.max(end as u64);
+        if let Some(key) = key {
+            if self.packed_uniform_cache.len() >= 65536 {
+                self.packed_uniform_cache.clear();
+            }
+            self.packed_uniform_cache.insert(key, (ci, off));
+        }
         Some((ci, off))
     }
 
@@ -4536,8 +5367,14 @@ impl Gpu {
         }
         let none = Vec::new();
         let bindings = prog.group_bindings.get(&group).unwrap_or(&none);
-        let mut entries: Vec<(u32, Res)> = Vec::with_capacity(bindings.len());
-        let mut key: Vec<u64> = Vec::with_capacity(bindings.len() * 2 + 3);
+        // Most shaders use a handful of resources. Avoid allocating heap
+        // vectors twice per draw before doing a bind-group cache lookup.
+        // This changes only the temporary representation, not binding order
+        // or the persistent cache key.
+        let mut entries: smallvec::SmallVec<[(u32, Res); 8]> =
+            smallvec::SmallVec::with_capacity(bindings.len());
+        let mut key: smallvec::SmallVec<[u64; 24]> =
+            smallvec::SmallVec::with_capacity(bindings.len() * 2 + 3);
         key.extend([bgl.1, prog.uid, stage as u64]);
         let mut dyn_off = None;
         let cloud_fix = stage == 1
@@ -4599,6 +5436,7 @@ impl Gpu {
                     }) {
                         Some(_) if point => {
                             key.push(sid as u64 | 1 << 40);
+                            key.push(self.obj_generation(sid));
                             let words = st.as_ref().unwrap().words.clone();
                             let dev_smp = self.nearest.get(&sid).cloned();
                             dev_smp.unwrap_or_else(|| {
@@ -4613,6 +5451,7 @@ impl Gpu {
                         }
                         Some(s) => {
                             key.push(sid as u64);
+                            key.push(self.obj_generation(sid));
                             s
                         }
                         None => {
@@ -4658,15 +5497,39 @@ impl Gpu {
                     match v {
                         Some(v) => {
                             let res = self.view_obj(id).unwrap().res;
+                            let view_gen = self.obj_generation(id);
+                            let texture_gen = self.obj_generation(res);
                             self.use_tex(res);
                             if let Some(t) = self.tex_mut(res) {
                                 t.in_bg = true;
                             }
                             key.push(id as u64);
-                            key.push(0);
+                            key.push(view_gen);
+                            key.push(texture_gen);
                             entries.push((b.binding, Res::View(v)));
                         }
                         None => {
+                            if stage == 1
+                                && prog.label.to_ascii_lowercase().contains("ped")
+                                && std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some()
+                            {
+                                let reason = if id == 0 {
+                                    "SRV nao vinculado"
+                                } else if self.view_obj(id).is_none() {
+                                    "SRV inexistente"
+                                } else if !is_tex {
+                                    "SRV aponta para buffer"
+                                } else {
+                                    "textura com vista/formato incompativel"
+                                };
+                                log_once(
+                                    &format!("ped-tex-{}-{}", prog.uid, b.binding),
+                                    &format!(
+                                        "ped missing texture: shader={} binding={} name={} srv={} reason={reason}",
+                                        prog.label, b.binding, b.name, id
+                                    ),
+                                );
+                            }
                             key.push(0);
                             let d = self.dummy_texture(b);
                             entries.push((b.binding, Res::View(d)));
@@ -4731,6 +5594,8 @@ impl Gpu {
                             bo.in_bg = true;
                         }
                         key.push(id as u64);
+                        key.push(self.obj_generation(id));
+                        key.push(self.obj_generation(r));
                     } else {
                         key.push(0);
                     }
@@ -4790,6 +5655,8 @@ impl Gpu {
                         t.in_bg = true;
                     }
                     key.push(uid as u64);
+                    key.push(self.obj_generation(uid));
+                    key.push(self.obj_generation(res));
                     entries.push((b.binding, Res::View(v)));
                 }
             }
@@ -4809,11 +5676,18 @@ impl Gpu {
                     let tex = view.and_then(|v| self.tex(v.res));
                     textures.push(serde_json::json!({
                         "binding": b.binding,
+                        "name": b.name,
                         "srv": id,
                         "present": view.is_some(),
                         "buffer": view.map(|v| v.is_buf).unwrap_or(true),
                         "format": tex.map(|t| format!("{:?}", t.format)),
                         "size": tex.map(|t| [t.desc.w, t.desc.h, t.desc.d]),
+                        "res": view.map(|v| v.res),
+                        "mips": tex.map(|t| t.desc.mips),
+                        "writes": tex.map(|t| t.writes),
+                        "first": tex
+                            .and_then(|t| t.first_bytes.as_ref())
+                            .map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>()),
                     }));
                 }
             }
@@ -4847,7 +5721,10 @@ impl Gpu {
                 "constants": constants,
             }));
         }
-        if let Some((bg, uid)) = self.bind_groups.get(&key) {
+        if let Some((bg, uid)) = self.bind_groups.get(key.as_slice()) {
+            if *PERF_DIAGNOSTICS {
+                self.perf.bind_hits += 1;
+            }
             return Some(BgResult {
                 bg: bg.clone(),
                 uid: *uid,
@@ -4869,6 +5746,7 @@ impl Gpu {
                 },
             })
             .collect();
+        let perf_start = Instant::now();
         let bg = self.scoped(&format!("bind group {}", prog.label), |d| {
             d.create_bind_group(&BindGroupDescriptor {
                 label: None,
@@ -4876,11 +5754,30 @@ impl Gpu {
                 entries: &wentries,
             })
         })?;
+        if *PERF_DIAGNOSTICS {
+            self.perf.bind_misses += 1;
+            self.perf.bind_group_ms += perf_start.elapsed().as_secs_f64() * 1000.0;
+        }
         if self.bind_groups.len() > BG_LIMIT * 3 / 2 {
-            self.bind_groups.clear();
+            // Clearing everything makes the next frames recreate every group,
+            // a measurable CPU spike. Keep the newest half; uids are monotonic
+            // per worker because they are only handed out when a group is made.
+            let keep = BG_LIMIT / 2;
+            let mut uids: Vec<u64> = self.bind_groups.values().map(|(_, uid)| *uid).collect();
+            uids.sort_unstable_by(|a, b| b.cmp(a));
+            if let Some(&cutoff) = uids.get(keep) {
+                let before = self.bind_groups.len();
+                self.bind_groups.retain(|_, (_, uid)| *uid >= cutoff);
+                log(&format!(
+                    "bind group cache trimmed {} -> {}",
+                    before,
+                    self.bind_groups.len()
+                ));
+                self.perf.bind_trims += 1;
+            }
         }
         let uid = self.uid();
-        self.bind_groups.insert(key, (bg.clone(), uid));
+        self.bind_groups.insert(key.into_vec(), (bg.clone(), uid));
         Some(BgResult { bg, uid, dyn_off })
     }
 
@@ -4937,12 +5834,36 @@ impl Gpu {
             None => 0,
         };
         let key = self.pipe_key(vs, ps, layout, &strides, self.s.topo, strip_code, &st, &pi);
+        // The original browser waits on critical lighting jobs. Here the
+        // render thread can wait on the native compiler's channel, but only
+        // once per exact pipeline state and with a bounded timeout.
+        let wait_critical =
+            critical_lighting_pipeline(&vs.label, ps.map(|program| program.label.as_str()))
+                && !matches!(self.pipelines.get(&key), Some(PipeEntry::Done(_)))
+                && self.lighting_waited.len() < 24
+                && self.lighting_waited.insert(key.clone());
+        let wait_budget = if wait_critical {
+            LIGHT_PIPELINE_WAIT
+        } else {
+            self.pipe_wait_left
+        };
+        if wait_critical {
+            log_once(
+                &format!("critical-pipeline-{}", vs.label),
+                &format!(
+                    "awaiting critical lighting pipeline up to {} ms: {} + {}",
+                    wait_budget.as_millis(),
+                    vs.label,
+                    ps.map(|p| p.label.as_str()).unwrap_or("-")
+                ),
+            );
+        }
         let _ = (vs_id, ps_id);
         match self.pipelines.get(&key) {
             Some(PipeEntry::Done(p)) => return p.clone(),
             Some(PipeEntry::Pending) => {
                 let start = Instant::now();
-                let deadline = start + self.pipe_wait_left;
+                let deadline = start + wait_budget;
                 while !matches!(self.pipelines.get(&key), Some(PipeEntry::Done(_))) {
                     let Ok((done, pipeline)) = self
                         .pipe_results
@@ -4952,7 +5873,9 @@ impl Gpu {
                     };
                     self.finish_pipeline(done, pipeline);
                 }
-                self.pipe_wait_left = self.pipe_wait_left.saturating_sub(start.elapsed());
+                if !wait_critical {
+                    self.pipe_wait_left = self.pipe_wait_left.saturating_sub(start.elapsed());
+                }
                 if let Some(PipeEntry::Done(p)) = self.pipelines.get(&key) {
                     return p.clone();
                 }
@@ -4976,7 +5899,7 @@ impl Gpu {
             self.pipelines.insert(key.clone(), PipeEntry::Pending);
             let _ = tx.send((id, job));
             let start = Instant::now();
-            let deadline = start + self.pipe_wait_left;
+            let deadline = start + wait_budget;
             while let Ok((done, pipeline)) = self
                 .pipe_results
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -4986,7 +5909,9 @@ impl Gpu {
                     break;
                 }
             }
-            self.pipe_wait_left = self.pipe_wait_left.saturating_sub(start.elapsed());
+            if !wait_critical {
+                self.pipe_wait_left = self.pipe_wait_left.saturating_sub(start.elapsed());
+            }
             if let Some(PipeEntry::Done(p)) = self.pipelines.get(&key) {
                 return p.clone();
             }
@@ -5181,6 +6106,20 @@ impl Gpu {
                     clamp: wf(r.words.get(4).copied().unwrap_or(0)),
                 };
             }
+            // Controlled parity experiment: determine whether an incorrect
+            // stencil mask is discarding the GTA's deferred lighting over
+            // characters. Never enabled in normal gameplay.
+            if std::env::var("MUGUET_DIAG_LIGHTING_STENCIL").as_deref() == Ok("off")
+                && (label.contains("deferred_lighting") || label.contains("tiled_lighting"))
+            {
+                d.stencil.front.compare = CompareFunction::Always;
+                d.stencil.back.compare = CompareFunction::Always;
+                d.stencil.write_mask = 0;
+                log_once(
+                    "lighting-stencil-bypass",
+                    "DIAGNOSTIC: deferred lighting stencil test bypassed for A/B",
+                );
+            }
             d
         });
         let a2c = blend
@@ -5233,7 +6172,28 @@ impl Gpu {
                         ),
                     );
                 }
-                Some(self.pixel_module(p, a2c, remap.as_ref())?)
+                Some(self.pixel_module(p, a2c, remap.as_ref(), &vs.clip_locs)?)
+            }
+            None if !vs.clip_locs.is_empty() => {
+                for format in &pi.rt_formats {
+                    targets.push(format.map(|format| ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: ColorWrites::empty(),
+                    }));
+                }
+                let mapped: Vec<_> = vs
+                    .clip_locs
+                    .iter()
+                    .map(|loc| {
+                        remap
+                            .as_ref()
+                            .and_then(|r| r.0.get(loc).copied())
+                            .unwrap_or(*loc)
+                    })
+                    .collect();
+                let code = clip_fragment("", &mapped)?;
+                Some(self.variant(vs, &format!("clip-only-{mapped:?}"), |_| code)?)
             }
             None => None,
         };
@@ -5544,10 +6504,19 @@ impl Gpu {
 
     fn warm_program(&mut self, hash: &str, stage: u32) -> Option<Rc<Program>> {
         if let Some(p) = self.warm_programs.get(hash) {
-            return p.clone();
+            return Some(p.clone());
+        }
+        if !shader_retry_ready(self.shader_failures.get(hash), Instant::now()) {
+            return None;
         }
         let p = self.load_program(hash, stage);
-        self.warm_programs.insert(hash.to_string(), p.clone());
+        if let Some(program) = &p {
+            self.shader_failures.remove(hash);
+            self.warm_programs.insert(hash.to_string(), program.clone());
+        } else {
+            self.shader_failures
+                .insert(hash.to_string(), Instant::now());
+        }
         p
     }
 
@@ -5575,8 +6544,50 @@ impl Gpu {
         }
     }
 
+    #[track_caller]
     fn skip(&mut self) {
         self.skipped += 1;
+        // Cold shader/pipeline compilation can skip a draw inside an occlusion
+        // query. Such a query cannot prove that the model is hidden: sending
+        // back zero would incorrectly cull its geometry for later frames.
+        if let Some(active) = self.occlusion_active {
+            if let Some(Obj::Query(query)) = self.obj_mut(active) {
+                query.skipped_draw = true;
+            }
+        }
+        if std::env::var("MUGUET_DIAG_SKIPPED_DRAWS").as_deref() == Ok("1") {
+            let origin = std::panic::Location::caller();
+            let labels = [self.s.shader[0], self.s.shader[1]]
+                .map(|id| match self.obj(id) {
+                    Some(Obj::Shader(shader)) => {
+                        let name = self
+                            .shader_index
+                            .get(&shader.hash)
+                            .map(|s| {
+                                format!(
+                                    "{}::{}",
+                                    s["effect"].as_str().unwrap_or("?"),
+                                    s["program"].as_str().unwrap_or("?")
+                                )
+                            })
+                            .unwrap_or_else(|| shader.hash.clone());
+                        format!("{id}:{name}")
+                    }
+                    _ => format!("{id}:unbound"),
+                })
+                .join(" + ");
+            log_once(
+                &format!("skip-draw-{}-{}", origin.line(), labels),
+                &format!(
+                    "draw skipped at {}:{} shaders=[{}] rt0={} ds={}",
+                    origin.file(),
+                    origin.line(),
+                    labels,
+                    self.s.rt[0].tex,
+                    self.s.ds.tex
+                ),
+            );
+        }
     }
 
     fn do_draw(&mut self, p: u64) {
@@ -5591,9 +6602,22 @@ impl Gpu {
         let (kind, count, inst, start, base_vertex, start_instance) =
             (u(0), u(1), u(2), u(3), u(4) as i32, u(5));
         self.collect_pipelines();
+        if *UNIFORM_CACHE_AB {
+            let enabled = (self.uniform_ab_epoch.elapsed().as_secs() / 20).is_multiple_of(2);
+            if enabled != self.uniform_cache_on {
+                self.uniform_cache_on = enabled;
+                log(&format!("perf A/B: uniform_cache={enabled}"));
+            }
+        }
         let vs_id = self.s.shader[0];
         let ps_id = self.s.shader[1];
         let Some(vs) = self.shader_program(vs_id) else {
+            if std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some() {
+                log_once(
+                    &format!("missing-vs-{vs_id}"),
+                    &format!("draw skipped: VS {vs_id} not available"),
+                );
+            }
             self.skip();
             return;
         };
@@ -5601,6 +6625,12 @@ impl Gpu {
             match self.shader_program(ps_id) {
                 Some(p) => Some(p),
                 None => {
+                    if std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some() {
+                        log_once(
+                            &format!("missing-ps-{ps_id}"),
+                            &format!("draw skipped: PS {ps_id} not available (VS {})", vs.label),
+                        );
+                    }
                     self.skip();
                     return;
                 }
@@ -5683,6 +6713,44 @@ impl Gpu {
                 return;
             }
         };
+        let ped_label = ps
+            .as_ref()
+            .filter(|p| p.label.to_ascii_lowercase().contains("ped"));
+        if std::env::var("MUGUET_DIAG_LIGHTING_TRACE").as_deref() == Ok("1") {
+            if let Some(light) = ps.as_ref().filter(|p| {
+                p.label.starts_with("deferred_lighting")
+                    || p.label.starts_with("tiled_lighting")
+                    || p.label.contains("PS_Composite")
+            }) {
+                log_once(
+                    &format!("lighting-trace-{}", light.uid),
+                    &format!(
+                        "lighting trace: VS={} PS={} ds={} dss={} rt0={} textures={} shader_bindings={}",
+                        vs.label,
+                        light.label,
+                        self.s.ds.tex,
+                        self.s.dss.0,
+                        self.s.rt[0].tex,
+                        self.s.srv[1].iter().take(12).map(u32::to_string).collect::<Vec<_>>().join(","),
+                        light.info.bindings.len()
+                    ),
+                );
+            }
+        }
+        if std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some() {
+            if let Some(ped) = ped_label {
+                log_once(
+                    &format!("ped-draw-{}", ped.uid),
+                    &format!(
+                        "ped draw reached pipeline: VS={} PS={} fragments={} bindings={}",
+                        vs.label,
+                        ped.label,
+                        ped.info.outputs.len(),
+                        ped.info.bindings.len()
+                    ),
+                );
+            }
+        }
         self.prepare_depth_proxies(&vs, 0);
         if let Some(p) = &ps {
             self.prepare_depth_proxies(p, 1);
@@ -5690,6 +6758,27 @@ impl Gpu {
         if !self.ensure_pass() {
             self.skip();
             return;
+        }
+        if let (true, Some(ped), Some(pi)) = (
+            std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some(),
+            ped_label,
+            self.pass_info.as_ref(),
+        ) {
+            let blend = self.state(self.s.blend.0);
+            let targets = pi
+                .rt_formats
+                .iter()
+                .enumerate()
+                .map(|(slot, format)| {
+                    let (_, mask) = blend_for(blend.as_deref(), slot);
+                    format!("RT{slot}:{format:?}/write={:04b}", mask.bits())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            log_once(
+                &format!("ped-targets-{}", ped.uid),
+                &format!("ped render targets: {} [{}]", ped.label, targets),
+            );
         }
         let pl = if !self.pdirty && self.last_pl.is_some() {
             self.last_pl.clone()
@@ -5700,6 +6789,17 @@ impl Gpu {
             pl
         };
         let Some(pl) = pl else {
+            if std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some() {
+                if let Some(ped) = ped_label {
+                    log_once(
+                        &format!("ped-no-pipeline-{}", ped.uid),
+                        &format!(
+                            "ped draw skipped: pipeline unavailable for {} (VS {})",
+                            ped.label, vs.label
+                        ),
+                    );
+                }
+            }
             self.skip();
             return;
         };
@@ -5980,6 +7080,137 @@ impl Gpu {
             }
         }
         self.draws += 1;
+        // One-shot, opt-in G-buffer readback after a real ped draw. Unlike a
+        // screenshot of the final swapchain, this reveals whether the
+        // deferred material's RT0 contains the debug albedo before lighting.
+        let gbuffer_dump = std::env::var_os("MUGUET_PED_GBUFFER_DUMP_PATH");
+        if self.presents >= *PED_GBUFFER_DUMP_AFTER_PRESENTS
+            && crate::bridge::world_ready()
+            && ps
+                .as_ref()
+                .is_some_and(|shader| shader.label.contains("PS_DeferredPedTextured"))
+            && gbuffer_dump.is_some()
+            && !PED_GBUFFER_DUMPED.swap(true, Ordering::SeqCst)
+        {
+            let path = PathBuf::from(gbuffer_dump.unwrap());
+            for slot in 0..4 {
+                let rt = self.s.rt[slot].clone();
+                if rt.tex == 0 {
+                    continue;
+                }
+                let output = if slot == 0 {
+                    path.clone()
+                } else {
+                    let mut next = path.clone();
+                    next.set_file_name(format!("ped-rt{slot}.bgra"));
+                    next
+                };
+                self.dump_ped_gbuffer(rt.tex, rt.mip, rt.slice, &output);
+            }
+        }
+    }
+
+    fn dump_ped_gbuffer(&mut self, id: u32, mip: u32, layer: u32, path: &Path) {
+        let Some((texture, format, desc)) = self.tex(id).map(|t| (t.tex.clone(), t.format, t.desc))
+        else {
+            log("G-buffer diagnostic: missing RT0 texture");
+            return;
+        };
+        if !matches!(
+            format,
+            TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
+        ) || desc.dim != TextureDimension::D2
+            || desc.samples != 1
+        {
+            log(&format!("G-buffer diagnostic: unsupported RT0 {format:?}"));
+            return;
+        }
+        let (w, h) = ((desc.w >> mip).max(1), (desc.h >> mip).max(1));
+        if w > 4096 || h > 4096 {
+            log("G-buffer diagnostic: dimensions exceed limit");
+            return;
+        }
+        let row_bytes = w * 4;
+        let aligned_row = row_bytes.div_ceil(256) * 256;
+        let staging = self.device.create_buffer(&BufferDescriptor {
+            label: Some("one-shot ped G-buffer diagnostic"),
+            size: aligned_row as u64 * h as u64,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        self.end_pass();
+        self.encoder().copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: mip,
+                origin: Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
+                aspect: TextureAspect::All,
+            },
+            TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(aligned_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.flush();
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(MapMode::Read, move |result| {
+            let _ = tx.send(result.is_ok());
+        });
+        let _ = self.device.poll(PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(8)),
+        });
+        if rx.recv_timeout(Duration::from_secs(8)) != Ok(true) {
+            log("G-buffer diagnostic: mapping failed or timed out");
+            return;
+        }
+        let mapped = match staging.slice(..).get_mapped_range() {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                log(&format!(
+                    "G-buffer diagnostic: mapped range unavailable: {error}"
+                ));
+                staging.unmap();
+                return;
+            }
+        };
+        let mut packed = Vec::with_capacity(row_bytes as usize * h as usize);
+        for y in 0..h as usize {
+            let from = y * aligned_row as usize;
+            packed.extend_from_slice(&mapped[from..from + row_bytes as usize]);
+        }
+        drop(mapped);
+        staging.unmap();
+        if let Err(error) = std::fs::write(path, packed) {
+            log(&format!("G-buffer diagnostic: cannot save RT0: {error}"));
+            return;
+        }
+        let metadata = serde_json::json!({
+            "kind": "wgr-ped-gbuffer-rt0-v1",
+            "width": w, "height": h,
+            "format": format!("{format:?}"),
+            "bytes_per_pixel": 4,
+            "path": path.display().to_string(),
+            "note": "RT0 after one ped draw; read before deferred lighting. Not the final screen."
+        });
+        let _ = std::fs::write(path.with_extension("json"), metadata.to_string());
+        log(&format!(
+            "G-buffer diagnostic: saved RT0 {w}x{h} {format:?} to {}",
+            path.display()
+        ));
     }
 
     fn do_dispatch(&mut self, x: u32, y: u32, z: u32) {
@@ -5988,6 +7219,21 @@ impl Gpu {
             self.skipped += 1;
             return;
         };
+        if std::env::var("MUGUET_DIAG_LIGHTING_TRACE").as_deref() == Ok("1")
+            && (prog.label.contains("lighting") || prog.label.contains("Luminance"))
+        {
+            log_once(
+                &format!("compute-light-trace-{}", prog.uid),
+                &format!(
+                    "compute lighting trace: program={} dispatch={}x{}x{} bindings={}",
+                    prog.label,
+                    x,
+                    y,
+                    z,
+                    prog.info.bindings.len()
+                ),
+            );
+        }
         self.prepare_depth_proxies(&prog, 2);
         self.end_pass();
 
@@ -6083,6 +7329,7 @@ impl Gpu {
                             out_locs: vec![],
                             in_locs: vec![],
                             clip: false,
+                            clip_locs: Vec::new(),
                         })
                     }
                     None => {
@@ -6173,10 +7420,7 @@ impl Gpu {
             if t.desc.w <= 8 && t.desc.h <= 8 {
                 log_once(
                     &format!("clearsmall{}x{}{c:?}", t.desc.w, t.desc.h),
-                    &format!(
-                        "clear small texture {}x{} color={c:?}",
-                        t.desc.w, t.desc.h
-                    ),
+                    &format!("clear small texture {}x{} color={c:?}", t.desc.w, t.desc.h),
                 );
             }
         }
@@ -6184,6 +7428,21 @@ impl Gpu {
             return;
         };
         self.mark_color_dirty(id);
+        if *EAGER_CLEARS {
+            self.materialize_clears(id);
+            self.clear_rt_now(
+                id,
+                mip,
+                slice,
+                Color {
+                    r: f64::from(c[0]),
+                    g: f64::from(c[1]),
+                    b: f64::from(c[2]),
+                    a: f64::from(c[3]),
+                },
+            );
+            return;
+        }
         if three {
             self.materialize_clears(id);
             self.clear_rt_now(
@@ -6232,6 +7491,11 @@ impl Gpu {
         let d = (flags & 1 != 0).then(|| depth.clamp(0.0, 1.0));
         let st = (flags & 2 != 0 && has_stencil(fmt)).then_some(stencil);
         if d.is_none() && st.is_none() {
+            return;
+        }
+        if *EAGER_CLEARS {
+            self.materialize_clears(id);
+            self.clear_ds_now(id, mip, slice, d, st);
             return;
         }
         if three {
@@ -6303,6 +7567,9 @@ impl Gpu {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        if let Some(t) = self.tex_mut(id) {
+            t.writes = t.writes.saturating_add(1);
+        }
     }
     fn clear_ds_now(
         &mut self,
@@ -6342,6 +7609,9 @@ impl Gpu {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        if let Some(t) = self.tex_mut(id) {
+            t.writes = t.writes.saturating_add(1);
+        }
     }
     fn clear_uav(&mut self, id: u32, values: [u32; 4]) {
         let Some((res, is_buf, a)) = self.view_obj(id).map(|v| (v.res, v.is_buf, v.a)) else {
@@ -6471,6 +7741,156 @@ impl Gpu {
     fn sub_dropped(desc: &TexDesc, sub: u32) -> bool {
         sub % (desc.mips + desc.skip) < desc.skip
     }
+    /// Mirror FivePlay's bcPackedUnorm fallback without a costly GPU-CPU
+    /// readback. Render to rgba32float (supported in wgpu 30), quantize
+    /// normalized floats to u16 on the GPU, and copy into BC1 as raw bits.
+    /// Each RGBA16_UNORM texel represents one 64-bit BC1 block.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_packed_unorm_bc1(
+        &mut self,
+        src: &Texture,
+        src_mip: u32,
+        src_layer: u32,
+        dst: &Texture,
+        dst_mip: u32,
+        dst_layer: u32,
+        sx: u32,
+        sy: u32,
+        dx: u32,
+        dy: u32,
+        w: u32,
+        h: u32,
+    ) -> bool {
+        let src_size = src.size().mip_level_size(src_mip, src.dimension());
+        let dst_size = dst.size().mip_level_size(dst_mip, dst.dimension());
+        let (w, h) = (
+            w.min(src_size.width.saturating_sub(sx))
+                .min(dst_size.width.saturating_sub(dx).div_ceil(4)),
+            h.min(src_size.height.saturating_sub(sy))
+                .min(dst_size.height.saturating_sub(dy).div_ceil(4)),
+        );
+        if w == 0 || h == 0 {
+            return true;
+        }
+        if dx % 4 != 0 || dy % 4 != 0 {
+            log_once(
+                "packedbcunaligned",
+                "BC1 destination not on a block boundary",
+            );
+            return false;
+        }
+        let bytes_per_row = (w as u64 * 8).div_ceil(256) * 256;
+        let size = bytes_per_row * h as u64;
+        if size > self.device.limits().max_storage_buffer_binding_size as u64 {
+            log_once(
+                "packedbcbig",
+                "BC1 packed fallback exceeds storage-buffer binding limit",
+            );
+            return false;
+        }
+        if self.packed_bc_pipeline.is_none() {
+            let module = self.device.create_shader_module(ShaderModuleDescriptor {
+                label: Some("RGBA16_UNORM to BC1 packed words"),
+                source: ShaderSource::Wgsl(include_str!("unorm16_bc_pack.wgsl").into()),
+            });
+            self.packed_bc_pipeline =
+                self.scoped("RGBA16_UNORM BC1 packing compute pipeline", |d| {
+                    d.create_compute_pipeline(&ComputePipelineDescriptor {
+                        label: Some("RGBA16_UNORM BC1 packing"),
+                        layout: None,
+                        module: &module,
+                        entry_point: Some("main"),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    })
+                });
+            if self.packed_bc_pipeline.is_none() {
+                return false;
+            }
+        }
+        let pipeline = self.packed_bc_pipeline.as_ref().unwrap().clone();
+        let source_view = src.create_view(&TextureViewDescriptor {
+            base_mip_level: src_mip,
+            mip_level_count: Some(1),
+            base_array_layer: src_layer,
+            array_layer_count: Some(1),
+            dimension: Some(TextureViewDimension::D2),
+            ..Default::default()
+        });
+        let params: Vec<u8> = [sx, sy, 0, 0, w, h, (bytes_per_row / 4) as u32, 0]
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let info = self.device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("BC1 packing parameters"),
+            contents: &params,
+            usage: BufferUsages::UNIFORM,
+        });
+        let buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("Packed BC1 block words"),
+            size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let bg = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Packed BC1 block-word inputs"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(&source_view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: info.as_entire_binding(),
+                },
+            ],
+        });
+        self.end_pass();
+        {
+            let mut pass = self
+                .encoder()
+                .begin_compute_pass(&ComputePassDescriptor::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
+        }
+        self.encoder().copy_buffer_to_texture(
+            TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row as u32),
+                    rows_per_image: Some(h),
+                },
+            },
+            TexelCopyTextureInfo {
+                texture: dst,
+                mip_level: dst_mip,
+                origin: Origin3d {
+                    x: dx,
+                    y: dy,
+                    z: dst_layer,
+                },
+                aspect: TextureAspect::All,
+            },
+            Extent3d {
+                width: (w * 4).min(dst_size.width - dx),
+                height: (h * 4).min(dst_size.height - dy),
+                depth_or_array_layers: 1,
+            },
+        );
+        log_once(
+            "packed-bc1-active",
+            "DXGI RGBA16_UNORM -> BC1 with float32 GPU render + compute integer quantization",
+        );
+        PACKED_BC_COPIES.fetch_add(1, Ordering::Relaxed);
+        true
+    }
     #[allow(clippy::too_many_arguments)]
     fn copy_region(
         &mut self,
@@ -6555,7 +7975,45 @@ impl Gpu {
         };
         let three = s.desc.dim == TextureDimension::D3;
         let d3 = d.desc.dim == TextureDimension::D3;
-        let (stex, dtex, sf, df) = (s.tex.clone(), d.tex.clone(), s.format, d.format);
+        let (stex, dtex, sf, df, packed_unorm) = (
+            s.tex.clone(),
+            d.tex.clone(),
+            s.format,
+            d.format,
+            s.packed_unorm,
+        );
+        if packed_unorm
+            && !three
+            && !d3
+            && matches!(
+                df,
+                TextureFormat::Bc1RgbaUnorm | TextureFormat::Bc1RgbaUnormSrgb
+            )
+        {
+            let packed = self.copy_packed_unorm_bc1(
+                &stex,
+                ss.0,
+                ss.1,
+                &dtex,
+                ds.0,
+                ds.1,
+                if has_box { l } else { 0 },
+                if has_box { t } else { 0 },
+                dx,
+                dy,
+                w,
+                h,
+            );
+            if packed {
+                self.mark_color_dirty(dst);
+                self.use_tex(src);
+                self.use_tex(dst);
+                if let Some(tex) = self.tex_mut(dst) {
+                    tex.writes = tex.writes.saturating_add(1);
+                }
+            }
+            return;
+        }
         if sf != df
             && !three
             && !d3
@@ -6678,6 +8136,9 @@ impl Gpu {
         self.mark_color_dirty(dst);
         self.use_tex(src);
         self.use_tex(dst);
+        if let Some(t) = self.tex_mut(dst) {
+            t.writes = t.writes.saturating_add(1);
+        }
     }
     fn copy_resource(&mut self, dst: u32, src: u32) {
         if self.astc_pending.contains(&src) || self.astc_pending.contains(&dst) {
@@ -6705,6 +8166,22 @@ impl Gpu {
                 "copyresastc",
                 "CopyResource between an ASTC-transcoded and a plain texture: ignored",
             );
+            return;
+        }
+        if s.packed_unorm
+            && matches!(
+                d.format,
+                TextureFormat::Bc1RgbaUnorm | TextureFormat::Bc1RgbaUnormSrgb
+            )
+        {
+            let layers = sd.d.min(dd.d);
+            for layer in 0..layers {
+                for mip in 0..sd.mips.min(dd.mips) {
+                    let src_sub = layer * (sd.mips + sd.skip) + mip;
+                    let dst_sub = layer * (dd.mips + dd.skip) + mip;
+                    self.copy_region(dst, dst_sub, 0, 0, 0, src, src_sub, false, 0, 0, 0, 0, 0, 0);
+                }
+            }
             return;
         }
         self.end_pass();
@@ -6740,6 +8217,9 @@ impl Gpu {
         self.mark_color_dirty(dst);
         self.use_tex(src);
         self.use_tex(dst);
+        if let Some(t) = self.tex_mut(dst) {
+            t.writes = t.writes.saturating_add(1);
+        }
     }
     fn resolve(&mut self, dst: u32, dst_sub: u32, src: u32, src_sub: u32) {
         self.materialize_clears(src);
@@ -6787,6 +8267,9 @@ impl Gpu {
         self.mark_color_dirty(dst);
         self.use_tex(src);
         self.use_tex(dst);
+        if let Some(t) = self.tex_mut(dst) {
+            t.writes = t.writes.saturating_add(1);
+        }
     }
 
     fn generate_mips(&mut self, srv_id: u32) {
@@ -6948,6 +8431,9 @@ impl Gpu {
             if copy > 0 {
                 self.encoder().copy_buffer_to_buffer(&g, from, &rb, 0, copy);
             }
+            if *PERF_DIAGNOSTICS {
+                self.perf.flush_readback += 1;
+            }
             self.flush();
             self.map_pending(
                 rb,
@@ -7033,7 +8519,6 @@ impl Gpu {
                 depth_or_array_layers: if three { d } else { 1 },
             },
         );
-        self.flush();
         let row_len = if row_pitch != 0 {
             row_bytes.min(row_pitch)
         } else {
@@ -7058,6 +8543,10 @@ impl Gpu {
                 ),
             );
         }
+        if *PERF_DIAGNOSTICS {
+            self.perf.flush_readback += 1;
+        }
+        self.flush();
         self.map_pending(rb, MapKind::Readback { flag, rows });
     }
 
@@ -7134,9 +8623,18 @@ impl Gpu {
                                         u64::from_le_bytes(range[at..at + 8].try_into().unwrap());
                                 }
                             }
+                            if sum != 0 {
+                                OCCLUSION_NONZERO.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                OCCLUSION_ZERO.fetch_add(1, Ordering::Relaxed);
+                            }
                             self.query_store(
                                 addr,
-                                if sum != 0 { OCCLUSION_VISIBLE_COUNT } else { 0 },
+                                if *FORCE_OCCLUSION_VISIBLE || sum != 0 {
+                                    OCCLUSION_VISIBLE_COUNT
+                                } else {
+                                    0
+                                },
                                 seq as u32,
                             );
                         }
@@ -7176,6 +8674,7 @@ impl Gpu {
                 qtype,
                 addr,
                 slots: vec![],
+                skipped_draw: false,
             }),
         );
         if self.occlusion_set.is_none() {
@@ -7216,6 +8715,7 @@ impl Gpu {
             return;
         }
         q.slots.clear();
+        q.skipped_draw = false;
         self.occlusion_active = Some(id);
         self.begin_occlusion_in_pass();
     }
@@ -7235,11 +8735,18 @@ impl Gpu {
                 }
                 self.occlusion_active = None;
             }
-            let slots = match self.obj_mut(id) {
-                Some(Obj::Query(q)) => std::mem::take(&mut q.slots),
-                _ => vec![],
+            let (slots, skipped_draw) = match self.obj_mut(id) {
+                Some(Obj::Query(q)) => (std::mem::take(&mut q.slots), q.skipped_draw),
+                _ => (vec![], false),
             };
-            self.pending_resolve.push((id, seq, slots));
+            if skipped_draw {
+                OCCLUSION_INCOMPLETE.fetch_add(1, Ordering::Relaxed);
+                // Defer completion until the GPU submit, like other event
+                // queries. A missing draw is unknown, not occluded.
+                self.pending_events.push((id, seq, OCCLUSION_VISIBLE_COUNT));
+            } else {
+                self.pending_resolve.push((id, seq, slots));
+            }
         } else {
             let t = Instant::now().duration_since(*START).as_nanos() as u64;
             self.pending_events
@@ -7259,7 +8766,17 @@ impl Gpu {
                 continue;
             };
             if slots.is_empty() {
-                self.query_store(addr, 0, seq);
+                OCCLUSION_ZERO.fetch_add(1, Ordering::Relaxed);
+                OCCLUSION_EMPTY.fetch_add(1, Ordering::Relaxed);
+                self.query_store(
+                    addr,
+                    if *FORCE_OCCLUSION_VISIBLE {
+                        OCCLUSION_VISIBLE_COUNT
+                    } else {
+                        0
+                    },
+                    seq,
+                );
                 continue;
             }
             let consecutive = slots.windows(2).all(|w| w[1] == w[0] + 1);
@@ -7474,6 +8991,7 @@ impl Gpu {
                     })
                     .clone()
             };
+            let perf_acquire = Instant::now();
             let frame = match self.surface.as_ref().unwrap().0.get_current_texture() {
                 CurrentSurfaceTexture::Success(f) | CurrentSurfaceTexture::Suboptimal(f) => Some(f),
                 other => {
@@ -7485,6 +9003,9 @@ impl Gpu {
                     None
                 }
             };
+            if *PERF_DIAGNOSTICS {
+                self.perf.acquire_ms += perf_acquire.elapsed().as_secs_f64() * 1000.0;
+            }
             if let Some(frame) = frame {
                 let view = frame.texture.create_view(&TextureViewDescriptor::default());
                 self.use_tex(id);
@@ -7521,6 +9042,13 @@ impl Gpu {
             self.flush();
         }
         self.collect_pipelines();
+        if *PERF_DIAGNOSTICS {
+            let frame_ms = self.perf_frame_start.elapsed().as_secs_f64() * 1000.0;
+            self.perf.frames += 1;
+            self.perf.frame_ms += frame_ms;
+            self.perf.max_frame_ms = self.perf.max_frame_ms.max(frame_ms);
+            self.perf_frame_start = Instant::now();
+        }
         self.presents += 1;
         self.pipe_wait_left = PIPELINE_WAIT;
         PRESENTS.store(self.presents, Ordering::Relaxed);
@@ -7528,13 +9056,20 @@ impl Gpu {
 
         self.frame_slot_done[self.ubo_slot] = self.last_submit.clone();
         self.ubo_slot = (self.ubo_slot + 1) % FRAME_SLOTS;
+        // Reusing dynamic offsets is only safe within the same logical frame.
+        // Other frame slots can be concurrently owned by the GPU.
+        self.packed_uniform_cache.clear();
         self.ubo_chunk = 0;
         self.ubo_off = 0;
         if let Some(idx) = self.frame_slot_done[self.ubo_slot].take() {
+            let fence_start = Instant::now();
             let _ = self.device.poll(PollType::Wait {
                 submission_index: Some(idx),
                 timeout: None,
             });
+            if *PERF_DIAGNOSTICS {
+                self.perf.fence_wait_ms += fence_start.elapsed().as_secs_f64() * 1000.0;
+            }
         }
         self.process_maps(false);
     }
@@ -7554,15 +9089,21 @@ impl Gpu {
             } else {
                 String::new()
             };
+            let gpu_memory = if cfg!(windows) {
+                // The Windows platform shim returns zero because it does not
+                // query GPU residency. Zero must not be shown as a measurement.
+                "não medido".to_string()
+            } else {
+                format!("{} MB", crate::gpu_allocated_mb())
+            };
             log(&format!(
-                "fps: {:.1} ({} MB memory, game heap {} MB{resident}, gpu {} MB, compressed {} MB{malloc}, surface {}x{} game {}x{}, {} frames, {} clears folded, {} draws/frame, {} draws waiting for a compiling pipeline, {:.1} submits/frame, {:.1} passes/frame, {} skipped total, pipelines {}, bind groups cached {}, validation errors {})",
+                "fps: {:.1} ({} MB memory, game heap {} MB{resident}, gpu {gpu_memory}, compressed {} MB{malloc}, surface {}x{} game {}x{}, {} frames, {} clears folded, {} draws/frame, {} draws waiting for a compiling pipeline, {:.1} submits/frame, {:.1} passes/frame, {} skipped total, pipelines {}, bind groups cached {}, validation errors {})",
                 frames as f64 / dt,
                 crate::footprint_mb(),
                 crate::RT
                     .get()
                     .map(|r| r.mem.data_size() >> 20)
                     .unwrap_or(0),
-                crate::gpu_allocated_mb(),
                 crate::compressed_mb(),
                 self.surface_size.0,
                 self.surface_size.1,
@@ -7579,6 +9120,63 @@ impl Gpu {
                 self.bind_groups.len(),
                 self.errors.load(Ordering::Relaxed)
             ));
+            if *PERF_DIAGNOSTICS {
+                let n = self.perf.frames.max(1) as f64;
+                log(&format!(
+                    "perf: frames={} mean_frame_ms={:.2} max_frame_ms={:.2} fence_wait_ms/frame={:.2} submit_ms/frame={:.2} acquire_ms/frame={:.2} bind_group_ms/frame={:.2} bind_hit={} bind_miss={} bind_trims={} staged_buffer_updates={} upload_fallback_flushes={} uniform_hits={} uniform_misses={} uniform_mib_saved={:.1} flush_sync={} flush_destroy={} flush_texture={} flush_readback={} flush_idle_query={} uniform_cache={}",
+                    self.perf.frames,
+                    self.perf.frame_ms / n,
+                    self.perf.max_frame_ms,
+                    self.perf.fence_wait_ms / n,
+                    self.perf.submit_ms / n,
+                    self.perf.acquire_ms / n,
+                    self.perf.bind_group_ms / n,
+                    self.perf.bind_hits,
+                    self.perf.bind_misses,
+                    self.perf.bind_trims,
+                    self.perf.staged_buffer_updates,
+                    self.perf.upload_fallback_flushes,
+                    self.perf.uniform_cache_hits,
+                    self.perf.uniform_cache_misses,
+                    self.perf.uniform_bytes_saved as f64 / (1 << 20) as f64,
+                    self.perf.flush_sync,
+                    self.perf.flush_destroy,
+                    self.perf.flush_texture_upload,
+                    self.perf.flush_readback,
+                    self.perf.flush_idle_query,
+                    self.uniform_cache_on
+                ));
+                log(&format!(
+                    "perf-ops: draws={} draw_ms/frame={:.2} readbacks={} readback_ms/frame={:.2} dispatch_ms/frame={:.2} buffer_upload_ms/frame={:.2} texture_upload_ms/frame={:.2} idle_wait_ms/frame={:.2}",
+                    self.perf.opcode_calls[32],
+                    self.perf.opcode_ns[32] as f64 / 1_000_000.0 / n,
+                    self.perf.opcode_calls[42],
+                    self.perf.opcode_ns[42] as f64 / 1_000_000.0 / n,
+                    self.perf.opcode_ns[39] as f64 / 1_000_000.0 / n,
+                    (self.perf.opcode_ns[12] + self.perf.opcode_ns[47]) as f64 / 1_000_000.0 / n,
+                    self.perf.opcode_ns[13] as f64 / 1_000_000.0 / n,
+                    self.perf.idle_wait_ns as f64 / 1_000_000.0 / n
+                ));
+                self.perf = PerfCounters::default();
+            }
+            if std::env::var_os("MUGUET_DIAG_OCCLUSION_VISIBLE").is_some() {
+                log(&format!(
+                    "occlusion diagnostic: visible={} zero={} empty={} incomplete={} force_visible={}",
+                    OCCLUSION_NONZERO.load(Ordering::Relaxed),
+                    OCCLUSION_ZERO.load(Ordering::Relaxed),
+                    OCCLUSION_EMPTY.load(Ordering::Relaxed),
+                    OCCLUSION_INCOMPLETE.load(Ordering::Relaxed),
+                    *FORCE_OCCLUSION_VISIBLE
+                ));
+            }
+            if std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some() {
+                log(&format!(
+                    "unorm16 fallback counters: textures={} gpu_bc1_copies={} eager_clears={}",
+                    PACKED_UNORM_TEXTURES.load(Ordering::Relaxed),
+                    PACKED_BC_COPIES.load(Ordering::Relaxed),
+                    *EAGER_CLEARS
+                ));
+            }
             if *MEM_STATS {
                 let mut by: Vec<(TextureFormat, u64, u64, u64)> = Vec::new();
                 for (f, p, e) in self.bc_live.values() {

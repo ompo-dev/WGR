@@ -101,6 +101,59 @@ async fn ranges_head_isolation_and_cache_validation() -> Result<()> {
     server.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn stale_if_range_and_head_do_not_return_partial_content() -> Result<()> {
+    let (_temp, server, client) = local().await?;
+    let url = format!("{}/data/test.bin", server.origin);
+    let etag = client.head(&url).send().await?.headers()["etag"].clone();
+    for validator in ["\"stale\"", etag.to_str()?] {
+        let response = client
+            .get(&url)
+            .header("range", "bytes=0-3")
+            .header("if-range", validator)
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200, "{validator}");
+        assert!(response.headers().get("content-range").is_none());
+        assert_eq!(response.text().await?, "0123456789abcdef");
+    }
+    let response = client
+        .head(&url)
+        .header("range", "bytes=0-3")
+        .send()
+        .await?;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-length"], "16");
+    let response = client
+        .get(&url)
+        .header("range", "bytes=0-3")
+        .header("if-none-match", etag)
+        .send()
+        .await?;
+    assert_eq!(response.status(), 304, "precondição precede Range");
+    assert!(response.bytes().await?.is_empty());
+    let tag = client.head(&url).send().await?.headers()["etag"]
+        .to_str()?
+        .to_string();
+    for validator in [
+        "*".to_string(),
+        tag.trim_start_matches("W/").to_string(),
+        format!("\"stale\", {tag}"),
+    ] {
+        assert_eq!(
+            client
+                .get(&url)
+                .header("if-none-match", validator)
+                .send()
+                .await?
+                .status(),
+            304
+        );
+    }
+    server.shutdown().await;
+    Ok(())
+}
 #[tokio::test]
 async fn batch_is_ordered_gzip_and_raw_sha1_cache() -> Result<()> {
     let (_temp, server, client) = local().await?;
@@ -214,6 +267,51 @@ async fn upstream(State(bytes): State<Arc<Vec<u8>>>, headers: HeaderMap) -> Resp
         .header("content-length", end - start + 1)
         .body(Body::from(bytes[start as usize..=end as usize].to_vec()))
         .expect("response")
+}
+
+#[tokio::test]
+async fn truncated_zip_filename_and_inconsistent_stored_sizes_are_rejected() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let name = "fixture/mirror/playgta5.com/index.html";
+    let mut bytes = vec![0u8; 31];
+    bytes[..4].copy_from_slice(b"PK\x03\x04");
+    bytes[26..28].copy_from_slice(&(name.len() as u16).to_le_bytes());
+    let mut complete = bytes[..30].to_vec();
+    complete.extend_from_slice(name.as_bytes());
+    complete.push(42);
+    let cache = Arc::new(DiskCache::open(temp.path().join("cache"), 1024)?);
+    for (bytes, size) in [(bytes, 1), (complete, 2)] {
+        let zip_size = bytes.len() as u64;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let router = Router::new()
+            .route("/fixture.zip", get(upstream))
+            .with_state(Arc::new(bytes));
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let index = ZipIndex {
+            url: format!("{origin}/fixture.zip"),
+            size: zip_size,
+            entries: [(
+                name.to_string(),
+                ZipEntry {
+                    csize: 1,
+                    usize: size,
+                    method: 0,
+                    lho: 0,
+                    crc: None,
+                },
+            )]
+            .into(),
+        };
+        let archive = Arc::new(RemoteArchive::new(
+            index,
+            NetworkPolicy::for_url(&origin, true)?,
+            cache.clone(),
+        )?);
+        assert!(archive.read("index.html", 0, 0).await.is_err());
+        task.abort();
+    }
+    Ok(())
 }
 #[tokio::test]
 async fn remote_zip_stored_deflate_offsets_and_concurrent_dedup() -> Result<()> {
@@ -423,7 +521,30 @@ async fn remote_zip_stored_deflate_offsets_and_concurrent_dedup() -> Result<()> 
     .await?;
     let response = reqwest::get(format!("{}/b/build-test/loader.js", server.origin)).await?;
     assert_eq!(response.status(), 200);
+    let etag = response.headers()["etag"].to_str()?.to_string();
     assert_eq!(response.text().await?, "console.log('legal fixture');");
+    let client = reqwest::Client::new();
+    for (validator, status) in [
+        (etag.clone(), 206),
+        (format!("W/{etag}"), 200),
+        ("\"stale\"".to_string(), 200),
+    ] {
+        let response = client
+            .get(format!("{}/b/build-test/loader.js", server.origin))
+            .header("range", "bytes=0-6")
+            .header("if-range", validator)
+            .send()
+            .await?;
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response.text().await?,
+            if status == 206 {
+                "console"
+            } else {
+                "console.log('legal fixture');"
+            }
+        );
+    }
     let before = cache.stats()?.bytes;
     let body = r#"[["stored.bin",4,7]]"#;
     let response = reqwest::Client::new()

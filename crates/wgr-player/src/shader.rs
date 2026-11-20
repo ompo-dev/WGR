@@ -3,6 +3,7 @@
 //! `cbpack_t` no binding 0, com um offset dinâmico por desenho. O binding 15
 //! (constantes inline) fica de fora.
 
+use anyhow::{Context, Result, ensure};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -28,8 +29,9 @@ pub struct Pack {
 }
 
 /// Reescreve o WGSL e devolve o layout do buffer empacotado.
-pub fn pack_uniforms(text: &str) -> (String, Option<Pack>) {
+pub fn pack_uniforms(text: &str) -> Result<(String, Option<Pack>)> {
     struct Member {
+        group: u32,
         binding: u32,
         name: String,
         ty: String,
@@ -39,11 +41,11 @@ pub fn pack_uniforms(text: &str) -> (String, Option<Pack>) {
     let mut members: Vec<Member> = Vec::new();
     let mut group = 0u32;
     let out = UNIFORM_DECL.replace_all(text, |c: &regex::Captures| {
-        let binding: u32 = c[2].parse().unwrap_or(0);
+        let binding: u32 = c[2].parse().unwrap_or(u32::MAX);
         if binding == 15 {
             return c[0].to_string();
         }
-        group = c[1].parse().unwrap_or(0);
+        group = c[1].parse().unwrap_or(u32::MAX);
         let ty = c[4].to_string();
         let size = Regex::new(&format!(
             r"struct\s+{}\s*\{{([^}}]*)\}}",
@@ -52,12 +54,16 @@ pub fn pack_uniforms(text: &str) -> (String, Option<Pack>) {
         .ok()
         .and_then(|st| st.captures(text).map(|s| s[1].to_string()))
         .and_then(|body| {
-            ARRAY_N
-                .captures(&body)
-                .map(|a| a[1].parse::<u64>().unwrap_or(1) * 16)
+            ARRAY_N.captures(&body).map(|a| {
+                a[1].parse::<u64>()
+                    .ok()
+                    .and_then(|n| n.checked_mul(16))
+                    .unwrap_or(u64::MAX)
+            })
         })
         .unwrap_or(16);
         members.push(Member {
+            group,
             binding,
             name: c[3].to_string(),
             ty,
@@ -66,19 +72,35 @@ pub fn pack_uniforms(text: &str) -> (String, Option<Pack>) {
         String::new()
     });
     if members.is_empty() {
-        return (text.to_string(), None);
+        return Ok((text.to_string(), None));
     }
     let mut out = out.into_owned();
     members.sort_by_key(|m| m.binding);
-    let mut offset = 0;
+    let mut offset = 0u64;
     let mut pack_members = Vec::with_capacity(members.len());
     for member in &members {
+        ensure!(
+            member.group == group && group <= 2 && member.binding < 15,
+            "Grupo ou binding de uniformes inválido"
+        );
+        ensure!(
+            member.size > 0 && member.size.is_multiple_of(16),
+            "Tamanho de uniforme inválido"
+        );
+        ensure!(
+            pack_members
+                .last()
+                .is_none_or(|previous: &PackMember| previous.binding < member.binding),
+            "Binding de uniforme duplicado"
+        );
         pack_members.push(PackMember {
             binding: member.binding,
             size: member.size,
             offset,
         });
-        offset += member.size;
+        offset = offset
+            .checked_add(member.size)
+            .context("Tamanho de pack excedido")?;
     }
     for member in &members {
         let re = Regex::new(&format!(r"\b{}\b", regex::escape(&member.name))).unwrap();
@@ -99,13 +121,13 @@ pub fn pack_uniforms(text: &str) -> (String, Option<Pack>) {
         Some(at) => format!("{}\n{}{}", &out[..at.start()], packed, &out[at.start()..]),
         None => format!("{out}{packed}"),
     };
-    (
+    Ok((
         out,
         Some(Pack {
             members: pack_members,
             size: offset,
         }),
-    )
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,7 +303,7 @@ fn main() {
 
     #[test]
     fn packs_every_uniform_into_binding_zero_and_preserves_offsets() {
-        let (packed, pack) = pack_uniforms(SHADER);
+        let (packed, pack) = pack_uniforms(SHADER).unwrap();
         let pack = pack.expect("uniform pack");
         assert_eq!(
             pack.members,
@@ -312,7 +334,7 @@ struct cb1 { x : array<vec4<f32>, 1u>, }
 @group(0u) @binding(15u) var<uniform> inline_cb : cb1;
 fn main() { let v = inline_cb.x[0]; }
 "#;
-        let (packed, pack) = pack_uniforms(shader);
+        let (packed, pack) = pack_uniforms(shader).unwrap();
         assert!(pack.is_none());
         assert!(packed.contains("var<uniform> inline_cb"));
     }
@@ -320,9 +342,30 @@ fn main() { let v = inline_cb.x[0]; }
     #[test]
     fn leaves_shaders_without_uniforms_untouched() {
         let shader = "fn main() {}\n";
-        let (packed, pack) = pack_uniforms(shader);
+        let (packed, pack) = pack_uniforms(shader).unwrap();
         assert!(pack.is_none());
         assert_eq!(packed, shader);
+    }
+
+    #[test]
+    fn rejects_size_overflow_duplicate_bindings_and_mixed_groups() {
+        for count in [
+            "0",
+            "1152921504606846976",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            let text = SHADER.replace("17u", count);
+            assert!(pack_uniforms(&text).is_err(), "{count}");
+        }
+        // Cada multiplicação cabe em u64; a soma dos membros não cabe.
+        let text = SHADER
+            .replace("17u", "1152921504606846975u")
+            .replace("4u", "2u");
+        assert!(pack_uniforms(&text).is_err());
+        assert!(pack_uniforms(&SHADER.replace("@binding(5u)", "@binding(2u)")).is_err());
+        assert!(pack_uniforms(&SHADER.replace("@binding(5u)", "@binding(16u)")).is_err());
+        assert!(pack_uniforms(&SHADER.replacen("@group(1u)", "@group(0u)", 1)).is_err());
     }
 
     const BINDINGS: &str = r#"

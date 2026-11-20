@@ -236,20 +236,20 @@ impl Services {
         let gta = self.paths.root.join("adapters/gta");
         std::fs::create_dir_all(gta.join("assets"))?;
         std::fs::create_dir_all(gta.join("public"))?;
-        for (name, bytes) in [
-            (
-                "assets/zip_index.json",
-                include_bytes!("../../../assets/gta/zip_index.json").as_slice(),
-            ),
-            (
-                "public/play.html",
-                include_bytes!("../../../assets/gta/play.html").as_slice(),
-            ),
-        ] {
-            if name == "public/play.html" || !gta.join(name).exists() {
-                std::fs::write(gta.join(name), bytes)?;
+        // O ZIP legado é opcional: preservar índices já configurados pelo usuário.
+        let index = gta.join("assets/zip_index.json");
+        if !index.exists()
+            && let Some(directory) = std::env::current_exe()?.parent()
+        {
+            let bundled = directory.join("assets/gta/zip_index.json");
+            if bundled.is_file() {
+                std::fs::copy(bundled, index)?;
             }
         }
+        std::fs::write(
+            gta.join("public/play.html"),
+            include_bytes!("../../../assets/gta/play.html"),
+        )?;
         if let Some(previous) = db.value::<PathBuf>("data_root")?
             && previous != self.paths.root
         {

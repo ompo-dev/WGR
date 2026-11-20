@@ -25,14 +25,44 @@ pub fn pump(
     memory: &GuestMemory,
     budget: usize,
 ) -> Result<Stats> {
+    pump_with_target(ring, worker, memory, budget, None)
+}
+
+/// Igual a [`pump`], mas apresenta o `PRESENT` do ring em uma superfície
+/// nativa no mesmo device do worker.
+pub fn pump_with_presenter(
+    ring: &mut Ring,
+    worker: &mut Worker,
+    memory: &GuestMemory,
+    presenter: &mut crate::surface::Presenter,
+    budget: usize,
+) -> Result<Stats> {
+    pump_with_target(ring, worker, memory, budget, Some(presenter))
+}
+
+fn pump_with_target(
+    ring: &mut Ring,
+    worker: &mut Worker,
+    memory: &GuestMemory,
+    budget: usize,
+    mut presenter: Option<&mut crate::surface::Presenter>,
+) -> Result<Stats> {
     let mut stats = Stats::default();
     for _ in 0..budget {
         let Some(command) = ring.next_command()? else {
             break;
         };
+        if command.opcode == 1 {
+            ring.acknowledge(command)?;
+            continue;
+        }
         worker.exec(command.opcode, &command.words, command.address, memory)?;
         if command.opcode == 7 {
-            worker.submit();
+            if let Some(presenter) = presenter.as_deref_mut() {
+                worker.present_to(presenter, command.words[0])?;
+            } else {
+                worker.submit();
+            }
             stats.frames += 1;
         }
         ring.acknowledge(command)?;
@@ -109,5 +139,19 @@ mod tests {
         assert_eq!(stats.frames, 0);
         assert!(worker.texture(1).is_some());
         assert_eq!(memory.load_u32(4).unwrap(), 112);
+        memory.store_u32(112, 0).unwrap();
+        memory.store_u32(116, 990).unwrap();
+        memory.store_u32(0, 4080).unwrap();
+        pump(&mut ring, &mut worker, &memory, 1).unwrap();
+        memory.store_u32(4080, 1).unwrap();
+        memory.store_u32(4084, 0).unwrap();
+        memory.store_u32(64, 0).unwrap();
+        memory.store_u32(68, 1).unwrap();
+        memory.store_u32(72, 123).unwrap();
+        memory.store_u32(0, 76).unwrap();
+        let stats = pump(&mut ring, &mut worker, &memory, 2).unwrap();
+        assert_eq!(stats.commands, 1, "WRAP não é um comando executável");
+        assert_eq!(memory.load_u32(4).unwrap(), 76);
+        assert_eq!(memory.load_u32(12).unwrap(), 3);
     }
 }

@@ -37,6 +37,17 @@ fn double_escape(previous: &mut Option<std::time::Instant>, now: std::time::Inst
     release
 }
 
+/// Converts cursor displacement from the center of a confined window into
+/// relative movement. Cursor warps back to the center must not feed the engine.
+fn confined_motion(position: PhysicalPosition<f64>, width: u32, height: u32) -> Option<(f64, f64)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let dx = position.x - f64::from(width) / 2.0;
+    let dy = position.y - f64::from(height) / 2.0;
+    (dx.abs() >= 1.0 || dy.abs() >= 1.0).then_some((dx, dy))
+}
+
 #[cfg(test)]
 mod capture_tests {
     use super::double_escape;
@@ -78,6 +89,23 @@ mod capture_tests {
             &mut previous,
             now + Duration::from_millis(900)
         ));
+    }
+
+    #[test]
+    fn confined_mouse_fallback_preserves_horizontal_and_vertical_motion() {
+        use winit::dpi::PhysicalPosition;
+        assert_eq!(
+            super::confined_motion(PhysicalPosition::new(660.0, 354.0), 1280, 720),
+            Some((20.0, -6.0))
+        );
+        assert_eq!(
+            super::confined_motion(PhysicalPosition::new(640.0, 360.0), 1280, 720),
+            None
+        );
+        assert_eq!(
+            super::confined_motion(PhysicalPosition::new(4.0, 4.0), 0, 0),
+            None
+        );
     }
 }
 
@@ -132,6 +160,8 @@ struct App {
     #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
     launcher_shown: bool,
     locked: bool,
+    cursor_confined: bool,
+    last_raw_mouse: Option<std::time::Instant>,
     focused: bool,
     last_escape: Option<std::time::Instant>,
     mods: ModifiersState,
@@ -385,7 +415,21 @@ impl ApplicationHandler for App {
                 input::button(b, state == ElementState::Pressed);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if !self.locked {
+                if self.locked
+                    && self.focused
+                    && self
+                        .last_raw_mouse
+                        .is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(250))
+                {
+                    let size = window.inner_size();
+                    if let Some((dx, dy)) = confined_motion(position, size.width, size.height) {
+                        input::mouse_delta_f(dx, dy);
+                        let _ = window.set_cursor_position(PhysicalPosition::new(
+                            f64::from(size.width) / 2.0,
+                            f64::from(size.height) / 2.0,
+                        ));
+                    }
+                } else if !self.locked {
                     self.cursor(&window, position);
                 }
             }
@@ -463,6 +507,7 @@ impl ApplicationHandler for App {
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.locked && self.window.as_deref().is_some_and(has_input_focus) {
+                self.last_raw_mouse = Some(std::time::Instant::now());
                 input::mouse_delta_f(delta.0, delta.1);
             }
         }
@@ -593,12 +638,22 @@ impl App {
         );
     }
     fn lock(&mut self, el: &ActiveEventLoop, window: &Window) {
-        let ok = window
-            .set_cursor_grab(CursorGrabMode::Locked)
+        let native_lock = window.set_cursor_grab(CursorGrabMode::Locked);
+        let confined = native_lock.is_err();
+        let ok = native_lock
             .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
             .is_ok();
+        self.cursor_confined = confined && ok;
+        self.last_raw_mouse = None;
         window.set_cursor_visible(!ok);
         self.locked = ok;
+        if self.cursor_confined {
+            let size = window.inner_size();
+            let _ = window.set_cursor_position(PhysicalPosition::new(
+                f64::from(size.width) / 2.0,
+                f64::from(size.height) / 2.0,
+            ));
+        }
         input::set_locked(ok);
         // The foreground process owns the parent HWND. Receive raw mouse motion
         // for its embedded child, and discard it whenever that child loses focus.
@@ -621,6 +676,8 @@ impl App {
         }
         window.set_cursor_visible(true);
         self.locked = false;
+        self.cursor_confined = false;
+        self.last_raw_mouse = None;
         input::set_locked(false);
         #[cfg(windows)]
         el.listen_device_events(DeviceEvents::WhenFocused);
@@ -645,6 +702,8 @@ pub fn run(
         started: false,
         launcher_shown: false,
         locked: false,
+        cursor_confined: false,
+        last_raw_mouse: None,
         focused: false,
         last_escape: None,
         mods: ModifiersState::empty(),

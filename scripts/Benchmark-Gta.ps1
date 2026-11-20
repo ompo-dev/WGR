@@ -23,7 +23,7 @@ $process = Start-Process -FilePath $exe -ArgumentList $arguments -WindowStyle No
 $watch = [Diagnostics.Stopwatch]::StartNew()
 while (-not $process.HasExited -and $watch.Elapsed.TotalSeconds -lt 930) {
     # Follow only this process tree; other applications also use WebView2.
-    $rows = Get-CimInstance Win32_Process -Filter "name='msedgewebview2.exe' OR name='WGR.exe'"
+    $rows = @(Get-CimInstance Win32_Process -Filter "name='msedgewebview2.exe' OR name='WGR.exe' OR name='wgr-rage.exe'")
     $ids = [Collections.Generic.HashSet[int]]::new(); [void]$ids.Add($process.Id)
     do {
         $added = $false
@@ -38,8 +38,9 @@ while (-not $process.HasExited -and $watch.Elapsed.TotalSeconds -lt 930) {
             [pscustomobject]@{ pid=$item.Id; name=$item.ProcessName; private_bytes=$item.PrivateMemorySize64; working_bytes=$item.WorkingSet64; cpu_seconds=$item.TotalProcessorTime.TotalSeconds; read_transfer_bytes=$native.ReadTransferCount; write_transfer_bytes=$native.WriteTransferCount }
         }
     })
+    $gpu = @(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^pid_(\d+)_' -and $ids.Contains([int]$Matches[1]) } | ForEach-Object { [pscustomobject]@{instance=$_.Name;dedicated_bytes=[long]$_.DedicatedUsage;shared_bytes=[long]$_.SharedUsage;committed_bytes=[long]$_.TotalCommitted} })
     $memory = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory | Select-Object AvailableMBytes,CommittedBytes,CommitLimit,PagesInputPersec,PagesOutputPersec
-    $samples.Add([pscustomobject]@{ seconds=[math]::Round($watch.Elapsed.TotalSeconds,1); members=$members; private_bytes=($members|Measure-Object private_bytes -Sum).Sum; working_bytes=($members|Measure-Object working_bytes -Sum).Sum; free_disk_bytes=(Get-PSDrive C).Free; system_memory=$memory; visible_main_window=($process.MainWindowHandle -ne [IntPtr]::Zero) })
+    $samples.Add([pscustomobject]@{ seconds=[math]::Round($watch.Elapsed.TotalSeconds,1); members=$members; private_bytes=($members|Measure-Object private_bytes -Sum).Sum; working_bytes=($members|Measure-Object working_bytes -Sum).Sum; gpu_process_memory=$gpu; free_disk_bytes=(Get-PSDrive C).Free; system_memory=$memory; visible_main_window=($process.MainWindowHandle -ne [IntPtr]::Zero) })
     $samples | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $project "artifacts/perf-$Name-resources.json")
     Start-Sleep -Seconds 5
     $process.Refresh()
@@ -47,6 +48,15 @@ while (-not $process.HasExited -and $watch.Elapsed.TotalSeconds -lt 930) {
 if (-not $process.HasExited) { [void]$process.CloseMainWindow(); throw 'Benchmark excedeu o prazo; fechamento solicitado somente à janela de teste.' }
 $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
 $values = @($report.fps_samples | Where-Object { $_.at_ms -ge ($report.world_at_ms + 4000) } | ForEach-Object { [double]$_.fps } | Sort-Object)
+$gpuTotals = @($samples | ForEach-Object {
+    if (@($_.gpu_process_memory).Count -gt 0) {
+        [pscustomobject]@{
+            dedicated_bytes = (@($_.gpu_process_memory) | Measure-Object dedicated_bytes -Sum).Sum
+            shared_bytes = (@($_.gpu_process_memory) | Measure-Object shared_bytes -Sum).Sum
+            committed_bytes = (@($_.gpu_process_memory) | Measure-Object committed_bytes -Sum).Sum
+        }
+    }
+})
 $summary = [ordered]@{
     name=$Name; map=$Map; fps_option=$Fps; world_confirmed=$report.world_confirmed
     gpu_logs=[bool]$GpuLogs
@@ -57,9 +67,13 @@ $summary = [ordered]@{
     linear_memory=$report.diagnostic.memory; configuration=$report.diagnostic.configuration
     cache=$report.cache; peak_private_bytes=($samples|Measure-Object private_bytes -Maximum).Maximum
     peak_working_bytes=($samples|Measure-Object working_bytes -Maximum).Maximum
+    gpu_samples=$gpuTotals.Count
+    peak_gpu_dedicated_bytes=($gpuTotals|Measure-Object dedicated_bytes -Maximum).Maximum
+    peak_gpu_shared_bytes=($gpuTotals|Measure-Object shared_bytes -Maximum).Maximum
+    peak_gpu_committed_bytes=($gpuTotals|Measure-Object committed_bytes -Maximum).Maximum
     free_disk_before=$before; free_disk_after=(Get-PSDrive C).Free
     visible_main_window_observed=(@($samples | Where-Object visible_main_window).Count -gt 0)
-    measurement='30 s após evento de mundo; FPS de submissão reportado pelo port, não apresentação física. Working sets podem conter páginas compartilhadas.'
+    measurement='30 s após evento de mundo; FPS de submissão reportado pelo port, não apresentação física. Working sets podem conter páginas compartilhadas. Contadores GPU por processo/adapter quando disponíveis: não equivalem ao tamanho de heap Wasm, nem são necessariamente a memória física exclusiva de texturas.'
 }
 $summary | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $project "artifacts/perf-$Name-summary.json")
 $summary | ConvertTo-Json -Depth 5

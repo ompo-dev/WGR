@@ -62,25 +62,53 @@ impl NativeChild {
             .env("WGR_NATIVE_ROOT", &options.native_root)
             .env("MUGUET_FSROOT", options.profile.join("native-saves"))
             .env("WGR_NONINTERACTIVE", "1")
+            // The GTA wasm build accepts vertical dY but ignores horizontal
+            // mouse dX in the native host. The GTA control-value route was
+            // measured to rotate camera yaw correctly. Preserve an opt-out.
+            .env(
+                "WGR_MOUSE_CONTROL_LOOK",
+                if std::env::var("WGR_MOUSE_CONTROL_LOOK").as_deref() == Ok("0") {
+                    "0"
+                } else {
+                    "1"
+                },
+            )
             .env(
                 "WGR_INPUT_DIAGNOSTICS",
-                if options.diagnostic
-                    || std::env::args().any(|arg| arg == "--gta-smoke")
-                    || std::env::var("WGR_INPUT_DIAGNOSTICS").map_or(true, |v| v != "0")
-                {
+                if diagnostics_enabled(
+                    options.diagnostic,
+                    std::env::args().any(|arg| arg == "--gta-smoke"),
+                    std::env::var("WGR_INPUT_DIAGNOSTICS").ok().as_deref(),
+                ) {
                     "1"
                 } else {
                     "0"
                 },
             )
             .env("MUGUET_FULLSCREEN", "0")
-            .env("MUGUET_SCALE", "1")
+            // The guest cannot resize its backbuffer safely after startup.
+            // Preserve full native-monitor rendering by default. An explicit
+            // WGR_RENDER_SCALE opt-in can change it, but performance tuning
+            // must not silently lower the image quality.
+            .env(
+                "MUGUET_SCALE",
+                native_render_scale(std::env::var("WGR_RENDER_SCALE").ok().as_deref()),
+            )
             .env("MUGUET_FPS", "0")
             .env("MUGUET_START_MODE", "2")
             .env("MUGUET_MUTE", if options.muted { "1" } else { "0" })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if options.diagnostic {
+            // Logs each missing ped texture binding once, not on every draw.
+            command.env("MUGUET_TEXTURE_DIAGNOSTICS", "1");
+        }
+        // Explicitly forward the opt-in shader-isolation experiment so the
+        // native child sees it even when launched by the GUI process.
+        if std::env::var("MUGUET_PED_DEBUG_ALBEDO").as_deref() == Ok("1") {
+            command.env("MUGUET_PED_DEBUG_ALBEDO", "1");
+        }
         let mut process = command
             .spawn()
             .context("Não foi possível iniciar o runtime nativo")?;
@@ -191,6 +219,20 @@ impl NativeChild {
         self.process.borrow().id()
     }
 }
+
+fn diagnostics_enabled(diagnostic: bool, smoke: bool, override_value: Option<&str>) -> bool {
+    diagnostic || smoke || override_value.is_some_and(|value| value != "0")
+}
+
+/// Keep the original full-resolution quality unless the user explicitly
+/// chooses another render scale.
+fn native_render_scale(raw: Option<&str>) -> String {
+    raw.and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && (0.50..=1.25).contains(value))
+        .unwrap_or(1.0)
+        .to_string()
+}
+
 impl Drop for NativeChild {
     fn drop(&mut self) {
         let _ = self.command("stop", false);
@@ -220,13 +262,10 @@ fn read_output(
             let mut reader = BufReader::new(output);
             let mut log = std::fs::File::create(log).ok();
             let mut logged = 0usize;
-            loop {
-                let mut line = Vec::with_capacity(512);
-                let Ok(count) = reader.by_ref().take(8192).read_until(b'\n', &mut line) else {
-                    break;
-                };
-                if count == 0 {
-                    break;
+            while let Ok(next) = bounded_line(&mut reader, 64 << 10) {
+                let Some((line, complete)) = next else { break };
+                if !complete {
+                    continue;
                 }
                 if logged + line.len() > 2 << 20 {
                     // Keep current failures visible after verbose engine startup,
@@ -262,4 +301,84 @@ fn read_output(
             }
         })?;
     Ok(())
+}
+
+/// Read a whole protocol event, not an 8 KiB fragment. GTA ped probes often
+/// contain many textures and constants and were silently truncated before.
+/// Oversized lines are drained without buffering unbounded untrusted output.
+fn bounded_line(
+    reader: &mut impl BufRead,
+    maximum: usize,
+) -> std::io::Result<Option<(Vec<u8>, bool)>> {
+    let mut result = Vec::with_capacity(512);
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((!result.is_empty()).then_some((result, !oversized)));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |at| at + 1);
+        if !oversized {
+            if result.len().saturating_add(consumed) <= maximum {
+                result.extend_from_slice(&available[..consumed]);
+            } else {
+                oversized = true;
+                result.clear();
+            }
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some((result, !oversized)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::bounded_line;
+    use std::io::{BufReader, Cursor};
+
+    #[test]
+    fn preserves_ped_report_larger_than_previous_eight_kibibyte_limit() {
+        let event = format!("WGR_EVENT {{\"textures\":\"{}\"}}\n", "x".repeat(12_000));
+        let mut input = BufReader::with_capacity(311, Cursor::new(event.clone()));
+        let (line, complete) = bounded_line(&mut input, 64 << 10).unwrap().unwrap();
+        assert!(complete);
+        assert_eq!(line, event.into_bytes());
+    }
+
+    #[test]
+    fn oversized_line_does_not_corrupt_next_protocol_event() {
+        let input = format!("{}\nWGR_EVENT {{\"type\":\"ok\"}}\n", "A".repeat(80_000));
+        let mut input = BufReader::with_capacity(127, Cursor::new(input));
+        let (_, complete) = bounded_line(&mut input, 64 << 10).unwrap().unwrap();
+        assert!(!complete);
+        let (second, complete) = bounded_line(&mut input, 64 << 10).unwrap().unwrap();
+        assert!(complete);
+        assert_eq!(second, b"WGR_EVENT {\"type\":\"ok\"}\n");
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::{diagnostics_enabled, native_render_scale};
+
+    #[test]
+    fn normal_play_does_not_enable_input_probes_implicitly() {
+        assert!(!diagnostics_enabled(false, false, None));
+        assert!(!diagnostics_enabled(false, false, Some("0")));
+        assert!(diagnostics_enabled(false, false, Some("1")));
+        assert!(diagnostics_enabled(true, false, None));
+        assert!(diagnostics_enabled(false, true, Some("0")));
+    }
+
+    #[test]
+    fn native_render_resolution_is_bounded_and_user_overridable() {
+        assert_eq!(native_render_scale(None), "1");
+        assert_eq!(native_render_scale(Some("0.67")), "0.67");
+        assert_eq!(native_render_scale(Some("1")), "1");
+        for invalid in ["0", "0.1", "2", "NaN", "inf", "fast"] {
+            assert_eq!(native_render_scale(Some(invalid)), "1");
+        }
+    }
 }

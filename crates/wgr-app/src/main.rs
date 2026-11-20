@@ -6,6 +6,7 @@ mod cpu_profile;
 mod gta_browser;
 mod input;
 mod momor;
+mod native_check;
 #[cfg(not(feature = "web-compat"))]
 mod native_child;
 #[cfg(not(feature = "web-compat"))]
@@ -38,6 +39,7 @@ fn main() {
                     | "--smoke"
                     | "--clear-cache"
                     | "--clear-profile-cache"
+                    | "--native-check"
             )
         }) {
             std::process::exit(1);
@@ -99,6 +101,12 @@ fn run() -> Result<()> {
         .build()?;
     let services = Arc::new(service::Services::new(paths)?);
     services.seed()?;
+    if args.iter().any(|arg| arg == "--native-check") {
+        let result = runtime.block_on(native_check::run())?;
+        let path = services.paths.root.join("native-check.json");
+        std::fs::write(path, serde_json::to_vec_pretty(&result)?)?;
+        return Ok(());
+    }
     if args.iter().any(|arg| arg == "--clear-cache") {
         let removed = services.cache.clear()?;
         std::fs::write(

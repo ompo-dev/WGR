@@ -1,4 +1,4 @@
-param([string]$Executable = (Join-Path $PSScriptRoot '../WGR.exe'))
+﻿param([string]$Executable = (Join-Path $PSScriptRoot '../WGR.exe'))
 $ErrorActionPreference = 'Stop'
 $project = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $exe = (Resolve-Path -LiteralPath $Executable).Path

@@ -2,7 +2,7 @@
 //! quadro e apresenta. Exige um desktop interativo; fica fora do CI.
 
 use std::sync::Arc;
-use wgr_player::surface::SurfaceContext;
+use wgr_player::surface::{Presenter, SurfaceContext};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -22,8 +22,21 @@ impl ApplicationHandler for App {
         );
         let surface =
             pollster::block_on(SurfaceContext::new(window.clone(), 320, 240)).expect("superfície");
-        let frame = surface.acquire().expect("quadro");
-        let view = frame.texture.create_view(&Default::default());
+        let source = surface.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("surface-test-source"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let source_view = source.create_view(&Default::default());
         let mut encoder = surface
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -33,7 +46,7 @@ impl ApplicationHandler for App {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("surface-test"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &source_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -48,7 +61,10 @@ impl ApplicationHandler for App {
             });
         }
         surface.queue.submit(Some(encoder.finish()));
-        surface.queue.present(frame);
+        let mut presenter = Presenter::new(surface);
+        presenter
+            .present(1, 1, &source, wgpu::TextureFormat::Rgba8Unorm, 2, 2)
+            .expect("apresentar fonte da engine");
         self.presented = true;
         self.window = Some(window);
         event_loop.exit();

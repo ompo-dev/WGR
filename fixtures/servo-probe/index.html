@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="pt-BR">
+<meta charset="utf-8">
+<title>WGR / Servo — Compatibilidade</title>
+<style>
+  html { color-scheme: dark; font-family: system-ui, sans-serif; background: #151923; color: #e9edf7; }
+  body { max-width: 880px; margin: 4rem auto; padding: 0 1.5rem; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
+</style>
+<h1>WGR / Servo — Diagnóstico</h1>
+<p>Verificando as APIs disponíveis. Disponibilidade não significa compatibilidade completa com um jogo.</p>
+<pre id="status">Executando…</pre>
+<script>
+  (async () => {
+    const available = (name) => typeof globalThis[name] !== "undefined";
+    const memory64 = [0, 97, 115, 109, 1, 0, 0, 0, 5, 3, 1, 4, 1];
+    const shared64 = [0, 97, 115, 109, 1, 0, 0, 0, 5, 4, 1, 7, 1, 1];
+    const report = {
+      kind: "wgr-servo-probe-v1",
+      phase: "initial",
+      crossOriginIsolated: globalThis.crossOriginIsolated === true,
+      wasm: available("WebAssembly"),
+      wasmMemory64: false,
+      wasmMemory64Instantiate: null,
+      wasmThreadsMemory64: false,
+      wasmSharedMemory: false,
+      sharedArrayBuffer: available("SharedArrayBuffer"),
+      worker: available("Worker"),
+      offscreenCanvas: available("OffscreenCanvas"),
+      offscreenCanvas2dReadback: false,
+      canvas2dReadback: false,
+      webgl: false,
+      webglReadback: false,
+      webgl2: false,
+      webgpuApi: !!navigator.gpu,
+      webgpuAdapter: null,
+      webgpuDevice: null,
+      audioContext: available("AudioContext") || available("webkitAudioContext"),
+      gamepadApi: typeof navigator.getGamepads === "function",
+      indexedDbApi: available("indexedDB"),
+      indexedDbWritable: null,
+      localStorageWritable: false
+    };
+    if (report.wasm) {
+      report.wasmMemory64 = WebAssembly.validate(new Uint8Array(memory64));
+      report.wasmThreadsMemory64 = WebAssembly.validate(new Uint8Array(shared64));
+      try {
+        report.wasmSharedMemory = new WebAssembly.Memory({
+          initial: 1, maximum: 1, shared: true
+        }).buffer.byteLength === 65536;
+      } catch (_) {}
+    }
+    try {
+      const canvas = document.createElement("canvas");
+      const gl = canvas.getContext("webgl");
+      report.webgl = !!gl;
+      if (gl) {
+        gl.clearColor(0.25, 0.5, 0.75, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        const pixel = new Uint8Array(4);
+        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+        report.webglReadback = pixel[0] >= 62 && pixel[0] <= 66 &&
+          pixel[1] >= 126 && pixel[1] <= 130 &&
+          pixel[2] >= 189 && pixel[2] <= 193 && pixel[3] === 255;
+      }
+      report.webgl2 = !!canvas.getContext("webgl2");
+    } catch (_) {}
+    try {
+      const canvas = document.createElement("canvas");
+      const context = canvas.getContext("2d");
+      context.fillStyle = "rgb(10, 20, 30)";
+      context.fillRect(0, 0, 1, 1);
+      const pixel = context.getImageData(0, 0, 1, 1).data;
+      report.canvas2dReadback = pixel[0] === 10 && pixel[1] === 20 && pixel[2] === 30;
+    } catch (_) {}
+    if (report.offscreenCanvas) {
+      try {
+        const canvas = new OffscreenCanvas(2, 2);
+        const context = canvas.getContext("2d");
+        context.fillStyle = "rgb(10, 20, 30)";
+        context.fillRect(0, 0, 1, 1);
+        report.offscreenCanvas2dReadback = context.getImageData(0, 0, 1, 1).data[0] === 10;
+      } catch (_) {}
+    }
+    try {
+      localStorage.setItem("wgr-servo-probe", "1");
+      report.localStorageWritable = localStorage.getItem("wgr-servo-probe") === "1";
+      localStorage.removeItem("wgr-servo-probe");
+    } catch (_) {}
+    if (report.wasmMemory64) {
+      report.wasmMemory64Instantiate = await Promise.resolve()
+        .then(() => WebAssembly.instantiate(new Uint8Array(memory64)))
+        .then(() => true, () => false);
+    }
+    document.getElementById("status").textContent = JSON.stringify(report, null, 2);
+    try {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/log", false);
+      xhr.send("WGR_SERVO_PROBE:" + JSON.stringify(report));
+    } catch (_) {}
+    if (report.indexedDbApi) {
+      report.indexedDbWritable = await Promise.race([
+        new Promise((resolve) => {
+          try {
+            const request = indexedDB.open("wgr-servo-probe", 2);
+            request.onupgradeneeded = () => {
+              if (!request.result.objectStoreNames.contains("data")) {
+                request.result.createObjectStore("data");
+              }
+            };
+            request.onsuccess = () => {
+              const database = request.result;
+              const transaction = database.transaction("data", "readwrite");
+              transaction.objectStore("data").put("ok", "key");
+              transaction.onerror = () => { database.close(); resolve(false); };
+              transaction.oncomplete = () => {
+                const read = database.transaction("data", "readonly").objectStore("data").get("key");
+                read.onsuccess = () => { database.close(); resolve(read.result === "ok"); };
+                read.onerror = () => { database.close(); resolve(false); };
+              };
+            };
+            request.onerror = () => resolve(false);
+            request.onblocked = () => resolve(false);
+          } catch (_) { resolve(false); }
+        }),
+        new Promise((resolve) => setTimeout(() => resolve(false), 1500))
+      ]);
+    }
+    if (report.webgpuApi) {
+      const gpu = await Promise.race([
+        (async () => {
+          const adapter = await navigator.gpu.requestAdapter();
+          if (!adapter) return {adapter: false, device: false};
+          try {
+            const device = await adapter.requestDevice();
+            const buffer = device.createBuffer({size: 4, usage: GPUBufferUsage.COPY_DST});
+            device.queue.writeBuffer(buffer, 0, new Uint8Array([1, 2, 3, 4]));
+            buffer.destroy();
+            return {adapter: true, device: true};
+          } catch (_) { return {adapter: true, device: false}; }
+        })().catch(() => ({adapter: false, device: false})),
+        new Promise((resolve) => setTimeout(() => resolve({adapter: false, device: false}), 5000))
+      ]);
+      report.webgpuAdapter = gpu.adapter;
+      report.webgpuDevice = gpu.device;
+    }
+    report.phase = "complete";
+    document.getElementById("status").textContent = JSON.stringify(report, null, 2);
+    try {
+      await fetch("/log", {
+        method: "POST",
+        headers: {"content-type": "text/plain"},
+        body: "WGR_SERVO_PROBE:" + JSON.stringify(report),
+        cache: "no-store"
+      });
+    } catch (error) {
+      document.getElementById("status").textContent += "\nRelatório HTTP falhou: " + error;
+    }
+  })();
+</script>
+</html>

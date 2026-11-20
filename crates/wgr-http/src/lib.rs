@@ -434,14 +434,26 @@ async fn file_response(
         .header("accept-ranges", "bytes")
         .header("etag", &etag)
         .header("cache-control", cache);
-    if headers.get("range").is_none()
-        && headers.get("if-none-match").and_then(|h| h.to_str().ok()) == Some(etag.as_str())
-    {
+    let not_modified = headers
+        .get("if-none-match")
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*"
+                    || candidate.strip_prefix("W/").unwrap_or(candidate)
+                        == etag.strip_prefix("W/").unwrap_or(&etag)
+            })
+        });
+    if not_modified {
         return Ok(builder
             .status(StatusCode::NOT_MODIFIED)
             .body(Body::empty())?);
     }
-    let partial = headers.get("range");
+    let range_matches = headers
+        .get("if-range")
+        .is_none_or(|value| !etag.starts_with("W/") && value.to_str().ok() == Some(etag.as_str()));
+    let partial = headers.get("range").filter(|_| !head && range_matches);
     let (start, end) = if let Some(range) = partial {
         match range.to_str().ok().and_then(|r| parse_range(r, size).ok()) {
             Some(r) => r,

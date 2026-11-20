@@ -2,6 +2,17 @@
 
 Aplicativo Windows em Rust para uma biblioteca privada de ports de jogos. Launcher GPUI/Momor, SQLite e execução WASM por Wasmtime. O player padrão não carrega WebView2, páginas ou iframe. Sem conta ou telemetria remota.
 
+## GPU nativa e Wasm sem navegador
+
+O player padrão executa WebAssembly em Wasmtime, renderiza por GPUI (fixture)
+ou por wgpu (adaptador RAGE), e usa CPAL para áudio. Não utiliza HTML,
+Chromium, Servo ou WebView2. A tela **Diagnóstico** agora testa a GPU real por
+wgpu, incluindo renderização e leitura de um pixel; isso não comprova um
+quadro do GTA. Consulte [execução nativa](docs/NATIVE-RUNTIME.md).
+
+Para testar sem abrir a interface, execute `WGR.exe --native-check --data-dir "C:\caminho\dados-de-teste"`.
+O resultado é salvo como `native-check.json` nessa pasta de dados.
+
 ## Abrir
 
 Use `WGR.exe` na raiz, mantendo `wgr-rage.exe` ao lado para o adaptador GTA. `scripts/Package.ps1 -SkipBuild` gera a distribuição portable com documentação, licenças e código-fonte. O caminho padrão não requer WebView2. O adaptador GTA está em validação; consulte as evidências antes de considerá-lo jogável.
@@ -36,7 +47,7 @@ pwsh -File scripts/Validate.ps1
 pwsh -File scripts/Package.ps1 -SkipBuild
 ```
 
-O validador compila em uma pasta temporária fora do OneDrive, copia os executáveis `WGR.exe` e `wgr-rage.exe` e limpa os intermediários. `-KeepBuild` conserva a pasta. O workspace tem quatro crates; o adaptador RAGE é um fork GPL separado em `vendor/muguet`. Não há dependência em tempo de execução dos diretórios de referência MomorRust ou 5-web-port.
+O validador compila em uma pasta temporária fora do OneDrive, copia os executáveis `WGR.exe` e `wgr-rage.exe` e limpa os intermediários. `-KeepBuild` conserva a pasta. O workspace tem cinco crates (incluindo o `wgr-player`); o adaptador RAGE é um fork GPL separado em `vendor/muguet`. Não há dependência em tempo de execução dos diretórios de referência MomorRust, Servo, Surfman, MozJS, WebRender ou 5-web-port.
 
 ## Estado e limites
 

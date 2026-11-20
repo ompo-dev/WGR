@@ -1,5 +1,12 @@
 # Arquitetura
 
+> **Atualização 20/11/2026:** O launcher padrão usa player nativo
+> `wgr-app` → `wgr-rage` (GTA) ou Wasmtime/GPUI (fixture). O workspace inclui
+> `wgr-runtime` e `wgr-player` (GPU/áudio/entrada ainda em evolução).
+> As seções históricas abaixo sobre o WebView2 descrevem o backend legado,
+> não o caminho padrão. O probe GPU nativo do app usa `wgr-player::gpu::probe`
+> diretamente, sem empacotar Servo ou outros motores de navegador.
+
 ## Fronteiras
 
 - `wgr-core`: entidades, estado de sessão, SQLite WAL/migração, catálogo, políticas de URL/DNS, cofre Windows, ZIP, thumbnails no app e cache com endereçamento SHA-256.

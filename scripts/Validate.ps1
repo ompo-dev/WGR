@@ -1,10 +1,20 @@
-param([switch]$SkipSmoke, [switch]$KeepBuild)
+﻿param([switch]$SkipSmoke, [switch]$KeepBuild, [switch]$SkipPublish, [string]$TargetDir)
 $ErrorActionPreference = 'Stop'
 $project = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$previousPath = $env:PATH
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    $toolchain = Get-Content -LiteralPath (Join-Path $project 'rust-toolchain.toml') -Raw
+    if ($toolchain -notmatch 'channel\s*=\s*"([^"]+)"') { throw 'Versão do toolchain Rust ausente.' }
+    $rustup = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $HOME '.rustup' }
+    $bin = Join-Path $rustup "toolchains/$($Matches[1])-x86_64-pc-windows-msvc/bin"
+    if (-not (Test-Path -LiteralPath (Join-Path $bin 'cargo.exe'))) { throw 'Cargo ausente. Instale o toolchain definido em rust-toolchain.toml.' }
+    $env:PATH = "$bin;$env:PATH"
+}
 # Keep large intermediates out of OneDrive; one release profile and one compiler.
-$build = [IO.Path]::GetFullPath((Join-Path $env:TEMP ('wgr-validation-' + [guid]::NewGuid().ToString('N'))))
+$ownsBuild = -not $TargetDir
+$build = if ($TargetDir) { [IO.Path]::GetFullPath($TargetDir) } else { [IO.Path]::GetFullPath((Join-Path $env:TEMP ('opencode/wgr-validation-' + [guid]::NewGuid().ToString('N')))) }
 $tempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
-if (-not $build.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Pasta temporária inválida.' }
+if ($ownsBuild -and -not $build.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Pasta temporária inválida.' }
 Push-Location $project
 try {
     New-Item -ItemType Directory -Path artifacts -Force | Out-Null
@@ -23,12 +33,15 @@ try {
     $exe = Join-Path $build 'release/WGR.exe'
     & (Join-Path $PSScriptRoot 'Build-NativeRage.ps1') -TargetDir $build *> artifacts/native-rage-build.log
     if (-not $SkipSmoke) { & (Join-Path $PSScriptRoot 'Smoke.ps1') -Executable $exe }
-    Copy-Item -LiteralPath $exe -Destination (Join-Path $project 'WGR.exe') -Force
-    Copy-Item -LiteralPath (Join-Path $build 'release/wgr-rage.exe') -Destination (Join-Path $project 'wgr-rage.exe') -Force
-    Write-Output 'Validação concluída. Executável: WGR.exe. Logs em artifacts/.'
+    if (-not $SkipPublish) {
+        Copy-Item -LiteralPath $exe -Destination (Join-Path $project 'WGR.exe') -Force
+        Copy-Item -LiteralPath (Join-Path $build 'release/wgr-rage.exe') -Destination (Join-Path $project 'wgr-rage.exe') -Force
+    }
+    Write-Output "Validação concluída. Executável validado: $exe. Logs em artifacts/."
 } finally {
-    if (-not $KeepBuild -and (Test-Path -LiteralPath $build)) {
+    if ($ownsBuild -and -not $KeepBuild -and (Test-Path -LiteralPath $build)) {
         cargo clean --target-dir $build *> artifacts/build-cleanup.log
     }
     Pop-Location
+    $env:PATH = $previousPath
 }

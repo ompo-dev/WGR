@@ -16,6 +16,7 @@ web-compat = ["dep:webview2-com"]
 wgr-core = { path = "../wgr-core" }
 wgr-http = { path = "../wgr-http" }
 wgr-runtime = { path = "../wgr-runtime" }
+wgr-player = { path = "../wgr-player" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

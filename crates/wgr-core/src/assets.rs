@@ -71,8 +71,15 @@ impl DiskCache {
             pinned: Mutex::new(HashSet::new()),
         })
     }
-    fn path(&self, hash: &str) -> PathBuf {
-        self.root.join("objects").join(&hash[..2]).join(hash)
+    fn path(&self, hash: &str) -> Result<PathBuf> {
+        ensure!(
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "SHA-256 inválido no índice do cache"
+        );
+        Ok(self.root.join("objects").join(&hash[..2]).join(hash))
     }
     pub fn temporary(&self) -> PathBuf {
         self.root
@@ -122,7 +129,7 @@ impl DiskCache {
             .query_row("SELECT hash FROM refs WHERE key=?1", [key], |r| r.get(0))
             .optional()?;
         if let Some(hash) = hash {
-            let path = self.path(&hash);
+            let path = self.path(&hash)?;
             if let Some(value) = load(&path, &hash)? {
                 db.execute(
                     "UPDATE objects SET last_access=?1 WHERE hash=?2 AND last_access<>?1",
@@ -166,7 +173,7 @@ impl DiskCache {
             "Objeto maior que o limite do cache; aumente o limite nas configurações"
         );
         let hash = file_hash(temporary)?;
-        let destination = self.path(&hash);
+        let destination = self.path(&hash)?;
         let mut db = self
             .db
             .lock()
@@ -189,13 +196,13 @@ impl DiskCache {
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
             for (old, bytes) in candidates {
-                if used + size <= self.limit {
+                if used.saturating_add(size) <= self.limit {
                     break;
                 }
                 if pinned.contains(&old) {
                     continue;
                 }
-                let path = self.path(&old);
+                let path = self.path(&old)?;
                 if path.exists() {
                     fs::remove_file(path)?;
                 }
@@ -204,7 +211,7 @@ impl DiskCache {
                 used = used.saturating_sub(bytes);
             }
             ensure!(
-                used + size <= self.limit,
+                used.saturating_add(size) <= self.limit,
                 "Cache em uso pela sessão; não há espaço para este objeto"
             );
         }
@@ -268,7 +275,7 @@ impl DiskCache {
             .collect::<rusqlite::Result<_>>()?;
         let mut n = 0;
         for hash in hashes {
-            let p = self.path(&hash);
+            let p = self.path(&hash)?;
             if p.is_file() {
                 n += fs::metadata(&p)?.len();
                 fs::remove_file(p)?;
@@ -434,6 +441,30 @@ pub fn import_zip(zip_path: &Path, bundles: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn corrupt_cache_hashes_are_rejected_without_poisoning_the_cache() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cache = DiskCache::open(temp.path().into(), 64)?;
+        for hash in ["", "a", "é", "../outside", &"g".repeat(64), &"é".repeat(32)] {
+            cache.db.lock().unwrap().execute(
+                "INSERT OR REPLACE INTO refs(key,hash) VALUES('corrupt',?1)",
+                [hash],
+            )?;
+            assert!(cache.get("corrupt").is_err(), "{hash:?}");
+        }
+        cache.put("valid", b"original")?;
+        assert_eq!(cache.read("valid", 8)?, Some(b"original".to_vec()));
+        cache.unpin_all();
+        cache.db.lock().unwrap().execute(
+            "INSERT INTO objects(hash,size,last_access) VALUES('',64,0)",
+            [],
+        )?;
+        assert!(cache.clear().is_err());
+        assert!(cache.put("evict", &[0; 64]).is_err());
+        assert!(cache.stats().is_ok(), "erro não envenena o mutex");
+        Ok(())
+    }
+
     #[test]
     fn bounded_cache_reads_verify_content_without_pinning_or_deleting_on_limit_error() -> Result<()>
     {

@@ -7,9 +7,16 @@ use std::sync::{
 use std::time::Instant;
 static COMMANDS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 static STARTED: AtomicBool = AtomicBool::new(false);
+static WORLD_READY: AtomicBool = AtomicBool::new(false);
 pub static PRESENTED: AtomicU64 = AtomicU64::new(0);
 pub fn emit(value: Value) {
+    if value["type"] == "game-progress" && value["payload"]["world"] == true {
+        WORLD_READY.store(true, Ordering::Release);
+    }
     println!("WGR_EVENT {value}");
+}
+pub fn world_ready() -> bool {
+    WORLD_READY.load(Ordering::Acquire)
 }
 pub fn start() {
     if STARTED.swap(true, Ordering::Relaxed) || std::env::var_os("WGR_CONTROL_PIPE").is_none() {

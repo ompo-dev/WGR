@@ -2,10 +2,14 @@
 //! (uma instância Wasmtime por thread sobre a mesma memória) e chamada de
 //! `__main_argc_argv`.
 
+use crate::{
+    input::InputBlock,
+    loader::{Launch, StartMode, engine_args},
+};
 use anyhow::{Context, Result, bail, ensure};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use std::time::Instant;
 use wasmtime::{Caller, Engine, ExternType, Linker, Module, Store, Val, ValType};
@@ -28,8 +32,63 @@ pub struct Host {
     pub gpu_ring: AtomicU64,
     pub gpu_ring_size: AtomicU64,
     pub input_block: AtomicU64,
+    pub audio_started: AtomicBool,
+    pub audio_ring: AtomicU64,
+    pub audio_capacity: AtomicU32,
     pub messages: Mutex<Vec<String>>,
     pub shared: OnceLock<Arc<Shared>>,
+    pub httpfs: OnceLock<Arc<crate::io::HttpFs>>,
+    stop: Arc<AtomicBool>,
+    io_worker: Mutex<Option<std::thread::JoinHandle<Result<()>>>>,
+    io_table: AtomicU64,
+    audio_worker: Mutex<Option<crate::audio::AudioOutput>>,
+    muted: AtomicBool,
+    input: Mutex<InputState>,
+}
+
+struct InputState {
+    block: Option<InputBlock>,
+    size: (i32, i32),
+    start_mode: StartMode,
+}
+
+impl Host {
+    /// Retém a escolha anterior à publicação; depois escreve no mesmo bloco.
+    pub fn set_start_mode(&self, mode: StartMode) -> Result<()> {
+        let mut input = self
+            .input
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Input indisponível"))?;
+        if let Some(block) = &input.block {
+            block.set_start_mode(mode.word())?;
+        }
+        input.start_mode = mode;
+        Ok(())
+    }
+
+    fn publish_input(&self, address: u64) -> Result<()> {
+        ensure!(address != 0, "Bloco de input nulo");
+        let block = InputBlock::new(self.memory.clone(), address)?;
+        let mut input = self
+            .input
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Input indisponível"))?;
+        if input.block.is_some() {
+            ensure!(
+                self.input_block.load(Ordering::Acquire) == address,
+                "A sessão já possui outro bloco de input"
+            );
+            return Ok(());
+        }
+        block.set_size(input.size.0, input.size.1)?;
+        block.center()?;
+        block.set_focus(false)?;
+        block.set_start_mode(input.start_mode.word())?;
+        input.block = Some(block);
+        // O consumidor só pode observar o ponteiro após a inicialização completa.
+        self.input_block.store(address, Ordering::Release);
+        Ok(())
+    }
 }
 
 pub struct EngineHost {
@@ -85,6 +144,24 @@ fn argument_i64(params: &[Val], index: usize) -> i64 {
     }
 }
 
+fn host_error(error: anyhow::Error) -> wasmtime::Error {
+    wasmtime::Error::msg(format!("{error:#}"))
+}
+
+fn call(
+    function: wasmtime::Func,
+    mut context: impl wasmtime::AsContextMut,
+    params: &[Val],
+) -> wasmtime::Result<Vec<Val>> {
+    let mut results = function
+        .ty(context.as_context())
+        .results()
+        .map(|ty| default_val(&ty))
+        .collect::<Vec<_>>();
+    function.call(context.as_context_mut(), params, &mut results)?;
+    Ok(results)
+}
+
 fn export_call(
     store: &mut Store<Arc<Host>>,
     instance: &wasmtime::Instance,
@@ -94,11 +171,7 @@ fn export_call(
     let function = instance
         .get_func(&mut *store, name)
         .with_context(|| format!("export {name}"))?;
-    let mut results = vec![Val::I64(0); function.ty(&*store).results().len()];
-    function
-        .call(&mut *store, params, &mut results)
-        .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
-    Ok(results)
+    call(function, store, params).map_err(|error| anyhow::anyhow!("{name}: {error:?}"))
 }
 
 fn call_table(
@@ -114,8 +187,7 @@ fn call_table(
         .get(&mut *store, index)
         .and_then(|value| value.as_func().flatten().cloned())
         .context("índice de função nulo")?;
-    function
-        .call(&mut *store, &[Val::I64(argument as i64)], &mut [])
+    call(function, store, &[Val::I64(argument as i64)])
         .map_err(|error| anyhow::anyhow!("thread: {error:?}"))?;
     Ok(())
 }
@@ -141,7 +213,7 @@ fn run_pthread(host: Arc<Host>, shared: Arc<Shared>, ptr: u64, start: u64, arg: 
         .and_then(|bytes| bytes.try_into().ok())
         .map(u64::from_le_bytes)
         .unwrap_or(0);
-    let _ = export_call(
+    export_call(
         &mut store,
         &instance,
         "emscripten_stack_set_limits",
@@ -149,13 +221,13 @@ fn run_pthread(host: Arc<Host>, shared: Arc<Shared>, ptr: u64, start: u64, arg: 
             Val::I64(high as i64),
             Val::I64(high.saturating_sub(size) as i64),
         ],
-    );
-    let _ = export_call(
+    )?;
+    export_call(
         &mut store,
         &instance,
         "_emscripten_stack_restore",
         &[Val::I64(high as i64)],
-    );
+    )?;
     export_call(
         &mut store,
         &instance,
@@ -165,10 +237,16 @@ fn run_pthread(host: Arc<Host>, shared: Arc<Shared>, ptr: u64, start: u64, arg: 
             Val::I32(0),
             Val::I32(0),
             Val::I32(1),
-            Val::I64(0),
+            Val::I32(0),
             Val::I32(0),
         ],
     )?;
+    if instance
+        .get_func(&mut store, "_emscripten_tls_init")
+        .is_some()
+    {
+        export_call(&mut store, &instance, "_emscripten_tls_init", &[])?;
+    }
     call_table(&mut store, &instance, start, arg)
 }
 
@@ -251,7 +329,14 @@ fn dispatch(
             result_f64(results, millis);
         }
         "emscripten_num_logical_cores" => result_i32(results, host.cores.clamp(1, 64) as i32),
-        "emscripten_get_heap_max" => result_i64(results, host.memory.len() as i64),
+        "emscripten_get_heap_max" => {
+            let memory = host.memory.shared();
+            result_i64(
+                results,
+                (memory.ty().maximum().unwrap_or(memory.size()) * 65536) as i64,
+            );
+        }
+        "wasm_module_int_js" => result_i32(results, argument_i32(params, 1)),
         "emscripten_resize_heap" => {
             let size = argument_i64(params, 0);
             if size <= 0 {
@@ -304,9 +389,37 @@ fn dispatch(
             result_i32(results, 0);
         }
         "wasm_input_publish_js" => {
-            host.input_block
-                .store(argument_i64(params, 0) as u64, Ordering::Release);
+            host.publish_input(argument_i64(params, 0) as u64)
+                .map_err(host_error)?;
             result_i32(results, 0);
+        }
+        "wasm_audio_publish_js" => {
+            let ring = argument_i64(params, 0) as u64;
+            let capacity = argument_i32(params, 1) as u32;
+            let mut output = host
+                .audio_worker
+                .lock()
+                .map_err(|_| wasmtime::Error::msg("Saída de áudio indisponível"))?;
+            if output.is_none() {
+                *output = Some(
+                    crate::audio::AudioOutput::start(
+                        host.memory.clone(),
+                        ring,
+                        capacity,
+                        host.muted.load(Ordering::Acquire),
+                    )
+                    .map_err(host_error)?,
+                );
+                host.audio_ring.store(ring, Ordering::Release);
+                host.audio_capacity.store(capacity, Ordering::Release);
+                host.audio_started.store(true, Ordering::Release);
+            } else if host.audio_ring.load(Ordering::Acquire) != ring
+                || host.audio_capacity.load(Ordering::Acquire) != capacity
+            {
+                return Err(wasmtime::Error::msg(
+                    "A sessão já possui outro ring de áudio",
+                ));
+            }
         }
         "wgpu_start_worker" => {
             host.gpu_ring
@@ -317,8 +430,74 @@ fn dispatch(
             result_i32(results, 0);
         }
         "wasm_httpfs_io_start_js" => {
+            let filesystem = host
+                .httpfs
+                .get()
+                .ok_or_else(|| wasmtime::Error::msg("HTTPFS não configurado"))?
+                .clone();
+            let mut worker = host
+                .io_worker
+                .lock()
+                .map_err(|_| wasmtime::Error::msg("Worker HTTPFS indisponível"))?;
+            if worker.is_none() {
+                *worker = Some(
+                    crate::io::spawn(
+                        host.memory.clone(),
+                        argument_i64(params, 0) as u64,
+                        filesystem,
+                        host.stop.clone(),
+                    )
+                    .map_err(host_error)?,
+                );
+                host.io_table
+                    .store(argument_i64(params, 0) as u64, Ordering::Release);
+            } else if host.io_table.load(Ordering::Acquire) != argument_i64(params, 0) as u64 {
+                return Err(wasmtime::Error::msg(
+                    "A sessão já possui outra tabela HTTPFS",
+                ));
+            }
             host.io_started.store(true, Ordering::Release);
             result_i32(results, 0);
+        }
+        "wasm_httpfs_manifest_js" => {
+            if argument_i32(params, 1) < 0 {
+                return Err(wasmtime::Error::msg("Capacidade do manifesto negativa"));
+            }
+            let length = match host.httpfs.get() {
+                Some(filesystem) => filesystem
+                    .manifest(
+                        &host.memory,
+                        argument_i64(params, 0) as u64,
+                        argument_i32(params, 1) as u32,
+                    )
+                    .map_err(host_error)?,
+                None => -1,
+            };
+            result_i32(results, length);
+        }
+        "_emscripten_init_main_thread_js" => {
+            let function = caller
+                .get_export("_emscripten_thread_init")
+                .and_then(|export| export.into_func())
+                .ok_or_else(|| wasmtime::Error::msg("export _emscripten_thread_init ausente"))?;
+            call(
+                function,
+                &mut *caller,
+                &[
+                    Val::I64(argument_i64(params, 0)),
+                    Val::I32(0),
+                    Val::I32(1),
+                    Val::I32(1),
+                    Val::I32(1 << 20),
+                    Val::I32(0),
+                ],
+            )?;
+            if let Some(tls) = caller
+                .get_export("_emscripten_tls_init")
+                .and_then(|export| export.into_func())
+            {
+                call(tls, &mut *caller, &[])?;
+            }
         }
         "__pthread_create_js" => {
             let pointer = argument_i64(params, 0) as u64;
@@ -369,8 +548,22 @@ pub fn load(bytes: &[u8], cores: u32, memory_budget: u64) -> Result<EngineHost> 
         gpu_ring: AtomicU64::new(0),
         gpu_ring_size: AtomicU64::new(0),
         input_block: AtomicU64::new(0),
+        audio_started: AtomicBool::new(false),
+        audio_ring: AtomicU64::new(0),
+        audio_capacity: AtomicU32::new(0),
         messages: Mutex::new(Vec::new()),
         shared: OnceLock::new(),
+        httpfs: OnceLock::new(),
+        stop: Arc::new(AtomicBool::new(false)),
+        io_worker: Mutex::new(None),
+        io_table: AtomicU64::new(0),
+        audio_worker: Mutex::new(None),
+        muted: AtomicBool::new(false),
+        input: Mutex::new(InputState {
+            block: None,
+            size: (1280, 720),
+            start_mode: StartMode::Menu,
+        }),
     });
     let mut store = Store::new(&engine, host.clone());
     store.set_epoch_deadline(1);
@@ -446,32 +639,49 @@ pub fn load(bytes: &[u8], cores: u32, memory_budget: u64) -> Result<EngineHost> 
 }
 
 impl EngineHost {
+    pub fn configure_input(&mut self, launch: &Launch) -> Result<()> {
+        ensure!(
+            launch.width > 0
+                && launch.width <= i32::MAX as u32
+                && launch.height > 0
+                && launch.height <= i32::MAX as u32,
+            "Dimensões de input inválidas"
+        );
+        let mut input = self
+            .host
+            .input
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Input indisponível"))?;
+        ensure!(input.block.is_none(), "Input já publicado");
+        input.size = (launch.width as i32, launch.height as i32);
+        input.start_mode = launch.start_mode;
+        Ok(())
+    }
+
+    /// Configura input antes dos construtores que podem publicar o bloco.
+    pub fn start_with_launch(&mut self, launch: &Launch) -> Result<i32> {
+        self.configure_input(launch)?;
+        self.start(&engine_args(launch))
+    }
+
+    pub fn configure_httpfs(&mut self, filesystem: Arc<crate::io::HttpFs>) -> Result<()> {
+        self.host
+            .httpfs
+            .set(filesystem)
+            .map_err(|_| anyhow::anyhow!("HTTPFS já configurado"))
+    }
     pub fn start(&mut self, args: &[String]) -> Result<i32> {
         // Emscripten initializes a tabela de funções e os dados no ctors; sem
         // ele, call_indirect/invoke caem em funcref nulo.
-        for name in ["__wasm_apply_data_relocs", "__wasm_init_memory"] {
-            if let Ok(init) = self
-                .instance
-                .get_typed_func::<(), ()>(&mut self.store, name)
-            {
-                init.call(&mut self.store, ())
-                    .map_err(|error| anyhow::anyhow!("{name}: {error:?}"))?;
+        for name in [
+            "__wasm_apply_data_relocs",
+            "__wasm_init_memory",
+            "_emscripten_tls_init",
+            "__wasm_call_ctors",
+        ] {
+            if self.instance.get_func(&mut self.store, name).is_some() {
+                export_call(&mut self.store, &self.instance, name, &[])?;
             }
-        }
-        if let Ok(tls) = self
-            .instance
-            .get_typed_func::<(), ()>(&mut self.store, "_emscripten_tls_init")
-        {
-            tls.call(&mut self.store, ())
-                .map_err(|error| anyhow::anyhow!("_emscripten_tls_init: {error:?}"))?;
-        }
-        if let Ok(ctors) = self
-            .instance
-            .get_typed_func::<(), ()>(&mut self.store, "__wasm_call_ctors")
-        {
-            ctors
-                .call(&mut self.store, ())
-                .map_err(|error| anyhow::anyhow!("__wasm_call_ctors: {error:?}"))?;
         }
         let alloc = self
             .instance
@@ -527,6 +737,51 @@ impl EngineHost {
 
     pub fn io_started(&self) -> bool {
         self.host.io_started.load(Ordering::Acquire)
+    }
+
+    pub fn audio_started(&self) -> bool {
+        self.host.audio_started.load(Ordering::Acquire)
+    }
+
+    pub fn mute(&self, muted: bool) -> Result<()> {
+        self.host.muted.store(muted, Ordering::Release);
+        if let Some(output) = self
+            .host
+            .audio_worker
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Saída de áudio indisponível"))?
+            .as_ref()
+        {
+            output.mute(muted);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for EngineHost {
+    fn drop(&mut self) {
+        self.host.stop.store(true, Ordering::Release);
+        self.runtime.interrupt();
+        let audio = self
+            .host
+            .audio_worker
+            .lock()
+            .ok()
+            .and_then(|mut output| output.take());
+        drop(audio);
+        if let Some(worker) = self
+            .host
+            .io_worker
+            .lock()
+            .ok()
+            .and_then(|mut worker| worker.take())
+        {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!("Worker HTTPFS encerrou com erro: {error:#}"),
+                Err(_) => tracing::warn!("Worker HTTPFS encerrou com panic"),
+            }
+        }
     }
 }
 

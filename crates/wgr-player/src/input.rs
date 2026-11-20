@@ -34,6 +34,7 @@ pub const TAIL: u64 = 9;
 /// Modo inicial: 1 = história, 2 = sandbox (igual ao `play.html`).
 pub const START_STORY: i32 = 1;
 pub const START_SANDBOX: i32 = 2;
+pub const START_SANDBOX_ENV_TEST: i32 = 3;
 
 #[derive(Clone)]
 pub struct InputBlock {
@@ -106,6 +107,10 @@ impl InputBlock {
     }
 
     pub fn set_start_mode(&self, mode: i32) -> Result<()> {
+        ensure!(
+            (0..=START_SANDBOX_ENV_TEST).contains(&mode),
+            "Modo inicial inválido"
+        );
         self.memory
             .store_u32(self.base + START_MODE_OFFSET, mode as u32)
     }

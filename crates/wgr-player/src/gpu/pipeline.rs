@@ -130,7 +130,7 @@ pub fn plan(input: &PipelineInput<'_>) -> PipelinePlan {
             alpha_to_coverage_enabled: input
                 .blend_words
                 .is_some_and(|words| words.first().copied().unwrap_or(0) != 0)
-                && samples == 1,
+                && samples > 1,
         },
         group0: entries_for(&input.vs.bindings, 0, 0),
         group1: input
@@ -163,7 +163,7 @@ struct Out { @location(0u) color : vec4<f32>, }
     fn builds_targets_and_skips_slots_the_pixel_shader_does_not_write() {
         let display = map(28, 0).format;
         let aux = TextureFormat::Rgba16Float;
-        let pipeline = plan(&PipelineInput {
+        let input = PipelineInput {
             vs_label: "ped::VS".into(),
             ps_label: Some("ped::PS".into()),
             vs: &shader(),
@@ -173,13 +173,14 @@ struct Out { @location(0u) color : vec4<f32>, }
             strides: &[],
             topology: 4,
             strip_format: None,
-            blend_words: None,
+            blend_words: Some(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 15]),
             depth_words: None,
             raster_words: None,
             targets: &[Some(display), Some(aux)],
             samples: 1,
             depth_format: Some(TextureFormat::Depth32Float),
-        });
+        };
+        let pipeline = plan(&input);
         assert_eq!(pipeline.label, "ped::VS + ped::PS");
         assert_eq!(pipeline.targets.len(), 2);
         assert_eq!(pipeline.targets[0].as_ref().unwrap().format, display);
@@ -196,6 +197,12 @@ struct Out { @location(0u) color : vec4<f32>, }
             TextureFormat::Depth32Float
         );
         assert_eq!(pipeline.group1.len(), 3);
+        assert!(!pipeline.multisample.alpha_to_coverage_enabled);
+        let msaa = plan(&PipelineInput {
+            samples: 4,
+            ..input
+        });
+        assert!(msaa.multisample.alpha_to_coverage_enabled);
     }
 
     #[test]

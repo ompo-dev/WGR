@@ -9,15 +9,18 @@ use crate::gpu::objects::{
     parse_texture, parse_uav,
 };
 use crate::gpu::pipeline::{self, PipelineInput};
+use crate::gpu::pipeline_cache::{CachedPipeline, PipelineCache, PipelineCacheStats, PipelineKey};
 use crate::gpu::resources::{create_buffer, create_texture};
 use crate::gpu::table::ObjectTable;
+use crate::gpu::uniform::{inline_constants, snapshot, validate_pack};
 use crate::gpu::upload::{
     BufferUpload, TextureUpload, parse_buffer_upload, parse_texture_upload, valid_texture_upload,
 };
 use crate::shader::ShaderInfo;
 use crate::shader::{Pack, pack_uniforms, parse_wgsl};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use std::collections::HashMap;
+use wgpu::util::DeviceExt;
 use wgpu::{
     BindGroup, BindGroupLayout, BindGroupLayoutDescriptor, Buffer, Color, CommandEncoder,
     CommandEncoderDescriptor, Device, Extent3d, FragmentState, LoadOp, Operations, Origin3d,
@@ -30,6 +33,7 @@ use wgr_runtime::shared::GuestMemory;
 
 pub struct TextureObject {
     pub texture: Texture,
+    pub generation: u64,
     pub format: TextureFormat,
     pub view_formats: Vec<TextureFormat>,
     pub width: u32,
@@ -67,7 +71,9 @@ pub struct Program {
     pub module: ShaderModule,
     pub info: ShaderInfo,
     pub pack: Option<Pack>,
+    pub constants: Option<Buffer>,
     pub label: String,
+    pub generation: u64,
 }
 
 pub enum Object {
@@ -85,12 +91,19 @@ pub struct Worker {
     pub queue: Queue,
     pub objects: ObjectTable<Object>,
     pub state: crate::gpu::state::State,
-    shader_sources: HashMap<String, String>,
+    shader_sources: HashMap<String, crate::gpu::shaders::ShaderSource>,
+    pipeline_cache: PipelineCache,
+    shader_generation: u64,
+    texture_generation: u64,
     encoder: Option<CommandEncoder>,
     pass: Option<RenderPass<'static>>,
     pass_views: Vec<Option<TextureView>>,
-    pending_clears: [Option<Color>; 8],
+    uniform_bytes: u64,
 }
+
+// shortcut: snapshots imutáveis em vez do ring/cache do JS. Limita a memória
+// retida por encoder; submete antes de ultrapassar 16 MiB. Otimizar com perfis reais.
+const UNIFORM_SUBMISSION_BYTES: u64 = 16 * 1024 * 1024;
 
 impl Worker {
     pub fn new(device: Device, queue: Queue) -> Self {
@@ -100,16 +113,43 @@ impl Worker {
             objects: ObjectTable::new(),
             state: Default::default(),
             shader_sources: HashMap::new(),
+            pipeline_cache: PipelineCache::new(),
+            shader_generation: 0,
+            texture_generation: 0,
             encoder: None,
             pass: None,
             pass_views: Vec::new(),
-            pending_clears: [None; 8],
+            uniform_bytes: 0,
         }
     }
 
     pub fn register_shader_source(&mut self, hash: &str, source: &str) {
-        self.shader_sources
-            .insert(hash.to_string(), source.to_string());
+        self.register_shader_with_constants(
+            hash,
+            crate::gpu::shaders::ShaderSource {
+                text: source.to_string(),
+                constants: None,
+            },
+        );
+    }
+
+    pub fn register_shader_with_constants(
+        &mut self,
+        hash: &str,
+        source: crate::gpu::shaders::ShaderSource,
+    ) {
+        self.shader_sources.insert(hash.to_string(), source);
+    }
+
+    pub fn pipeline_cache_stats(&self) -> PipelineCacheStats {
+        self.pipeline_cache.stats()
+    }
+
+    fn uniform_limit(&self) -> u64 {
+        let limits = self.device.limits();
+        limits
+            .max_uniform_buffer_binding_size
+            .min(limits.max_buffer_size)
     }
 
     pub fn texture(&self, id: u32) -> Option<&TextureObject> {
@@ -149,6 +189,10 @@ impl Worker {
     }
 
     pub fn create_texture(&mut self, request: &TextureRequest) -> Result<()> {
+        self.texture_generation = self
+            .texture_generation
+            .checked_add(1)
+            .context("Geração de textura excedida")?;
         let mapped = map(request.dxgi, request.bind);
         let texture = create_texture(
             &self.device,
@@ -167,6 +211,7 @@ impl Worker {
             request.id,
             Object::Texture(TextureObject {
                 texture,
+                generation: self.texture_generation,
                 format: mapped.format,
                 view_formats: mapped.views,
                 width: request.width,
@@ -180,6 +225,32 @@ impl Worker {
         Ok(())
     }
 
+    /// Fecha o encoder da engine e compõe sua textura final na superfície.
+    pub fn present_to(&mut self, presenter: &mut crate::surface::Presenter, id: u32) -> Result<()> {
+        self.submit();
+        let texture = self
+            .texture(id)
+            .with_context(|| format!("PRESENT para textura desconhecida {id}"))?;
+        ensure!(
+            texture.dimension == TextureDimension::D2
+                && texture.depth == 1
+                && texture.samples == 1
+                && texture
+                    .texture
+                    .usage()
+                    .contains(wgpu::TextureUsages::TEXTURE_BINDING),
+            "Textura {id} não pode ser apresentada"
+        );
+        presenter.present(
+            id,
+            texture.generation,
+            &texture.texture,
+            texture.format,
+            texture.width,
+            texture.height,
+        )
+    }
+
     pub fn upload_texture(&mut self, upload: &TextureUpload, guest: &GuestMemory) -> Result<()> {
         let texture = match self.objects.get(upload.id) {
             Some(Object::Texture(texture)) => texture,
@@ -191,21 +262,53 @@ impl Worker {
         if upload.mip >= texture.mips {
             bail!("Mip {} fora da textura {}", upload.mip, upload.id);
         }
+        let mip_size = |value: u32| value.checked_shr(upload.mip).unwrap_or(0).max(1);
+        let (z, depth) = if texture.dimension == TextureDimension::D3 {
+            ensure!(upload.slice == 0, "Slice inválido para textura 3D");
+            (upload.z, mip_size(texture.depth))
+        } else {
+            ensure!(upload.z == 0, "Coordenada Z inválida para textura 1D/2D");
+            (upload.slice, texture.depth)
+        };
+        ensure!(
+            texture.samples == 1
+                && !texture.format.is_depth_stencil_format()
+                && texture
+                    .texture
+                    .usage()
+                    .contains(wgpu::TextureUsages::COPY_DST)
+                && upload
+                    .x
+                    .checked_add(upload.width)
+                    .is_some_and(|end| end <= mip_size(texture.width))
+                && upload
+                    .y
+                    .checked_add(upload.height)
+                    .is_some_and(|end| end <= mip_size(texture.height))
+                && z.checked_add(upload.depth).is_some_and(|end| end <= depth),
+            "Upload fora dos limites ou do uso da textura {}",
+            upload.id
+        );
         let bytes = guest
-            .read(upload.data_address, upload.size as usize)
+            .read(
+                upload.data_address,
+                upload
+                    .size
+                    .try_into()
+                    .context("Tamanho de textura excedido")?,
+            )
             .context("Leitura dos bytes da textura")?;
+        let texture = texture.texture.clone();
+        // Queue::write_* executa antes do próximo submit, não no ponto do ring.
+        self.submit();
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &texture.texture,
+                texture: &texture,
                 mip_level: upload.mip,
                 origin: Origin3d {
                     x: upload.x,
                     y: upload.y,
-                    z: if texture.dimension == TextureDimension::D3 {
-                        upload.z
-                    } else {
-                        upload.slice
-                    },
+                    z,
                 },
                 aspect: wgpu::TextureAspect::All,
             },
@@ -225,7 +328,11 @@ impl Worker {
     }
 
     pub fn create_buffer(&mut self, request: &BufferRequest) -> Result<()> {
-        let gpu = if request.bind & (0x1 | 0x2 | 0x8 | 0x80 | 0x10) != 0 {
+        ensure!(
+            request.size > 0 && request.size <= self.device.limits().max_buffer_size,
+            "Tamanho de buffer inválido"
+        );
+        let gpu = if request.bind & (0x1 | 0x2 | 0x8 | 0x80) != 0 || request.misc & 0x10 != 0 {
             Some(create_buffer(
                 &self.device,
                 "buffer",
@@ -253,11 +360,33 @@ impl Worker {
         let Some(Object::Buffer(buffer)) = self.objects.get(upload.id) else {
             bail!("Upload para buffer desconhecido {}", upload.id);
         };
+        ensure!(
+            upload
+                .offset
+                .checked_add(upload.size)
+                .is_some_and(|end| end <= buffer.size),
+            "Upload fora dos limites do buffer {}",
+            upload.id
+        );
+        ensure!(
+            buffer.buffer.is_none()
+                || (upload.offset.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+                    && upload.size.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)),
+            "Upload GPU desalinhado"
+        );
         let bytes = guest
-            .read(upload.data_address, upload.size as usize)
+            .read(
+                upload.data_address,
+                upload
+                    .size
+                    .try_into()
+                    .context("Tamanho de buffer excedido")?,
+            )
             .context("Leitura dos bytes do buffer")?;
-        if let Some(gpu) = &buffer.buffer {
-            self.queue.write_buffer(gpu, upload.offset, &bytes);
+        let gpu = buffer.buffer.clone();
+        if let Some(gpu) = gpu {
+            self.submit();
+            self.queue.write_buffer(&gpu, upload.offset, &bytes);
         }
         if let Some(shadow) = self
             .objects
@@ -268,10 +397,7 @@ impl Worker {
             })
         {
             let start = upload.offset as usize;
-            let end = start.saturating_add(bytes.len()).min(shadow.len());
-            if start < end {
-                shadow[start..end].copy_from_slice(&bytes[..end - start]);
-            }
+            shadow[start..start + bytes.len()].copy_from_slice(&bytes);
         }
         Ok(())
     }
@@ -355,13 +481,35 @@ impl Worker {
             .get(&shader.hash)
             .with_context(|| format!("WGSL ausente para {}", shader.hash))?
             .clone();
-        let (text, pack) = pack_uniforms(&source);
+        let (text, pack) = pack_uniforms(&source.text)?;
+        if let Some(pack) = &pack {
+            validate_pack(pack, self.uniform_limit())?;
+        }
+        let constants = source
+            .constants
+            .as_deref()
+            .map(|json| -> Result<Buffer> {
+                let bytes = inline_constants(json, self.uniform_limit())?;
+                Ok(self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("wgr-player-inline-constants"),
+                        contents: &bytes,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    }))
+            })
+            .transpose()
+            .context("Constantes do shader inválidas")?;
         let label = format!("{}:{}", shader.hash, shader.stage);
         let module = self.device.create_shader_module(ShaderModuleDescriptor {
             label: Some(&label),
             source: ShaderSource::Wgsl(text.as_str().into()),
         });
         let info = parse_wgsl(&text);
+        self.shader_generation = self
+            .shader_generation
+            .checked_add(1)
+            .context("Geração de shader excedida")?;
         self.objects.insert(
             id,
             Object::Shader(Program {
@@ -371,7 +519,9 @@ impl Worker {
                 module,
                 info,
                 pack,
+                constants,
                 label,
+                generation: self.shader_generation,
             }),
         );
         Ok(())
@@ -387,7 +537,8 @@ impl Worker {
         let request = parse_state(words).context("CREATE_STATE inválido")?;
         let body: Vec<u32> = words.get(2..).unwrap_or_default().to_vec();
         let object = if request.kind == 3 {
-            let sampler = self.device.create_sampler(&SamplerDescriptor::default());
+            let descriptor = crate::gpu::sampler::descriptor(&body)?;
+            let sampler = self.device.create_sampler(&descriptor);
             Object::Sampler(sampler)
         } else {
             Object::State {
@@ -418,7 +569,7 @@ impl Worker {
                 }
                 self.state.set_vertex_buffers_at(start, &entries);
             }
-            22 => self.state.set_index_buffer(words[0], words[1]),
+            22 => self.state.set_index_buffer(words[0], words[1], words[2]),
             23 => {
                 let stage = words[0];
                 let start = words[1] as usize;
@@ -450,9 +601,18 @@ impl Worker {
                 let stage = words[0];
                 let start = words[1];
                 let count = words[2] as usize;
+                ensure!(
+                    words[3 + count..3 + count * 2]
+                        .iter()
+                        .all(|&value| value == u32::MAX),
+                    "Contadores iniciais de UAV ainda não implementados"
+                );
                 self.state.set_uavs(stage, start, &words[3..3 + count]);
             }
-            26 => self.state.set_render_targets(words),
+            26 => {
+                self.pass = None;
+                self.state.set_render_targets(words);
+            }
             27 => self.state.blend = words[0],
             28 => self.state.depth_stencil = words[0],
             29 => self.state.raster = words[0],
@@ -504,7 +664,50 @@ impl Worker {
         payload_address: u64,
         guest: &GuestMemory,
     ) -> Result<()> {
+        let minimum = match op {
+            0 | 2 | 33 => 0,
+            4 | 7 | 19 | 20 | 29 | 30 | 31 => 1,
+            15 | 16 | 18 | 21 | 28 => 2,
+            12 | 22..=25 | 38 | 47 => 3,
+            11 | 14 => 5,
+            27 | 32 => 6,
+            5 => 7,
+            17 | 37 => 9,
+            3 => 10,
+            13 => 12,
+            26 => 37,
+            _ => bail!("Opcode GPU {op} não implementado"),
+        };
+        ensure!(
+            words.len() >= minimum,
+            "Payload truncado do opcode GPU {op}"
+        );
+        let counted = match op {
+            21 => Some((2, 3, words[1], words[0], 16)),
+            23 => Some((3, 3, words[2], words[1], 16)),
+            24 => Some((3, 1, words[2], words[1], 128)),
+            25 => Some((3, 1, words[2], words[1], 16)),
+            38 => Some((3, 2, words[2], words[1], 16)),
+            30 => Some((1, 6, words[0], 0, 16)),
+            31 => Some((1, 4, words[0], 0, 16)),
+            _ => None,
+        };
+        if let Some((header, stride, count, start, limit)) = counted {
+            ensure!(
+                start <= limit && count <= limit - start,
+                "Slots inválidos no opcode GPU {op}"
+            );
+            ensure!(
+                words.len() >= header + stride * count as usize,
+                "Contagem truncada no opcode GPU {op}"
+            );
+        }
+        if matches!(op, 18 | 23..=25 | 38) {
+            ensure!(words[0] < 3, "Estágio GPU inválido");
+        }
         match op {
+            // NOP/INIT não alteram estado; PRESENT é submetido pelo dreno.
+            0 | 2 | 7 => Ok(()),
             3 => {
                 let request = parse_texture(words).context("CREATE_TEXTURE inválido")?;
                 self.create_texture(&request)
@@ -520,8 +723,7 @@ impl Worker {
                     b: f64::from(f32::from_bits(words[5])),
                     a: f64::from(f32::from_bits(words[6])),
                 };
-                self.pending_clear(words[0], color);
-                Ok(())
+                self.clear_target(words[0], words[1], words[2], color)
             }
             11 => {
                 let request = parse_buffer(words).context("CREATE_BUFFER inválido")?;
@@ -548,24 +750,60 @@ impl Worker {
                 let request = parse_uav(words).context("CREATE_UAV inválido")?;
                 self.create_view(&request)
             }
-            18..=31 => self.exec_state(op, words),
+            18..=31 | 38 => self.exec_state(op, words),
             32 => self.draw(words),
             33 => {
+                self.pass = None;
                 self.state.clear();
                 Ok(())
             }
-            _ => Ok(()),
+            _ => bail!("Opcode GPU {op} não implementado"),
         }
     }
 
-    fn pending_clear(&mut self, id: u32, color: Color) {
-        for (index, target) in self.state.render_targets.iter().enumerate() {
-            if target.texture == id {
-                self.pending_clears[index] = Some(color);
-                return;
-            }
-        }
-        self.pending_clears[0] = Some(color);
+    fn clear_target(&mut self, id: u32, mip: u32, slice: u32, color: Color) -> Result<()> {
+        let texture = self
+            .texture(id)
+            .context("Clear para textura desconhecida")?;
+        ensure!(
+            texture.dimension == TextureDimension::D2
+                && mip < texture.mips
+                && slice < texture.depth
+                && texture
+                    .texture
+                    .usage()
+                    .contains(wgpu::TextureUsages::RENDER_ATTACHMENT),
+            "Alvo de clear inválido"
+        );
+        let view = texture.texture.create_view(&TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D2),
+            base_mip_level: mip,
+            mip_level_count: Some(1),
+            base_array_layer: slice,
+            array_layer_count: Some(1),
+            ..Default::default()
+        });
+        self.pass = None;
+        let encoder = self.encoder.get_or_insert_with(|| {
+            self.device
+                .create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("wgr-player-clear"),
+                })
+        });
+        let _pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("wgr-player-clear"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(color),
+                    store: StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        Ok(())
     }
 
     fn ensure_pass(&mut self) -> Result<()> {
@@ -573,11 +811,9 @@ impl Worker {
             return Ok(());
         }
         let mut views: Vec<Option<TextureView>> = Vec::new();
-        let mut formats: Vec<TextureFormat> = Vec::new();
         for target in &self.state.render_targets {
             if target.texture == 0 {
                 views.push(None);
-                formats.push(TextureFormat::Rgba8Unorm);
                 continue;
             }
             let Some(texture) = self.texture(target.texture) else {
@@ -589,6 +825,8 @@ impl Worker {
                 texture.format
             };
             let view = texture.texture.create_view(&TextureViewDescriptor {
+                format: Some(format),
+                dimension: Some(TextureViewDimension::D2),
                 base_mip_level: target.mip,
                 mip_level_count: Some(1),
                 base_array_layer: target.slice,
@@ -596,22 +834,19 @@ impl Worker {
                 ..Default::default()
             });
             views.push(Some(view));
-            formats.push(format);
         }
         if views.iter().all(Option::is_none) {
             bail!("Nenhum render target ligado");
         }
-        let clear = self.pending_clears;
         let color_attachments: Vec<Option<RenderPassColorAttachment<'_>>> = views
             .iter()
-            .enumerate()
-            .map(|(index, view)| {
+            .map(|view| {
                 view.as_ref().map(|view| RenderPassColorAttachment {
                     view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
-                        load: clear[index].map_or(LoadOp::Load, LoadOp::Clear),
+                        load: LoadOp::Load,
                         store: StoreOp::Store,
                     },
                 })
@@ -635,7 +870,6 @@ impl Worker {
             .forget_lifetime();
         self.pass_views = views;
         self.pass = Some(pass);
-        self.pending_clears = [None; 8];
         Ok(())
     }
 
@@ -645,7 +879,7 @@ impl Worker {
         program: &Program,
         group: u32,
         layout: &BindGroupLayout,
-    ) -> Result<Option<BindGroup>> {
+    ) -> Result<Option<(BindGroup, Vec<u32>)>> {
         let bindings: Vec<_> = program
             .info
             .bindings
@@ -655,9 +889,55 @@ impl Worker {
         if bindings.is_empty() {
             return Ok(None);
         }
+        let packed = if bindings.iter().any(|binding| {
+            binding.kind == crate::shader::BindingKind::Uniform && binding.binding != 15
+        }) {
+            let pack = program
+                .pack
+                .as_ref()
+                .context("Layout sem pack de uniformes")?;
+            let slots = self
+                .state
+                .cb
+                .get(stage as usize)
+                .context("Estágio de uniformes inválido")?;
+            let bytes = snapshot(
+                pack,
+                slots,
+                |id| match self.objects.get(id) {
+                    Some(Object::Buffer(buffer)) => buffer.shadow.as_deref(),
+                    _ => None,
+                },
+                self.uniform_limit(),
+            )?;
+            Some(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("wgr-player-uniform-snapshot"),
+                        contents: &bytes,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    }),
+            )
+        } else {
+            None
+        };
+        let mut dynamic_offsets = Vec::new();
         let mut entries = Vec::new();
         for binding in &bindings {
             let resource = match binding.kind {
+                crate::shader::BindingKind::Uniform => {
+                    let buffer = if binding.binding == 15 {
+                        program
+                            .constants
+                            .as_ref()
+                            .context("Binding 15 sem tabela de constantes")?
+                    } else {
+                        ensure!(binding.binding == 0, "Uniforme fora do binding empacotado");
+                        dynamic_offsets.push(0);
+                        packed.as_ref().context("Snapshot de uniformes ausente")?
+                    };
+                    buffer.as_entire_binding()
+                }
                 crate::shader::BindingKind::Sampler
                 | crate::shader::BindingKind::SamplerComparison => {
                     let id = *self
@@ -686,7 +966,11 @@ impl Worker {
                     };
                     wgpu::BindingResource::TextureView(view)
                 }
-                _ => continue,
+                _ => bail!(
+                    "Tipo de binding ainda não suportado: {:?} no binding {}",
+                    binding.kind,
+                    binding.binding
+                ),
             };
             entries.push(wgpu::BindGroupEntry {
                 binding: binding.binding,
@@ -701,32 +985,54 @@ impl Worker {
             layout,
             entries: &entries,
         });
-        Ok(Some(bind_group))
+        Ok(Some((bind_group, dynamic_offsets)))
     }
 
     fn draw(&mut self, words: &[u32]) -> Result<()> {
         let kind = words[0];
+        ensure!(kind <= 3, "Desenho indireto ainda não implementado");
         let count = *words.get(1).unwrap_or(&0);
         let instances = *words.get(2).unwrap_or(&1);
         let start = *words.get(3).unwrap_or(&0);
         let base_vertex = *words.get(4).unwrap_or(&0) as i32;
         let start_instance = *words.get(5).unwrap_or(&0);
+        let vertex_end = start
+            .checked_add(count)
+            .context("Intervalo de desenho excedido")?;
+        let instance_end = start_instance
+            .checked_add(instances)
+            .context("Intervalo de instâncias excedido")?;
         let vs = self.shader(0).context("Vertex shader ausente")?;
         let vs_inputs = vs.inputs.clone();
         let vs_info = vs.info.clone();
         let vs_module = vs.module.clone();
         let vs_label = vs.label.clone();
+        let vs_generation = vs.generation;
         let ps = self.shader(1);
-        let (ps_info, ps_module, ps_label) = match ps {
+        let (ps_info, ps_module, ps_label, ps_generation) = match ps {
             Some(program) => (
                 Some(program.info.clone()),
                 Some(program.module.clone()),
                 Some(program.label.clone()),
+                Some(program.generation),
             ),
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
         let elements = self.layout().cloned().unwrap_or_default();
 
+        let uniform_bytes = [self.shader(0), self.shader(1)]
+            .into_iter()
+            .flatten()
+            .filter_map(|program| program.pack.as_ref())
+            .try_fold(0u64, |total, pack| -> Result<u64> {
+                validate_pack(pack, self.uniform_limit())?;
+                total
+                    .checked_add(pack.size)
+                    .context("Snapshots de uniformes excedidos")
+            })?;
+        if self.uniform_bytes + uniform_bytes > UNIFORM_SUBMISSION_BYTES {
+            self.submit();
+        }
         self.ensure_pass()?;
         let target_formats: Vec<Option<TextureFormat>> = self
             .state
@@ -745,78 +1051,131 @@ impl Worker {
         let blend_words = self.state_words(self.state.blend).cloned();
         let depth_words = self.state_words(self.state.depth_stencil).cloned();
         let raster_words = self.state_words(self.state.raster).cloned();
-        let plan = pipeline::plan(&PipelineInput {
-            vs_label,
-            ps_label,
-            vs: &vs_info,
-            ps: ps_info.as_ref(),
-            inputs: &vs_inputs,
-            elements: &elements,
-            strides: &[],
+        let strides = self.state.vertex_buffers.map(|buffer| buffer.stride);
+        let key = PipelineKey {
+            vertex_generation: vs_generation,
+            fragment_generation: ps_generation,
+            layout: elements
+                .iter()
+                .flat_map(|element| {
+                    [
+                        element.semantic,
+                        element.index,
+                        element.format,
+                        element.slot,
+                        element.offset,
+                        element.class,
+                        element.step_rate,
+                    ]
+                })
+                .collect(),
+            strides,
             topology: self.state.topology,
-            strip_format: None,
-            blend_words: blend_words.as_deref(),
-            depth_words: depth_words.as_deref(),
-            raster_words: raster_words.as_deref(),
-            targets: &target_formats,
+            strip_format: matches!(kind, 1 | 3).then_some(
+                if self.state.index_buffer.stride == 57 {
+                    16
+                } else {
+                    32
+                },
+            ),
+            blend: blend_words.clone().unwrap_or_default(),
+            depth: depth_words.clone().unwrap_or_default(),
+            raster: raster_words.clone().unwrap_or_default(),
+            targets: target_formats.clone(),
             samples: 1,
             depth_format: None,
-        });
-
-        let bgl0 = self
-            .device
-            .create_bind_group_layout(&BindGroupLayoutDescriptor {
-                label: Some("wgr-player"),
-                entries: &plan.group0,
+        };
+        let cached = self.pipeline_cache.get(&key);
+        let (pipeline, bgl0, bgl1) = if let Some(cached) = cached {
+            (cached.pipeline, cached.group0, cached.group1)
+        } else {
+            let plan = pipeline::plan(&PipelineInput {
+                vs_label,
+                ps_label,
+                vs: &vs_info,
+                ps: ps_info.as_ref(),
+                inputs: &vs_inputs,
+                elements: &elements,
+                strides: &strides,
+                topology: self.state.topology,
+                strip_format: matches!(kind, 1 | 3).then_some(
+                    if self.state.index_buffer.stride == 57 {
+                        wgpu::IndexFormat::Uint16
+                    } else {
+                        wgpu::IndexFormat::Uint32
+                    },
+                ),
+                blend_words: blend_words.as_deref(),
+                depth_words: depth_words.as_deref(),
+                raster_words: raster_words.as_deref(),
+                targets: &target_formats,
+                samples: 1,
+                depth_format: None,
             });
-        let bgl1 = self
-            .device
-            .create_bind_group_layout(&BindGroupLayoutDescriptor {
-                label: Some("wgr-player"),
-                entries: &plan.group1,
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&PipelineLayoutDescriptor {
-                label: Some("wgr-player"),
-                bind_group_layouts: &[Some(&bgl0), Some(&bgl1)],
-                immediate_size: 0,
-            });
-        let buffer_plans: Vec<_> = plan
-            .vertex_buffers
-            .iter()
-            .map(|plan| plan.as_ref().map(|plan| (plan, plan.attributes())))
-            .collect();
-        let mut vertex_layouts = Vec::new();
-        for entry in &buffer_plans {
-            match entry {
-                Some((plan, attrs)) => vertex_layouts.push(Some(plan.layout(attrs))),
-                None => vertex_layouts.push(None),
+            let bgl0 = self
+                .device
+                .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                    label: Some("wgr-player"),
+                    entries: &plan.group0,
+                });
+            let bgl1 = self
+                .device
+                .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                    label: Some("wgr-player"),
+                    entries: &plan.group1,
+                });
+            let layout = self
+                .device
+                .create_pipeline_layout(&PipelineLayoutDescriptor {
+                    label: Some("wgr-player"),
+                    bind_group_layouts: &[Some(&bgl0), Some(&bgl1)],
+                    immediate_size: 0,
+                });
+            let buffer_plans: Vec<_> = plan
+                .vertex_buffers
+                .iter()
+                .map(|plan| plan.as_ref().map(|plan| (plan, plan.attributes())))
+                .collect();
+            let mut vertex_layouts = Vec::new();
+            for entry in &buffer_plans {
+                match entry {
+                    Some((plan, attrs)) => vertex_layouts.push(Some(plan.layout(attrs))),
+                    None => vertex_layouts.push(None),
+                }
             }
-        }
-        let pipeline = self
-            .device
-            .create_render_pipeline(&RenderPipelineDescriptor {
-                label: Some(&plan.label),
-                layout: Some(&layout),
-                vertex: VertexState {
-                    module: &vs_module,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    buffers: &vertex_layouts,
+            let pipeline = self
+                .device
+                .create_render_pipeline(&RenderPipelineDescriptor {
+                    label: Some(&plan.label),
+                    layout: Some(&layout),
+                    vertex: VertexState {
+                        module: &vs_module,
+                        entry_point: Some("main"),
+                        compilation_options: Default::default(),
+                        buffers: &vertex_layouts,
+                    },
+                    fragment: ps_module.as_ref().map(|module| FragmentState {
+                        module,
+                        entry_point: Some("main"),
+                        compilation_options: Default::default(),
+                        targets: &plan.targets,
+                    }),
+                    primitive: plan.primitive,
+                    depth_stencil: None,
+                    multisample: plan.multisample,
+                    multiview_mask: None,
+                    cache: None,
+                });
+            self.pipeline_cache.insert(
+                key,
+                CachedPipeline {
+                    pipeline: pipeline.clone(),
+                    group0: bgl0.clone(),
+                    group1: bgl1.clone(),
                 },
-                fragment: ps_module.as_ref().map(|module| FragmentState {
-                    module,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    targets: &plan.targets,
-                }),
-                primitive: plan.primitive,
-                depth_stencil: None,
-                multisample: plan.multisample,
-                multiview_mask: None,
-                cache: None,
-            });
+            );
+            (pipeline, bgl0, bgl1)
+        };
 
         let bind0 = match self.shader(0).cloned() {
             Some(program) => self.bind_group(0, &program, 0, &bgl0)?,
@@ -826,14 +1185,15 @@ impl Worker {
             Some(program) => self.bind_group(1, &program, 1, &bgl1)?,
             None => None,
         };
+        self.uniform_bytes += uniform_bytes;
 
         if let Some(pass) = self.pass.as_mut() {
             pass.set_pipeline(&pipeline);
-            if let Some(bind) = &bind0 {
-                pass.set_bind_group(0, bind, &[]);
+            if let Some((bind, offsets)) = &bind0 {
+                pass.set_bind_group(0, bind, offsets);
             }
-            if let Some(bind) = &bind1 {
-                pass.set_bind_group(1, bind, &[]);
+            if let Some((bind, offsets)) = &bind1 {
+                pass.set_bind_group(1, bind, offsets);
             }
             for (slot, buffer) in self.state.vertex_buffers.iter().enumerate() {
                 if buffer.buffer != 0
@@ -868,16 +1228,9 @@ impl Worker {
                     wgpu::IndexFormat::Uint32
                 };
                 pass.set_index_buffer(gpu.slice(self.state.index_buffer.offset as u64..), format);
-                pass.draw_indexed(
-                    start..start + count,
-                    base_vertex,
-                    start_instance..start_instance + instances,
-                );
+                pass.draw_indexed(start..vertex_end, base_vertex, start_instance..instance_end);
             } else {
-                pass.draw(
-                    start..start + count,
-                    start_instance..start_instance + instances,
-                );
+                pass.draw(start..vertex_end, start_instance..instance_end);
             }
         }
         Ok(())
@@ -885,6 +1238,8 @@ impl Worker {
 
     pub fn submit(&mut self) {
         self.pass = None;
+        self.pass_views.clear();
+        self.uniform_bytes = 0;
         if let Some(encoder) = self.encoder.take() {
             self.queue.submit(Some(encoder.finish()));
         }

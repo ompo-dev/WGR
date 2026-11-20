@@ -7,12 +7,225 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use wgr_core::assets::{sha256, DiskCache};
 use wgr_core::security::{rooted_file, safe_relative, HttpClient, NetworkPolicy};
 
-const DISK_BUDGET: u64 = 2 << 30;
+const DISK_BUDGET: u64 = 6 << 30;
+const MIN_DISK_BUDGET: u64 = 2 << 30;
+const FREE_DISK_RESERVE: u64 = 12 << 30;
 const HOT_BUDGET: usize = 48 << 20;
 const BLOCK: u64 = 128 << 10;
 const FETCH_WINDOW: u64 = 1 << 20;
 const BOOT_PREFETCH_BUDGET: u64 = 64 << 20;
 const BUILD: &str = "8b0b5899ed";
+const SHADER_INDEX_REFRESH: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+fn cache_budget_for_free_space(free_bytes: u64) -> u64 {
+    MIN_DISK_BUDGET
+        + free_bytes
+            .saturating_sub(FREE_DISK_RESERVE)
+            .min(DISK_BUDGET - MIN_DISK_BUDGET)
+}
+
+fn safe_cache_budget(support: &Path) -> u64 {
+    #[cfg(windows)]
+    {
+        if let Ok(bytes) = crate::platform_windows::statfs_bytes(support) {
+            let word = |offset: usize| {
+                u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap_or([0; 8]))
+            };
+            return cache_budget_for_free_space(word(32).saturating_mul(word(8)));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = support;
+    MIN_DISK_BUDGET
+}
+const HEADER_PREFETCH_WORKERS: usize = 2;
+const MAX_HIGH_HINTS: usize = 16;
+const MAX_LOW_HINTS: usize = 1;
+const HINT_RECENT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The browser loader sends its I/O worker origin + /data/.
+/// The v2 dataset differs from the old fiveplay.lol dataset. Never reuse
+/// old bytes merely because an asset name and length happen to match.
+fn data_cache_key(base: &str, version: &str, path: &str, start: u64, size: u64) -> String {
+    format!("{BUILD}:data:{base}:{version}:{path}:{start}:{size}")
+}
+
+fn manifest_valid(manifest: &Value) -> bool {
+    let Some(version) = manifest["version"].as_str() else {
+        return false;
+    };
+    let Some(files) = manifest["files"].as_array() else {
+        return false;
+    };
+    !version.is_empty()
+        && version.len() <= 128
+        && !files.is_empty()
+        && files.len() <= 100_000
+        && files.iter().all(|file| {
+            file.as_array().is_some_and(|entry| {
+                entry.len() >= 2
+                    && entry[0]
+                        .as_str()
+                        .is_some_and(|path| safe_relative(path).is_ok())
+                    && entry[1].as_u64().is_some_and(|size| size <= 1 << 40)
+            })
+        })
+}
+
+fn bootset_valid(value: &Value) -> bool {
+    value.as_array().is_some_and(|rows| {
+        rows.len() <= 100_000
+            && rows.iter().all(|row| {
+                row.as_array().is_some_and(|entry| {
+                    entry.len() == 2
+                        && entry[0]
+                            .as_str()
+                            .is_some_and(|path| safe_relative(path).is_ok())
+                        && entry[1].is_array()
+                })
+            })
+    })
+}
+
+fn refresh_data_metadata(
+    runtime: &tokio::runtime::Runtime,
+    http: &HttpClient,
+    directory: &Path,
+    filename: &str,
+    url: &str,
+    validate: fn(&Value) -> bool,
+) -> Result<Value> {
+    let path = directory.join(filename);
+    let marker = directory.join(format!("{filename}.source"));
+    let old = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(validate);
+    let source_matches = std::fs::read_to_string(&marker)
+        .ok()
+        .is_some_and(|source| source == url);
+    let fresh = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|time| time.elapsed().ok())
+        .is_some_and(|age| age < SHADER_INDEX_REFRESH);
+    if old.is_some() && source_matches && fresh {
+        return Ok(old.unwrap());
+    }
+    let latest = runtime.block_on(http.get(url, 8 << 20)).and_then(|reply| {
+        ensure!(reply.status.is_success(), "Metadados HTTP {}", reply.status);
+        let parsed: Value = serde_json::from_slice(&reply.body)?;
+        ensure!(validate(&parsed), "Metadados inválidos de {url}");
+        Ok((reply.body, parsed))
+    });
+    match latest {
+        Ok((body, parsed)) => {
+            if old.as_ref() != Some(&parsed) || !source_matches {
+                if path.is_file() {
+                    let backup = directory.join(format!("{filename}.previous"));
+                    if !backup.exists() {
+                        let _ = std::fs::copy(&path, &backup);
+                    }
+                }
+                let temp = directory.join(format!("{filename}.partial"));
+                std::fs::write(&temp, body)?;
+                std::fs::rename(&temp, &path)?;
+                eprintln!("[native-assets] refreshed {filename} from {url}");
+            }
+            std::fs::write(marker, url)?;
+            Ok(parsed)
+        }
+        Err(error) if source_matches && old.is_some() => {
+            eprintln!("[native-assets] {filename}: offline validated cache: {error}");
+            Ok(old.unwrap())
+        }
+        Err(error) => Err(error.context(format!(
+            "{filename}: catálogo local pertence a outra origem; versão v2 requer sincronização inicial"
+        ))),
+    }
+}
+
+fn shader_index_valid(index: &Value) -> bool {
+    index.is_object()
+        && index["_packs"]
+            .as_array()
+            .is_some_and(|packs| packs.len() <= 1024)
+}
+
+/// Maintain one bounded, browser-build-matched shader catalog. An old index
+/// from the previous hostname can omit shaders the Chromium port already
+/// knows about (including ped skin/deferred and SSAO passes). Offline launch
+/// keeps the last validated catalog; no unchecked download replaces it.
+fn refresh_shader_index(
+    runtime: &tokio::runtime::Runtime,
+    http: &HttpClient,
+    directory: &Path,
+    base: &str,
+) -> Result<Value> {
+    let path = directory.join("index.json");
+    let source_marker = directory.join("index.source");
+    let old = std::fs::read(&path)
+        .ok()
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+        .filter(shader_index_valid);
+    let same_origin = std::fs::read_to_string(&source_marker)
+        .ok()
+        .is_some_and(|source| source == base);
+    let recent = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < SHADER_INDEX_REFRESH);
+    if old.is_some() && same_origin && recent {
+        return Ok(old.unwrap());
+    }
+    let result = runtime
+        .block_on(http.get(&format!("{base}index.json"), 8 << 20))
+        .and_then(|reply| {
+            ensure!(
+                reply.status.is_success(),
+                "HTTP {} for shader index",
+                reply.status
+            );
+            let updated: Value = serde_json::from_slice(&reply.body)?;
+            ensure!(
+                shader_index_valid(&updated),
+                "Índice de shaders remoto inválido"
+            );
+            Ok((reply.body, updated))
+        });
+    match result {
+        Ok((body, updated)) => {
+            if old.as_ref() != Some(&updated) {
+                if path.exists() {
+                    let backup = directory.join("index.previous.json");
+                    if !backup.exists() {
+                        let _ = std::fs::copy(&path, &backup);
+                    }
+                }
+                let temporary = directory.join("index.partial");
+                std::fs::write(&temporary, body)?;
+                std::fs::rename(&temporary, &path)?;
+                eprintln!(
+                    "[native-assets] shader catalog refreshed: {} records",
+                    updated.as_object().map(|x| x.len()).unwrap_or(0)
+                );
+            }
+            let _ = std::fs::write(&source_marker, base);
+            Ok(updated)
+        }
+        Err(error) => {
+            if let Some(old) = old.filter(|_| same_origin) {
+                eprintln!("[native-assets] shader catalog refresh unavailable ({error}); using validated offline copy");
+                Ok(old)
+            } else {
+                Err(error.context(
+                    "Catálogo de shaders indisponível para esta origem; não misturar versões",
+                ))
+            }
+        }
+    }
+}
 
 fn fetch_window(start: u64, size: u64) -> (u64, u64) {
     let window_start = start / FETCH_WINDOW * FETCH_WINDOW;
@@ -20,6 +233,15 @@ fn fetch_window(start: u64, size: u64) -> (u64, u64) {
         window_start,
         window_start.saturating_add(FETCH_WINDOW).min(size),
     )
+}
+
+fn fetch_asset_window(path: &str, start: u64, size: u64, bulk: bool) -> (u64, u64) {
+    if path.ends_with(".rpf") && !bulk {
+        let begin = start / BLOCK * BLOCK;
+        (begin, (begin + BLOCK).min(size))
+    } else {
+        fetch_window(start, size)
+    }
 }
 
 fn boot_range_end(position: u64, end: u64, budget_left: u64) -> u64 {
@@ -34,6 +256,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unbundled_valid_shaders_are_not_mistaken_for_missing_packs() {
+        assert_eq!(
+            shader_pack_slice(
+                &serde_json::json!({"ok":true,"effect":"SSAO","program":"VS_screenTransformSSAO"}),
+                false,
+            ),
+            None,
+        );
+        let packed = serde_json::json!({"p":[2,256,8192,64]});
+        assert_eq!(shader_pack_slice(&packed, false), Some((256, 8192)));
+        assert_eq!(shader_pack_slice(&packed, true), Some((8448, 64)));
+        assert_eq!(
+            shader_pack_slice(&serde_json::json!({"p":[2]}), false),
+            None
+        );
+    }
+
+    #[test]
+    fn never_reuses_old_origin_or_version_asset_blocks() {
+        let old = data_cache_key(
+            "https://fiveplay.lol/data/",
+            "1791169379-5814",
+            "common/data/gameconfig.xml",
+            0,
+            58602,
+        );
+        let current = data_cache_key(
+            "https://v2.fiveplay.lol/data/",
+            "grandv-r5-mobile-core-20261023",
+            "common/data/gameconfig.xml",
+            0,
+            58602,
+        );
+        let next = data_cache_key(
+            "https://v2.fiveplay.lol/data/",
+            "grandv-r5-mobile-core-20261024",
+            "common/data/gameconfig.xml",
+            0,
+            58602,
+        );
+        assert_ne!(old, current);
+        assert_ne!(current, next);
+        assert_eq!(
+            current,
+            data_cache_key(
+                "https://v2.fiveplay.lol/data/",
+                "grandv-r5-mobile-core-20261023",
+                "common/data/gameconfig.xml",
+                0,
+                58602,
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_data_manifests_and_bootsets() {
+        assert!(!manifest_valid(&serde_json::json!({"files": []})));
+        assert!(!manifest_valid(&serde_json::json!({
+            "version":"v2", "files":[["../outside.bin",20]]
+        })));
+        assert!(manifest_valid(&serde_json::json!({
+            "version":"v2", "files":[["common/data/gameconfig.xml",58602,42]]
+        })));
+        assert!(!bootset_valid(&serde_json::json!({"unexpected":"object"})));
+        assert!(!bootset_valid(&serde_json::json!([[
+            "../../secret",
+            [[0, 2]]
+        ]])));
+        assert!(bootset_valid(&serde_json::json!([[
+            "common/data/gameconfig.xml",
+            [[0, 4095]]
+        ]])));
+    }
+
+    #[test]
+    fn rejects_invalid_shader_catalogs_before_replacing_offline_cache() {
+        assert!(!shader_index_valid(&serde_json::json!({})));
+        assert!(!shader_index_valid(&serde_json::json!({"_packs":{}})));
+        assert!(shader_index_valid(&serde_json::json!({
+            "_packs":[{"file":"pack0.bin"}],
+            "0123456789abcdef":{"stage":"ps","ok":true}
+        })));
+        assert!(!shader_index_valid(&serde_json::json!({
+            "_packs": vec![serde_json::json!(null); 1025]
+        })));
+    }
+
+    #[test]
     fn groups_adjacent_blocks_in_one_bounded_window() {
         assert_eq!(fetch_window(0, 3 << 20), (0, 1 << 20));
         assert_eq!(fetch_window(128 << 10, 3 << 20), (0, 1 << 20));
@@ -42,9 +352,65 @@ mod tests {
     }
 
     #[test]
+    fn archive_headers_do_not_trigger_one_megabyte_downloads() {
+        assert_eq!(
+            fetch_asset_window("x64/anim/clip.rpf", 0, 10 << 20, false),
+            (0, BLOCK)
+        );
+        assert_eq!(
+            fetch_asset_window("x64/anim/short.rpf", 0, 8000, false),
+            (0, 8000)
+        );
+        assert_eq!(
+            fetch_asset_window("x64/anim/clip.rpf", BLOCK, 10 << 20, false),
+            (BLOCK, BLOCK * 2)
+        );
+        assert_eq!(
+            fetch_asset_window("x64/anim/clip.rpf", BLOCK, 10 << 20, true),
+            (0, FETCH_WINDOW)
+        );
+        assert_eq!(
+            fetch_asset_window("common/data/gameconfig.xml", 0, 10 << 20, false),
+            (0, FETCH_WINDOW)
+        );
+    }
+
+    #[test]
     fn caps_boot_preload_without_splitting_the_final_range() {
         assert_eq!(boot_range_end(63 << 20, 100 << 20, 1 << 20), 64 << 20);
         assert_eq!(boot_range_end(60 << 20, 61 << 20, 4 << 20), 61 << 20);
+    }
+
+    #[test]
+    fn urgent_streaming_suppresses_speculative_hints_but_not_nearby_hints() {
+        assert!(allow_hint(false, 30, 0, 0));
+        assert!(allow_hint(false, 30, MAX_HIGH_HINTS - 1, 0));
+        assert!(!allow_hint(false, 30, MAX_HIGH_HINTS, 0));
+        assert!(!allow_hint(true, 4, 0, 0));
+        assert!(!allow_hint(true, 0, 0, MAX_LOW_HINTS));
+        assert!(allow_hint(true, 0, 0, 0));
+    }
+
+    #[test]
+    fn recently_loaded_hints_are_coalesced_without_permanently_suppressing_retries() {
+        let now = std::time::Instant::now();
+        assert!(!hint_recently_satisfied(None, now));
+        assert!(hint_recently_satisfied(
+            Some(&(now - std::time::Duration::from_secs(2))),
+            now
+        ));
+        assert!(!hint_recently_satisfied(
+            Some(&(now - HINT_RECENT_TTL)),
+            now
+        ));
+    }
+
+    #[test]
+    fn cache_budget_keeps_free_disk_reserve_and_stays_bounded() {
+        assert_eq!(cache_budget_for_free_space(0), MIN_DISK_BUDGET);
+        assert_eq!(cache_budget_for_free_space(10 << 30), MIN_DISK_BUDGET);
+        assert_eq!(cache_budget_for_free_space(14 << 30), 4 << 30);
+        assert_eq!(cache_budget_for_free_space(80 << 30), DISK_BUDGET);
     }
 }
 
@@ -55,9 +421,39 @@ static FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 static DECODED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HINTS_QUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HINTS_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIVE_IO_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HINTS_HIGH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HINTS_LOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HINTS_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HINTS_DUPLICATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn metrics() -> Value {
     use std::sync::atomic::Ordering::Relaxed;
-    serde_json::json!({"hot_hits":HOT_HITS.load(Relaxed),"disk_hits":DISK_HITS.load(Relaxed),"transport_fetches":FETCHES.load(Relaxed),"decoded_asset_bytes":DECODED_BYTES.load(Relaxed),"hints_queued":HINTS_QUEUED.load(Relaxed),"hints_completed":HINTS_DONE.load(Relaxed)})
+    serde_json::json!({"hot_hits":HOT_HITS.load(Relaxed),"disk_hits":DISK_HITS.load(Relaxed),"transport_fetches":FETCHES.load(Relaxed),"decoded_asset_bytes":DECODED_BYTES.load(Relaxed),"hints_queued":HINTS_QUEUED.load(Relaxed),"hints_completed":HINTS_DONE.load(Relaxed),"hints_high":HINTS_HIGH.load(Relaxed),"hints_low":HINTS_LOW.load(Relaxed),"hints_deferred":HINTS_DEFERRED.load(Relaxed),"hints_duplicate":HINTS_DUPLICATE.load(Relaxed),"live_io_active":LIVE_IO_ACTIVE.load(Relaxed)})
+}
+
+struct LiveRead;
+impl LiveRead {
+    fn begin() -> Self {
+        LIVE_IO_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+impl Drop for LiveRead {
+    fn drop(&mut self) {
+        LIVE_IO_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+fn allow_hint(low: bool, active: usize, pending: usize, low_pending: usize) -> bool {
+    if low {
+        active == 0 && pending < MAX_HIGH_HINTS && low_pending < MAX_LOW_HINTS
+    } else {
+        pending < MAX_HIGH_HINTS
+    }
+}
+
+fn hint_recently_satisfied(since: Option<&std::time::Instant>, now: std::time::Instant) -> bool {
+    since.is_some_and(|last| now.saturating_duration_since(*last) < HINT_RECENT_TTL)
 }
 struct Hot {
     entries: HashMap<String, (Arc<Vec<u8>>, u64)>,
@@ -72,7 +468,8 @@ struct Assets {
     hot: Mutex<Hot>,
     locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     prefetching: Mutex<HashSet<String>>,
-    hinting: Mutex<HashSet<String>>,
+    hinting: Mutex<HashMap<String, bool>>,
+    recent_hints: Mutex<HashMap<String, std::time::Instant>>,
     hint_slots: tokio::sync::Semaphore,
     background: rayon::ThreadPool,
     network: tokio::sync::Semaphore,
@@ -117,6 +514,7 @@ pub fn prepare(support: &Path) -> Result<Option<PathBuf>> {
         allowed_origins: vec![
             "https://fiveplay.lol".into(),
             "https://cdn.fiveplay.lol".into(),
+            "https://v2.fiveplay.lol".into(),
         ],
         development_loopback: false,
     });
@@ -135,39 +533,33 @@ pub fn prepare(support: &Path) -> Result<Option<PathBuf>> {
     for directory in [&data_dir, &shader_dir] {
         std::fs::create_dir_all(directory)?;
     }
-    for (path, url) in [
-        (
-            data_dir.join("manifest.json"),
-            descriptor["assets"]["manifest"]
-                .as_str()
-                .context("Manifesto dos dados ausente")?
-                .to_string(),
-        ),
-        (
-            shader_dir.join("index.json"),
-            format!("{}index.json", shader_base),
-        ),
-        (
-            data_dir.join("bootset.json"),
-            format!("{}bootset.json", data_base),
-        ),
-    ] {
-        if !path.is_file() {
-            eprintln!("[native-assets] metadata {url}");
-            let reply = runtime.block_on(http.get(&url, 8 << 20))?;
-            ensure!(reply.status.is_success(), "Metadados HTTP {}", reply.status);
-            let _: Value = serde_json::from_slice(&reply.body)?;
-            let temporary = path.with_extension("partial");
-            std::fs::write(&temporary, &reply.body)?;
-            std::fs::rename(temporary, path)?;
-        }
-    }
-    let index: Value = serde_json::from_slice(&std::fs::read(shader_dir.join("index.json"))?)?;
+    let manifest_url = descriptor["assets"]["manifest"]
+        .as_str()
+        .context("Manifesto dos dados ausente")?;
+    http.policy.validate(manifest_url)?;
+    let manifest = refresh_data_metadata(
+        &runtime,
+        &http,
+        &data_dir,
+        "manifest.json",
+        manifest_url,
+        manifest_valid,
+    )?;
+    let bootset_url = format!("{data_base}bootset.json");
+    http.policy.validate(&bootset_url)?;
+    let bootset = refresh_data_metadata(
+        &runtime,
+        &http,
+        &data_dir,
+        "bootset.json",
+        &bootset_url,
+        bootset_valid,
+    )?;
+    let index = refresh_shader_index(&runtime, &http, &shader_dir, &shader_base)?;
     ensure!(
         index.is_object() && index.get("_packs").is_some(),
         "Índice de shaders inválido"
     );
-    let manifest: Value = serde_json::from_slice(&std::fs::read(data_dir.join("manifest.json"))?)?;
     let files = manifest["files"]
         .as_array()
         .context("Manifesto sem arquivos")?;
@@ -181,7 +573,10 @@ pub fn prepare(support: &Path) -> Result<Option<PathBuf>> {
     let assets = Arc::new(Assets {
         runtime,
         http,
-        cache: Mutex::new(DiskCache::open(cache_root.clone(), DISK_BUDGET)?),
+        cache: Mutex::new(DiskCache::open(
+            cache_root.clone(),
+            safe_cache_budget(support),
+        )?),
         cache_root,
         hot: Mutex::new(Hot {
             entries: HashMap::new(),
@@ -190,7 +585,8 @@ pub fn prepare(support: &Path) -> Result<Option<PathBuf>> {
         }),
         locks: Mutex::new(HashMap::new()),
         prefetching: Mutex::new(HashSet::new()),
-        hinting: Mutex::new(HashSet::new()),
+        hinting: Mutex::new(HashMap::new()),
+        recent_hints: Mutex::new(HashMap::new()),
         hint_slots: tokio::sync::Semaphore::new(4),
         background: rayon::ThreadPoolBuilder::new()
             .num_threads(8)
@@ -209,8 +605,22 @@ pub fn prepare(support: &Path) -> Result<Option<PathBuf>> {
         .set(assets.clone())
         .map_err(|_| anyhow::anyhow!("Assets nativos já inicializados"))?;
     assets.prewarm_gpu_shaders()?;
-    assets.prewarm_shaders(files)?;
-    assets.prewarm_boot(files, &data_dir.join("bootset.json"))?;
+    if assets
+        .data_base
+        .starts_with("https://v2.fiveplay.lol/data/")
+    {
+        // v2 has no reliable batch endpoint. Downloading thousands of game
+        // shaders via individual HTTP ranges BEFORE entering Wasmtime can
+        // stall launch for minutes. The native I/O lane serves these resources
+        // on demand and handles the game's prefetch-hint ring separately.
+        eprintln!(
+            "[native-assets] v2: shader and boot data stream on demand via bounded HTTP ranges"
+        );
+        assets.prewarm_archive_headers(files, &bootset);
+    } else {
+        assets.prewarm_shaders(files)?;
+        assets.prewarm_boot(files, &data_dir.join("bootset.json"))?;
+    }
     Ok(Some(wasm))
 }
 
@@ -225,19 +635,85 @@ pub fn configure_budget(support: &Path, wasm: &Path) -> Result<()> {
             overhead = overhead.saturating_add(entry.metadata()?.len());
         }
     }
-    let budget = DISK_BUDGET
+    let total_budget = safe_cache_budget(support);
+    let budget = total_budget
         .checked_sub(overhead)
         .filter(|n| *n >= 128 << 20)
-        .context("Código compilado excede o orçamento total de cache de 2 GiB")?;
+        .context("Código compilado excede o orçamento disponível de cache")?;
     *assets.cache.lock().unwrap() = DiskCache::open(assets.cache_root.clone(), budget)?;
     eprintln!(
-        "[native-assets] cache total <= 2 GiB; dados <= {} MiB; RAM de transporte <= 48 MiB",
+        "[native-assets] cache total <= {} GiB; dados <= {} MiB; RAM de transporte <= 48 MiB",
+        total_budget >> 30,
         budget >> 20
     );
     Ok(())
 }
 
 impl Assets {
+    fn prewarm_archive_headers(self: &Arc<Self>, files: &[Value], bootset: &Value) {
+        // GTA mounts thousands of archives by first reading just 16 bytes.
+        // Prefer bootset archives, which are actually requested during the
+        // initial load. Limit background I/O to two workers so it cannot
+        // saturate the 30 live streaming lanes with distant archive headers.
+        let boot_paths: HashSet<String> = bootset
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row[0].as_str().map(str::to_string))
+            .collect();
+        let mut archives: Vec<(String, u64)> = files
+            .iter()
+            .filter_map(|file| {
+                let path = file[0].as_str()?;
+                let size = file[1].as_u64()?;
+                (size > 0 && path.ends_with(".rpf")).then(|| (path.to_string(), size))
+            })
+            .collect();
+        archives.sort_by_key(|(path, _)| !boot_paths.contains(path));
+        archives.truncate(2048);
+        let count = archives.len();
+        let archives = Arc::new(archives);
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let skipped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for worker in 0..HEADER_PREFETCH_WORKERS {
+            let assets = Arc::clone(self);
+            let archives = Arc::clone(&archives);
+            let done = Arc::clone(&done);
+            let failures = Arc::clone(&failures);
+            let skipped = Arc::clone(&skipped);
+            let boot_paths = boot_paths.clone();
+            self.background.spawn(move || {
+                for (path, size) in archives.iter().skip(worker).step_by(HEADER_PREFETCH_WORKERS) {
+                    // An unrelated archive must not compete with urgent model
+                    // and texture requests when the engine is saturated.
+                    if !boot_paths.contains(path)
+                        && LIVE_IO_ACTIVE.load(std::sync::atomic::Ordering::Acquire) >= 16
+                    {
+                        skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    let url = format!("{}{path}?v={}", assets.data_base, assets.version);
+                    if assets.data_block(path, *size, 0, &url, false).is_err() {
+                        failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let ready = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if ready % 256 == 0 || ready == count {
+                        eprintln!("[native-assets] archive headers {ready}/{count}");
+                    }
+                }
+                if done.load(std::sync::atomic::Ordering::Relaxed) >= count {
+                    eprintln!(
+                        "[native-assets] RPF header prefetch: {count} candidates; {} deferred to live I/O; {} failed (retried on demand)",
+                        skipped.load(std::sync::atomic::Ordering::Relaxed),
+                        failures.load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                }
+            });
+        }
+    }
+
     fn prewarm_gpu_shaders(&self) -> Result<()> {
         use rayon::prelude::*;
         let packs = self.index["_packs"]
@@ -287,8 +763,14 @@ impl Assets {
                 .iter()
                 .any(|e| name.ends_with(e))
             {
-                let first = format!("{BUILD}:data:{name}:0:{size}");
-                let last = format!("{BUILD}:data:{name}:{}:{size}", (size - 1) / BLOCK * BLOCK);
+                let first = data_cache_key(&self.data_base, &self.version, &name, 0, size);
+                let last = data_cache_key(
+                    &self.data_base,
+                    &self.version,
+                    &name,
+                    (size - 1) / BLOCK * BLOCK,
+                    size,
+                );
                 if self.cached(&first)?.is_some() && self.cached(&last)?.is_some() {
                     continue;
                 }
@@ -347,7 +829,7 @@ impl Assets {
             let url=format!("{}{path}?v={}",self.data_base,self.version);
             let mut position=*start;
             while position<*end {
-                self.data_block(path, *size, position, &url)?;
+                self.data_block(path, *size, position, &url, true)?;
                 position=(position+BLOCK).min(*end);
             }
             let done=completed.fetch_add(1,std::sync::atomic::Ordering::Relaxed)+1;
@@ -372,8 +854,14 @@ impl Assets {
             if !path.starts_with("common/shaders/") || !path.ends_with(".fxc") {
                 continue;
             }
-            let first = format!("{BUILD}:data:{path}:0:{size}");
-            let last = format!("{BUILD}:data:{path}:{}:{size}", (size - 1) / BLOCK * BLOCK);
+            let first = data_cache_key(&self.data_base, &self.version, path, 0, size);
+            let last = data_cache_key(
+                &self.data_base,
+                &self.version,
+                path,
+                (size - 1) / BLOCK * BLOCK,
+                size,
+            );
             if self.cached(&first)?.is_some() && self.cached(&last)?.is_some() {
                 continue;
             }
@@ -400,6 +888,13 @@ impl Assets {
         Ok(())
     }
     fn fetch_batch(&self, files: &[(String, u64)]) -> Result<()> {
+        // The v2 origin's POST /data/batch endpoint currently times out or
+        // returns an undecodable body. The same origin serves byte ranges
+        // correctly (206 with an exact Content-Range). Use identity-encoded
+        // bounded range requests rather than blocking GTA startup.
+        if self.data_base.starts_with("https://v2.fiveplay.lol/data/") {
+            return self.fetch_files_by_range(files);
+        }
         let body = serde_json::to_vec(
             &files
                 .iter()
@@ -446,7 +941,13 @@ impl Assets {
                 .chunks(BLOCK as usize)
                 .enumerate()
             {
-                let key = format!("{BUILD}:data:{path}:{}:{size}", number as u64 * BLOCK);
+                let key = data_cache_key(
+                    &self.data_base,
+                    &self.version,
+                    path,
+                    number as u64 * BLOCK,
+                    *size,
+                );
                 cache.put(&key, chunk)?;
             }
             position += *size as usize;
@@ -457,6 +958,22 @@ impl Assets {
             files.len(),
             expected >> 10
         );
+        Ok(())
+    }
+
+    fn fetch_files_by_range(&self, files: &[(String, u64)]) -> Result<()> {
+        for (path, size) in files {
+            safe_relative(path)?;
+            if *size == 0 {
+                continue;
+            }
+            let url = format!("{}{path}?v={}", self.data_base, self.version);
+            let mut offset = 0;
+            while offset < *size {
+                self.data_block(path, *size, offset, &url, true)?;
+                offset = (offset + FETCH_WINDOW).min(*size);
+            }
+        }
         Ok(())
     }
     fn cached(&self, key: &str) -> Result<Option<Arc<Vec<u8>>>> {
@@ -476,12 +993,19 @@ impl Assets {
         }
         Ok(None)
     }
-    fn data_block(&self, path: &str, size: u64, start: u64, url: &str) -> Result<Arc<Vec<u8>>> {
-        let key = format!("{BUILD}:data:{path}:{start}:{size}");
+    fn data_block(
+        &self,
+        path: &str,
+        size: u64,
+        start: u64,
+        url: &str,
+        bulk: bool,
+    ) -> Result<Arc<Vec<u8>>> {
+        let key = data_cache_key(&self.data_base, &self.version, path, start, size);
         if let Some(data) = self.cached(&key)? {
             return Ok(data);
         }
-        let (window_start, finish) = fetch_window(start, size);
+        let (window_start, finish) = fetch_asset_window(path, start, size, bulk);
         let lock = {
             let mut locks = self.locks.lock().unwrap();
             if locks.len() > 1024 {
@@ -501,7 +1025,8 @@ impl Assets {
         }
         // One shared, bounded range per window prevents concurrent neighbouring
         // reads from fetching the same data repeatedly.
-        let whole = size <= 2 << 20
+        let whole = !self.data_base.starts_with("https://v2.fiveplay.lol/data/")
+            && size <= 2 << 20
             && [
                 ".fxc", ".xml", ".meta", ".json", ".ymt", ".csv", ".dat", ".gfx", ".txt", ".sps",
                 ".cfg",
@@ -528,7 +1053,7 @@ impl Assets {
         let cache = self.cache.lock().unwrap();
         for (number, chunk) in bytes.chunks(BLOCK as usize).enumerate() {
             let at = origin + number as u64 * BLOCK;
-            let block_key = format!("{BUILD}:data:{path}:{at}:{size}");
+            let block_key = data_cache_key(&self.data_base, &self.version, path, at, size);
             cache.put(&block_key, chunk)?;
             let data = Arc::new(chunk.to_vec());
             if at == start {
@@ -653,17 +1178,39 @@ pub fn shader_text(directory: &Path, hash: &str, constants: bool) -> Result<Stri
         .context("Shader local ausente e transporte remoto desativado")?;
     let record = assets.index.get(hash).context("Shader fora do índice")?;
     ensure!(record["ok"] == true, "Shader sem tradução disponível");
-    let pack = assets.pack(record)?;
-    let offset = record["p"][1].as_u64().context("Offset inválido")? as usize;
-    let wgsl = record["p"][2].as_u64().context("Comprimento inválido")? as usize;
-    let count = record["p"][3].as_u64().context("Constantes inválidas")? as usize;
-    let (start, length) = if constants {
-        (offset.checked_add(wgsl).context("Overflow de pack")?, count)
+    // The v2 index deliberately has valid shaders without a 'p' pack entry
+    // (e.g. SSAO::VS_screenTransformSSAO and ped HQ skin copy). The browser
+    // worker falls back to /shaders/<hash>.wgsl for those entries; the native
+    // runtime must not permanently skip the affected lighting draws.
+    if let Some((start, length)) = shader_pack_slice(record, constants) {
+        if let Ok(pack) = assets.pack(record) {
+            if let Some(end) = start.checked_add(length) {
+                if let Some(bytes) = pack.get(start..end) {
+                    if let Ok(source) = std::str::from_utf8(bytes) {
+                        return Ok(source.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let url = format!("{}{}", assets.shader_base, filename);
+    let bytes = assets.fetch(&format!("{BUILD}:shader:{url}"), &url, None)?;
+    Ok(std::str::from_utf8(&bytes)?.to_owned())
+}
+
+fn shader_pack_slice(record: &Value, constants: bool) -> Option<(usize, usize)> {
+    let p = record["p"].as_array()?;
+    if p.len() < 4 {
+        return None;
+    }
+    let offset = usize::try_from(p[1].as_u64()?).ok()?;
+    let wgsl = usize::try_from(p[2].as_u64()?).ok()?;
+    let count = usize::try_from(p[3].as_u64()?).ok()?;
+    if constants {
+        Some((offset.checked_add(wgsl)?, count))
     } else {
-        (offset, wgsl)
-    };
-    let end = start.checked_add(length).context("Overflow de pack")?;
-    Ok(std::str::from_utf8(pack.get(start..end).context("Pack truncado")?)?.to_string())
+        Some((offset, wgsl))
+    }
 }
 
 pub fn prefetch_shader(hash: &str) {
@@ -671,7 +1218,12 @@ pub fn prefetch_shader(hash: &str) {
     let Some(record) = assets.index.get(hash).filter(|r| r["ok"] == true).cloned() else {
         return;
     };
-    let key = record["p"][0].to_string();
+    let packed = record["p"][0].as_u64().is_some();
+    let key = if packed {
+        record["p"][0].to_string()
+    } else {
+        format!("individual:{hash}")
+    };
     {
         let mut pending = assets.prefetching.lock().unwrap();
         if pending.len() >= 8 || !pending.insert(key.clone()) {
@@ -679,8 +1231,18 @@ pub fn prefetch_shader(hash: &str) {
         }
     }
     let owned = assets.clone();
+    let hash = hash.to_owned();
     assets.background.spawn(move || {
-        let _ = owned.pack(&record);
+        if packed {
+            let _ = owned.pack(&record);
+        } else {
+            let url = format!("{}{hash}.wgsl", owned.shader_base);
+            let _ = owned.fetch(&format!("{BUILD}:shader:{url}"), &url, None);
+            if record["consts"] != Value::Null && record["consts"] != Value::Bool(false) {
+                let url = format!("{}{hash}.consts.json", owned.shader_base);
+                let _ = owned.fetch(&format!("{BUILD}:shader:{url}"), &url, None);
+            }
+        }
         owned.prefetching.lock().unwrap().remove(&key);
     });
 }
@@ -689,44 +1251,77 @@ pub fn prefetch_data(path: &str, size: u64, offset: u64, length: u64, low: bool)
     let Some(assets) = ASSETS.get() else {
         return;
     };
-    if length == 0
-        || offset >= size
-        || safe_relative(path).is_err()
-        || (low && assets.network.available_permits() < 8)
-    {
+    if length == 0 || offset >= size || safe_relative(path).is_err() {
         return;
     }
     let start = offset / BLOCK * BLOCK;
     let end = offset.saturating_add(length.min(1 << 20)).min(size);
-    let key = format!("{}:{path}:{start}", if low { "low" } else { "high" });
+    let end_block = end.saturating_add(BLOCK - 1) / BLOCK;
+    let key = format!("{path}:{start}:{end_block}");
     {
-        let mut pending = assets.hinting.lock().unwrap();
-        if pending.len() >= 64
-            || (low && pending.iter().filter(|key| key.starts_with("low:")).count() >= 2)
-            || !pending.insert(key.clone())
-        {
+        let now = std::time::Instant::now();
+        let mut recent = assets.recent_hints.lock().unwrap();
+        if recent.len() > 8192 {
+            recent.retain(|_, last| now.saturating_duration_since(*last) < HINT_RECENT_TTL);
+        }
+        if hint_recently_satisfied(recent.get(&key), now) {
+            HINTS_DUPLICATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
     }
+    {
+        let mut pending = assets.hinting.lock().unwrap();
+        if pending.contains_key(&key) {
+            HINTS_DUPLICATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let low_pending = pending.values().filter(|&&pending_low| pending_low).count();
+        let active = LIVE_IO_ACTIVE.load(std::sync::atomic::Ordering::Acquire);
+        if !allow_hint(low, active, pending.len(), low_pending)
+            || (low && assets.network.available_permits() < 8)
+        {
+            HINTS_DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        pending.insert(key.clone(), low);
+    }
     HINTS_QUEUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if low {
+        HINTS_LOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        HINTS_HIGH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let owned = assets.clone();
     let path = path.to_owned();
-    assets.background.spawn_fifo(move || {
+    let pending_key = key;
+    let job = move || {
         let result = (|| -> Result<()> {
             let _permit = owned.runtime.block_on(owned.hint_slots.acquire())?;
             let url = format!("{}{path}?v={}", owned.data_base, owned.version);
             let mut at = start;
             while at < end {
-                owned.data_block(&path, size, at, &url)?;
+                owned.data_block(&path, size, at, &url, length >= 256 << 10)?;
                 at += BLOCK;
             }
             Ok(())
         })();
         if result.is_ok() {
             HINTS_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            owned
+                .recent_hints
+                .lock()
+                .unwrap()
+                .insert(pending_key.clone(), std::time::Instant::now());
         }
-        owned.hinting.lock().unwrap().remove(&key);
-    });
+        owned.hinting.lock().unwrap().remove(&pending_key);
+    };
+    if low {
+        assets.background.spawn_fifo(job);
+    } else {
+        // Urgent hints are admitted even when live I/O is saturated; low
+        // priority speculative requests have a separate strict admission cap.
+        assets.background.spawn(job);
+    }
 }
 
 pub fn read_data(path: &str, size: u64, offset: u64, length: u64) -> Result<Vec<u8>> {
@@ -736,6 +1331,7 @@ pub fn read_data(path: &str, size: u64, offset: u64, length: u64) -> Result<Vec<
         "Intervalo de leitura inválido"
     );
     let assets = ASSETS.get().context("Transporte remoto desativado")?;
+    let _live = LiveRead::begin();
     let url = format!("{}{path}?v={}", assets.data_base, assets.version);
     let end = offset + length;
     let mut position = offset;
@@ -743,7 +1339,7 @@ pub fn read_data(path: &str, size: u64, offset: u64, length: u64) -> Result<Vec<
     while position < end {
         let start = position / BLOCK * BLOCK;
         let finish = (start + BLOCK).min(size);
-        let data = assets.data_block(path, size, start, &url)?;
+        let data = assets.data_block(path, size, start, &url, length >= 256 << 10)?;
         ensure!(
             data.len() as u64 == finish - start,
             "Bloco de dados truncado"

@@ -17,6 +17,9 @@ static MOUSE_Y_UNITS: AtomicU64 = AtomicU64::new(0);
 static MOUSE_RAW_X_EVENTS: AtomicU64 = AtomicU64::new(0);
 static MOUSE_RAW_Y_EVENTS: AtomicU64 = AtomicU64::new(0);
 static MOUSE_ABS_EVENTS: AtomicU64 = AtomicU64::new(0);
+// Experimental, per-frame horizontal look bridge for the GTA control layer.
+// It does not consume or replace the standard dX word in shared WASM memory.
+static CONTROL_LOOK_X: AtomicI32 = AtomicI32::new(0);
 
 const MX: u64 = 0;
 const MY: u64 = 1;
@@ -100,6 +103,7 @@ pub fn set_focus(focused: bool) {
     }
     if !focused {
         release_all();
+        CONTROL_LOOK_X.store(0, Ordering::Relaxed);
     }
 }
 pub fn set_locked(locked: bool) {
@@ -367,7 +371,43 @@ pub fn mouse_delta_f(dx: f64, dy: f64) {
         (ix as i32, iy as i32)
     };
     if ix != 0 || iy != 0 {
+        CONTROL_LOOK_X.fetch_add(ix, Ordering::Relaxed);
         mouse_delta(ix, iy);
+    }
+}
+
+pub fn take_control_look_x() -> i32 {
+    CONTROL_LOOK_X.swap(0, Ordering::Relaxed)
+}
+
+/// The GTA-native control contract accepts a signed analog look axis, not
+/// mouse pixels. Keep this conversion independent of the Wasm dX word.
+pub fn control_look_lr(dx: i32) -> f32 {
+    let divisor = std::env::var("WGR_MOUSE_LOOK_DIVISOR")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && (4.0..=120.0).contains(v))
+        .unwrap_or(12.0);
+    (dx as f32 / divisor).clamp(-1.0, 1.0)
+}
+
+#[cfg(test)]
+mod mouse_bridge_tests {
+    #[test]
+    fn control_bridge_observes_horizontal_motion_without_consuming_wasm_dx() {
+        let _ = super::take_control_look_x();
+        super::mouse_delta_f(24.0, 0.0);
+        assert!(super::take_control_look_x() >= 24);
+        assert_eq!(super::take_control_look_x(), 0);
+    }
+
+    #[test]
+    fn native_look_axis_is_signed_and_bounded_for_both_directions() {
+        assert_eq!(super::control_look_lr(0), 0.0);
+        assert!(super::control_look_lr(6) > 0.0);
+        assert!(super::control_look_lr(-6) < 0.0);
+        assert_eq!(super::control_look_lr(10000), 1.0);
+        assert_eq!(super::control_look_lr(-10000), -1.0);
     }
 }
 
@@ -404,5 +444,19 @@ pub fn inject(dx: i32, dy: i32) {
 
 // Aggregate diagnostics only: no typed text or key identities are recorded.
 pub fn snapshot() -> serde_json::Value {
-    serde_json::json!({"ready":base().is_some(),"focused":crate::pad::FOCUSED.load(Ordering::Relaxed),"captured":CAPTURED.load(Ordering::Relaxed),"held_count":HELD.lock().unwrap().len(),"key_events":KEY_EVENTS.load(Ordering::Relaxed),"relative_mouse_events":MOUSE_EVENTS.load(Ordering::Relaxed),"relative_x_units":MOUSE_X_UNITS.load(Ordering::Relaxed),"relative_y_units":MOUSE_Y_UNITS.load(Ordering::Relaxed),"raw_x_events":MOUSE_RAW_X_EVENTS.load(Ordering::Relaxed),"raw_y_events":MOUSE_RAW_Y_EVENTS.load(Ordering::Relaxed),"absolute_events":MOUSE_ABS_EVENTS.load(Ordering::Relaxed)})
+    serde_json::json!({
+        "ready": base().is_some(),
+        "focused": crate::pad::FOCUSED.load(Ordering::Relaxed),
+        "captured": CAPTURED.load(Ordering::Relaxed),
+        "held_count": HELD.lock().unwrap().len(),
+        "key_events": KEY_EVENTS.load(Ordering::Relaxed),
+        "relative_mouse_events": MOUSE_EVENTS.load(Ordering::Relaxed),
+        "relative_x_units": MOUSE_X_UNITS.load(Ordering::Relaxed),
+        "relative_y_units": MOUSE_Y_UNITS.load(Ordering::Relaxed),
+        "raw_x_events": MOUSE_RAW_X_EVENTS.load(Ordering::Relaxed),
+        "raw_y_events": MOUSE_RAW_Y_EVENTS.load(Ordering::Relaxed),
+        "absolute_events": MOUSE_ABS_EVENTS.load(Ordering::Relaxed),
+        "pending_dx": word(DX).map(|v| v.load(Ordering::SeqCst)),
+        "pending_dy": word(DY).map(|v| v.load(Ordering::SeqCst)),
+    })
 }

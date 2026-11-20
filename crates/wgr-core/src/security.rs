@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     net::{IpAddr, SocketAddr},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -116,32 +116,37 @@ fn public_ip_v4(ip: std::net::Ipv4Addr) -> bool {
 
 pub fn safe_relative(input: &str) -> Result<PathBuf> {
     ensure!(
-        !input.contains(['\\', ':', '\0']) && input.len() <= 2048,
-        "Cheminho de recurso inválido"
+        !input.is_empty()
+            && input.len() <= 2048
+            && !input.contains(['\\', ':', '<', '>', '"', '|', '?', '*'])
+            && !input.chars().any(char::is_control),
+        "Caminho de recurso inválido"
     );
     let path = Path::new(input);
     ensure!(!path.is_absolute(), "Caminho absoluto proibido");
-    for component in path.components() {
+    // Components normaliza aliases como a/./b e a//b antes de validá-los.
+    for name in input.split('/') {
         ensure!(
-            matches!(component, Component::Normal(_)),
+            !name.is_empty() && name != "." && name != "..",
             "Traversal de diretório proibido"
         );
-        if let Component::Normal(part) = component {
-            let name = part.to_string_lossy();
-            ensure!(!name.ends_with(['.', ' ']), "Nome Windows ambíguo");
-            let base = name.split('.').next().unwrap_or("").to_ascii_uppercase();
-            ensure!(
-                ![
-                    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
-                    "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
-                    "LPT8", "LPT9"
-                ]
-                .contains(&base.as_str()),
-                "Nome de dispositivo Windows proibido"
-            );
-        }
+        ensure!(!name.ends_with(['.', ' ']), "Nome Windows ambíguo");
+        let base = name
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        ensure!(
+            ![
+                "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4",
+                "COM5", "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2",
+                "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³"
+            ]
+            .contains(&base.as_str()),
+            "Nome de dispositivo Windows proibido"
+        );
     }
-    ensure!(!path.as_os_str().is_empty(), "Caminho vazio");
     Ok(path.to_path_buf())
 }
 pub fn rooted_file(root: &Path, relative: &str) -> Result<PathBuf> {
@@ -483,8 +488,24 @@ mod tests {
             "CON",
             "folder./x",
             "a/NUL.txt",
+            "a/./b",
+            "a//b",
+            "a/",
+            "a\u{1f}b",
+            "a?b",
+            "CON .txt",
+            "COM¹.txt",
+            "LPT².log",
         ] {
             assert!(safe_relative(path).is_err(), "{path}");
+        }
+        for path in [
+            "data/arquivo.bin",
+            ".hidden",
+            "COM10.txt",
+            "ação/Meu arquivo.txt",
+        ] {
+            assert!(safe_relative(path).is_ok(), "{path}");
         }
         let mixed = [
             "8.8.8.8:443".parse().expect("ip"),

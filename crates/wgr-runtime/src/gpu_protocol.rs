@@ -86,7 +86,9 @@ impl Ring {
     /// Advance only after the backend has consumed the referenced data.
     pub fn acknowledge(&mut self, command: Command) -> Result<()> {
         self.tail = command.next;
-        self.memory.add_u32(self.base + 12, 1)?;
+        if command.opcode != 1 {
+            self.memory.add_u32(self.base + 12, 1)?;
+        }
         self.memory.store_u32(self.base + 4, self.tail)?;
         self.memory.notify(self.base + 4)
     }

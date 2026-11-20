@@ -86,6 +86,7 @@ enum Action {
     FavoriteSource(Uuid),
     Settings,
     Diagnostics,
+    NativeCheck,
     ClearCache,
     CacheLimit,
     ToggleFullscreen,
@@ -106,6 +107,7 @@ enum Message {
     Preview(Result<Box<Preview>>),
     Launch(Result<Box<Launch>>),
     Report(Result<String>),
+    NativeCheck(Result<serde_json::Value>),
     Cover(Uuid, Result<Option<String>>),
 }
 #[derive(PartialEq)]
@@ -173,6 +175,7 @@ pub struct Shell {
     network: bool,
     auth: u8,
     diagnostic: serde_json::Value,
+    native_check: serde_json::Value,
     subscriptions: Vec<Subscription>,
     smoke: Option<PathBuf>,
     gta_smoke: bool,
@@ -265,6 +268,7 @@ impl Shell {
             network: false,
             auth: 0,
             diagnostic: serde_json::json!({}),
+            native_check: serde_json::json!({}),
             subscriptions: vec![],
             smoke,
             gta_smoke,
@@ -353,6 +357,10 @@ impl Shell {
         self.filter = self.settings.filter.clone();
         self.diagnostic = db
             .value("last_diagnostic")?
+            .unwrap_or_else(|| serde_json::json!({}));
+        self.native_check = std::fs::read(self.services.paths.root.join("native-check.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_else(|| serde_json::json!({}));
         Ok(())
     }
@@ -449,6 +457,15 @@ impl Shell {
                     }
                 }
                 Message::Report(result) => self.message(result),
+                Message::NativeCheck(result) => match result {
+                    Ok(report) => {
+                        self.native_check = report;
+                        self.message(Ok(
+                            "GPU nativa validada: quadro renderizado e lido em Rust.".into(),
+                        ));
+                    }
+                    Err(error) => self.message(Err(error)),
+                },
                 Message::Cover(id, result) => {
                     self.covers_loading = self.covers_loading.saturating_sub(1);
                     match result {
@@ -1414,6 +1431,22 @@ impl Shell {
             ),
             Action::Settings => self.view = View::Settings,
             Action::Diagnostics => self.view = View::Diagnostics,
+            Action::NativeCheck => {
+                let path = self.services.paths.root.join("native-check.json");
+                self.job(
+                    async move {
+                        let result = async {
+                            let report = crate::native_check::run().await?;
+                            std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
+                            Ok::<_, anyhow::Error>(report)
+                        }
+                        .await;
+                        Message::NativeCheck(result)
+                    },
+                    window,
+                    cx,
+                );
+            }
             Action::ClearCache => self.job(
                 async move {
                     let result = tokio::task::spawn_blocking(move || {
@@ -1461,7 +1494,10 @@ impl Shell {
                 }
             }
             Action::Export => {
-                let report = self.diagnostic.clone();
+                let mut report = self.diagnostic.clone();
+                if let Some(fields) = report.as_object_mut() {
+                    fields.insert("native_gpu".into(), self.native_check.clone());
+                }
                 let paths = self.services.paths.clone();
                 self.job(
                     async move {
@@ -2045,9 +2081,9 @@ impl Shell {
             .child(self.row("Armazenamento",&self.services.paths.root.to_string_lossy()))
             .child(self.button("fullscreen-setting",format!("Iniciar em tela cheia: {}",if self.settings.fullscreen{"sim"}else{"não"}),Action::ToggleFullscreen,cx))
             .child(self.button("cache-limit",format!("Limite do cache: {} MiB · clicar para alterar",self.settings.cache_limit_mib),Action::CacheLimit,cx))
-            .child(div().text_sm().text_color(rgb(MUTED)).child("O limite do cache Rust é aplicado ao iniciar. Perfis WebView2 e saves ocupam armazenamento separado."))
+            .child(div().text_sm().text_color(rgb(MUTED)).child("O limite do cache Rust é aplicado ao iniciar. Saves e perfis nativos ocupam armazenamento separado."))
             .child(div().flex().gap_2().child(self.button("clear-cache","Limpar cache Rust",Action::ClearCache,cx)).child(self.button("reveal","Abrir pasta de dados",Action::Reveal,cx)))
-            .child(self.row("GPU e qualidade","Usamos o adaptador escolhido pelo WebView2. Qualidade e FPS são controlados pelo jogo quando ele oferece essas opções."))
+            .child(self.row("GPU e qualidade","O player nativo usa wgpu (DirectX 12/Vulkan conforme o adaptador e driver). Teste sua GPU em Diagnóstico. Qualidade e FPS dependem do port."))
             .child(self.row("Atalhos","Ctrl+K buscar · Ctrl+N adicionar · Ctrl+Shift+B voltar do player · F11 tela cheia · Tab/Shift+Tab navegar"))
             .into_any_element()
     }
@@ -2080,8 +2116,12 @@ impl Shell {
             self.row(key, &status)
         });
         div().id("diagnostics-scroll").overflow_y_scroll().p_6().flex().flex_col().gap_3().size_full().child(div().text_2xl().child("Diagnóstico real do runtime"))
-            .child(div().text_sm().text_color(rgb(MUTED)).child("Os testes rodam no contexto da sessão. Abra Órbita para coletar o primeiro diagnóstico; recursos indisponíveis não são simulados."))
-            .child(self.row("WebView2",self.diagnostic["runtime"].as_str().unwrap_or("Não testado"))).children(rows)
+            .child(div().text_sm().text_color(rgb(MUTED)).child("Abra Órbita para testar o binário Wasm. O teste GPU abaixo executa diretamente em Rust, sem WebView2, Chromium ou Servo. APIs web e GPU nativa são verificações diferentes."))
+            .child(self.row("Runtime de jogo",self.diagnostic["runtime"].as_str().unwrap_or("Não testado"))).children(rows)
+            .child(self.row("GPU física (wgpu)",self.native_check["gpu"]["adapter_name"].as_str().unwrap_or("Não testada")))
+            .child(self.row("Backend GPU",self.native_check["gpu"]["adapter_backend"].as_str().unwrap_or("Não testado")))
+            .child(self.row("Quadro GPU nativo",if self.native_check["gpu"]["rendered_and_read_back"] == true{"Renderizado e lido (1x1)"}else{"Não testado"}))
+            .child(self.button("native-check","Testar GPU nativa (Rust / wgpu)",Action::NativeCheck,cx))
             .child(self.row("Primeiro frame",&self.diagnostic.get("first_frame_ms").filter(|v|!v.is_null()).map(|v|format!("{v} ms · reportado pelo jogo")).unwrap_or_else(||"Não informado".into())))
             .child(self.row("FPS",&self.diagnostic.get("fps").filter(|v|!v.is_null()).map(|v|format!("{v} · reportado pela fixture")).unwrap_or_else(||"Não informado".into())))
             .child(self.button("export-diagnostic","Exportar relatório JSON",Action::Export,cx)).into_any_element()

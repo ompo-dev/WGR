@@ -77,6 +77,18 @@ impl GuestMemory {
         self.word(address)?.store(value.to_le(), Ordering::Release);
         Ok(())
     }
+    /// Reivindica um slot sem disputar sua execução com outro consumidor.
+    pub fn compare_exchange_u32(&self, address: u64, current: u32, new: u32) -> Result<bool> {
+        Ok(self
+            .word(address)?
+            .compare_exchange(
+                current.to_le(),
+                new.to_le(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok())
+    }
     pub fn add_u32(&self, address: u64, value: u32) -> Result<()> {
         let _ = self
             .word(address)?
@@ -154,6 +166,10 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(memory.load_u32(0).unwrap(), 4000);
+        assert!(memory.compare_exchange_u32(0, 4000, 7).unwrap());
+        assert!(!memory.compare_exchange_u32(0, 4000, 8).unwrap());
+        memory.store_u32(0, 4000).unwrap();
+        assert!(memory.compare_exchange_u32(1, 0, 1).is_err());
         assert!(memory.store_u32(1, 7).is_err());
         assert!(memory.read(65535, 2).is_err());
         memory.write(24, &[3, 4, 5]).unwrap();

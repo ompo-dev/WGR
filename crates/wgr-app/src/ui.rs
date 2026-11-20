@@ -6,8 +6,9 @@ use crate::{
 use anyhow::{Context as _, Result, ensure};
 use gpui::{prelude::*, *};
 use momor_ui::{
-    Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Color as MomorColor, Label,
-    LabelCommon, TintColor, Toggleable, Tooltip,
+    Button, ButtonCommon, ButtonSize, ButtonStyle, Chip, Clickable, Color as MomorColor, Headline,
+    HeadlineSize, Icon, IconName, IconSize, Indicator, Label, LabelCommon, SelectableButton,
+    TintColor, Toggleable, Tooltip,
 };
 use raw_window_handle::HasWindowHandle;
 use std::{
@@ -15,6 +16,7 @@ use std::{
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
+use theme::ActiveTheme;
 use uuid::Uuid;
 use wgr_core::{
     credentials::{CredentialStore, Secret, WindowsVault},
@@ -22,40 +24,6 @@ use wgr_core::{
     security::{NetworkPolicy, rooted_file, validate_url},
     storage::Library,
 };
-
-mod theme {
-    pub const BG: u32 = 0x3b414d;
-    pub const SIDE: u32 = 0x2f343e;
-    pub const PANEL: u32 = 0x2e343e;
-    pub const BORDER: u32 = 0x464b57;
-    pub const TEXT: u32 = 0xdce0e5;
-    pub const MUTED: u32 = 0xa9afbc;
-    pub const ACCENT: u32 = 0x74ade8;
-    pub const DANGER: u32 = 0xf48771;
-    pub const HOVER: u32 = 0x363c46;
-}
-use theme::*;
-
-trait ButtonAppearance: Sized {
-    fn border_0(self) -> Self;
-    fn border_color(self, color: gpui::Rgba) -> Self;
-    fn text_color(self, color: gpui::Rgba) -> Self;
-    fn bg(self, color: gpui::Rgba) -> Self;
-}
-impl ButtonAppearance for Button {
-    fn border_0(self) -> Self {
-        self.style(ButtonStyle::Subtle)
-    }
-    fn border_color(self, color: gpui::Rgba) -> Self {
-        self.style(ButtonStyle::OutlinedCustom(color.into()))
-    }
-    fn text_color(self, color: gpui::Rgba) -> Self {
-        self.color(MomorColor::Custom(color.into()))
-    }
-    fn bg(self, _color: gpui::Rgba) -> Self {
-        self.style(ButtonStyle::Filled)
-    }
-}
 
 #[derive(Clone)]
 enum Action {
@@ -1628,7 +1596,25 @@ impl Shell {
     fn primary(&self, id: &str, label: &str, action: Action, cx: &mut Context<Self>) -> Button {
         self.button(id.to_string(), label.to_string(), action, cx)
             .style(ButtonStyle::Tinted(TintColor::Accent))
-            .color(MomorColor::Custom(rgb(0x142536).into()))
+    }
+    fn navigation_item(
+        &self,
+        id: &str,
+        title: &str,
+        icon: IconName,
+        selected: bool,
+        action: Action,
+        cx: &mut Context<Self>,
+    ) -> momor_ui::ListItem {
+        let view = cx.entity();
+        momor_ui::ListItem::new(ElementId::Name(id.to_owned().into()))
+            .rounded()
+            .toggle_state(selected)
+            .start_slot(Icon::new(icon).size(IconSize::Small))
+            .child(Label::new(title.to_owned()))
+            .on_click(move |_, window, cx| {
+                view.update(cx, |this, cx| this.act(action.clone(), window, cx));
+            })
     }
     fn field(&self, label: &str, entity: &Entity<TextInput>) -> Div {
         div()
@@ -1636,12 +1622,7 @@ impl Shell {
             .flex_col()
             .gap_1()
             .w_full()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(Label::new(label.to_string()).color(MomorColor::Muted)),
-            )
+            .child(Label::new(label.to_string()).color(MomorColor::Muted))
             .child(
                 div()
                     .w_full()
@@ -1715,64 +1696,78 @@ impl Shell {
         let id = game.id;
         let source = self.sources.iter().find(|s| s.id == game.source_id);
         let local = game.local_bundle_path.is_some();
-        let art =
-            if let Some(cover) = game
-                .cover_uri
-                .as_ref()
-                .filter(|p| PathBuf::from(p).is_file())
-            {
-                img(PathBuf::from(cover))
-                    .size_full()
-                    .object_fit(ObjectFit::Cover)
-                    .into_any_element()
-            } else {
-                div()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .justify_between()
-                    .p_4()
-                    .bg(rgb(if local { 0x23362f } else { 0x252d3b }))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(if local {
-                        "PACOTE LOCAL"
+        let art = if let Some(cover) = game
+            .cover_uri
+            .as_ref()
+            .filter(|p| PathBuf::from(p).is_file())
+        {
+            img(PathBuf::from(cover))
+                .size_full()
+                .object_fit(ObjectFit::Cover)
+                .into_any_element()
+        } else {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .items_center()
+                .gap_3()
+                .bg(if local {
+                    cx.theme().colors().element_selected
+                } else {
+                    cx.theme().colors().element_background
+                })
+                .child(
+                    Icon::new(if local {
+                        IconName::Box
                     } else {
-                        "FONTE EXTERNA"
-                    }))
-                    .child(
-                        div()
-                            .text_3xl()
-                            .text_color(rgb(if local { ACCENT } else { 0x9fb5dc }))
-                            .child(if game.external_id.as_deref() == Some("wgr-orbit") {
-                                "◌  ÓRBITA"
-                            } else {
-                                "WGR"
-                            }),
-                    )
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(
-                        if game.cover_uri.is_none() {
-                            "Sem capa fornecida pela fonte"
-                        } else {
-                            "Capa remota · não armazenada"
-                        },
-                    ))
-                    .into_any_element()
-            };
+                        IconName::CloudDownload
+                    })
+                    .size(IconSize::XLarge)
+                    .color(MomorColor::Muted),
+                )
+                .child(
+                    Label::new(if local {
+                        "Pacote local"
+                    } else {
+                        "Fonte externa"
+                    })
+                    .color(MomorColor::Muted),
+                )
+                .into_any_element()
+        };
         div()
             .flex_1()
             .min_w_0()
-            .h(px(300.))
-            .rounded_lg()
+            .h(px(332.))
+            .rounded_xl()
             .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(PANEL))
+            .border_color(cx.theme().colors().border_variant)
+            .bg(cx.theme().colors().surface_background)
             .overflow_hidden()
-            .child(div().h(px(138.)).w_full().child(art))
+            .child(
+                div()
+                    .relative()
+                    .h(px(170.))
+                    .w_full()
+                    .overflow_hidden()
+                    .child(art)
+                    .child(div().absolute().left_3().top_3().child(
+                        Chip::new(if local { "Instalado" } else { "Online" }).icon(if local {
+                            IconName::Box
+                        } else {
+                            IconName::CloudDownload
+                        }),
+                    )),
+            )
             .child(
                 div()
                     .p_4()
                     .flex()
                     .flex_col()
                     .gap_2()
+                    .min_h_0()
                     .child(
                         div()
                             .text_base()
@@ -1781,40 +1776,57 @@ impl Shell {
                             .child(game.title.clone()),
                     )
                     .child(
-                        div().text_xs().text_color(rgb(MUTED)).truncate().child(
-                            source
-                                .map(|s| s.display_name.clone())
-                                .unwrap_or_else(|| "Fonte ausente".into()),
-                        ),
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().colors().text_muted)
+                            .truncate()
+                            .child(
+                                source
+                                    .map(|s| s.display_name.clone())
+                                    .unwrap_or_else(|| "Fonte ausente".into()),
+                            ),
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(if game.compat_status.starts_with("Pronto") {
-                                ACCENT
-                            } else {
-                                MUTED
-                            }))
-                            .truncate()
-                            .child(game.compat_status.clone()),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Indicator::dot().color(
+                                if game.compat_status.starts_with("Pronto") {
+                                    MomorColor::Success
+                                } else {
+                                    MomorColor::Muted
+                                },
+                            ))
+                            .child(Label::new(game.compat_status.clone()).color(MomorColor::Muted)),
                     )
                     .child(
                         div()
                             .flex()
                             .gap_2()
                             .mt_2()
-                            .child(self.primary(
-                                &format!("play-{id}"),
-                                "Jogar",
-                                Action::Play(id),
-                                cx,
-                            ))
-                            .child(self.button(
-                                format!("favorite-{id}"),
-                                if game.favorite { "★" } else { "☆" },
-                                Action::Favorite(id),
-                                cx,
-                            ))
+                            .child(
+                                self.primary(&format!("play-{id}"), "Jogar", Action::Play(id), cx)
+                                    .start_icon(Icon::new(IconName::PlayFilled)),
+                            )
+                            .child(
+                                momor_ui::IconButton::new(
+                                    ElementId::Name(format!("favorite-{id}").into()),
+                                    if game.favorite {
+                                        IconName::StarFilled
+                                    } else {
+                                        IconName::Star
+                                    },
+                                )
+                                .style(ButtonStyle::Subtle)
+                                .size(ButtonSize::Medium)
+                                .tooltip(Tooltip::text("Favorito"))
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.act(Action::Favorite(id), window, cx)
+                                    },
+                                )),
+                            )
                             .child(self.button(
                                 format!("details-{id}"),
                                 "Detalhes",
@@ -1846,10 +1858,13 @@ impl Shell {
         });
         let sort_menu = momor_ui::DropdownMenu::new("sort-menu", "Ordenar", menu);
         let games = self.filtered();
-        let columns = if f32::from(window.viewport_size().width) > 1120. {
+        let width = f32::from(window.viewport_size().width);
+        let columns = if width >= 1330. {
             3
-        } else {
+        } else if width >= 850. {
             2
+        } else {
+            1
         };
         let rows = games.len().div_ceil(columns);
         let entity = cx.entity();
@@ -1879,9 +1894,9 @@ impl Shell {
         div()
             .flex()
             .flex_col()
-            .gap_5()
+            .gap_4()
             .size_full()
-            .p_6()
+            .p_5()
             .child(
                 div()
                     .flex()
@@ -1892,27 +1907,32 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .gap_1()
+                            .child(Headline::new("Biblioteca de jogos").size(HeadlineSize::Large))
                             .child(
                                 div()
-                                    .text_2xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Meus jogos"),
-                            )
-                            .child(div().text_sm().text_color(rgb(MUTED)).child(format!(
-                                "{} jogos · sua biblioteca privada, neste computador",
-                                games.len()
-                            ))),
+                                    .text_sm()
+                                    .text_color(cx.theme().colors().text_muted)
+                                    .child(format!(
+                                        "{} jogos · todos os seus jogos em um só lugar",
+                                        games.len()
+                                    )),
+                            ),
                     )
-                    .child(self.primary("add-game", "+ Adicionar jogo", Action::Add, cx)),
+                    .child(
+                        self.primary("add-game", "Adicionar jogo", Action::Add, cx)
+                            .start_icon(Icon::new(IconName::Plus)),
+                    ),
             )
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
+                    .gap_3()
                     .justify_between()
                     .items_center()
                     .child(
                         div().flex().gap_2().children(
-                            ["Todos", "Favoritos", "Instalados", "Online"]
+                            ["Todos", "Recentes", "Favoritos", "Instalados", "Online"]
                                 .into_iter()
                                 .map(|filter| {
                                     self.button(
@@ -1921,9 +1941,9 @@ impl Shell {
                                         Action::Filter(filter.into()),
                                         cx,
                                     )
-                                    .when(self.filter == filter, |b| {
-                                        b.border_color(rgb(ACCENT)).text_color(rgb(ACCENT))
-                                    })
+                                    .style(ButtonStyle::Subtle)
+                                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                                    .toggle_state(self.filter == filter)
                                 }),
                         ),
                     )
@@ -1937,10 +1957,30 @@ impl Shell {
                         .flex_col()
                         .justify_center()
                         .items_center()
-                        .gap_3()
-                        .text_color(rgb(MUTED))
-                        .child("Sua próxima sessão começa aqui.")
-                        .child("Adicione um link, uma API de biblioteca ou um pacote local."),
+                        .gap_4()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .bg(cx.theme().colors().surface_background)
+                        .child(
+                            Icon::new(IconName::Library)
+                                .size(IconSize::XLarge)
+                                .color(MomorColor::Muted),
+                        )
+                        .child(Headline::new("Sua biblioteca começa aqui"))
+                        .child(
+                            Label::new("Adicione um site, catálogo ou pacote local para começar.")
+                                .color(MomorColor::Muted),
+                        )
+                        .child(
+                            self.primary(
+                                "library-empty-add",
+                                "Adicionar primeiro jogo",
+                                Action::Add,
+                                cx,
+                            )
+                            .start_icon(Icon::new(IconName::Plus)),
+                        ),
                 )
             })
             .when(!games.is_empty(), |d| d.child(list))
@@ -1951,33 +1991,229 @@ impl Shell {
             return div().child("Jogo removido").into_any_element();
         };
         let source = self.sources.iter().find(|s| s.id == game.source_id);
-        div().id("detail-scroll").overflow_y_scroll().flex().flex_col().gap_5().p_6().size_full().child(self.button("detail-back","← Biblioteca",Action::Back,cx))
-            .child(div().rounded_lg().bg(rgb(PANEL)).border_1().border_color(rgb(BORDER)).p_6().flex().flex_col().gap_4().child(div().text_xs().text_color(rgb(ACCENT)).child("BIBLIOTECA / DETALHES"))
-                .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child(game.title.clone())).child(div().text_color(rgb(MUTED)).child(if game.description.is_empty(){"Descrição não informada".into()}else{game.description.clone()}))
-                .child(div().flex().gap_2().flex_wrap().child(self.primary("detail-play","Jogar",Action::Play(id),cx)).child(self.button("edit-game","Editar",Action::Edit(id),cx)).child(self.button("verify-game","Verificar arquivos",Action::Verify(id),cx)).child(self.button("star-game",if game.favorite{"★ Favorito"}else{"☆ Favoritar"},Action::Favorite(id),cx))))
-            .child(self.row("Disponibilidade",&game.compat_status)).child(self.row("Tipo",source.map(|s|s.kind.label()).unwrap_or("Não informado"))).child(self.row("Entrada",&game.entry_uri))
-            .child(self.row("Origem",source.map(|s|s.location.as_str()).unwrap_or("Não informado"))).child(self.row("Versão",game.version.as_deref().unwrap_or("Não informado")))
-            .child(self.row("Sessões",&game.play_count.to_string())).child(self.row("Saves","Perfil WebView2 separado por jogo. IndexedDB/localStorage mantêm a origem estável."))
-            .when(game.external_id.as_deref()==Some("gta-legacy")&&game.entry_uri.starts_with("https://fiveplay.lol/"),|d|d
-                .child(self.row("Qualidade",if game.entry_uri.contains("wgr_quality=economy"){"Economia: reduz texturas e distância de detalhe"}else{"Equilibrado: texturas e distância de detalhe intermediárias"}))
-                .child(div().flex().gap_2().child(self.button("gta-balanced","Equilibrado",Action::GtaGraphics(id,"balanced"),cx)).child(self.button("gta-economy","Economia de memória",Action::GtaGraphics(id,"economy"),cx))))
-            .child(self.row("Requisitos",&format!("WebGPU: {} · memory64: {} · memória compartilhada: {}",game.requirements.webgpu,game.requirements.wasm_memory64,game.requirements.shared_array_buffer)))
-            .child(div().flex().gap_2().flex_wrap().when_some(source,|d,s|d.child(self.button("edit-source","Configurar fonte / arquivos",Action::EditSource(s.id),cx))).child(self.button("move-up","↑ Mover",Action::Reorder(id,-1),cx)).child(self.button("move-down","↓ Mover",Action::Reorder(id,1),cx)).child(self.button("remove-game","Remover registro",Action::Remove(id),cx).text_color(rgb(DANGER))))
+        div()
+            .id("detail-scroll")
+            .overflow_y_scroll()
+            .size_full()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                self.button("detail-back", "Biblioteca", Action::Back, cx)
+                    .style(ButtonStyle::Subtle)
+                    .start_icon(Icon::new(IconName::ArrowLeft)),
+            )
+            .child(
+                div()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .bg(cx.theme().colors().surface_background)
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .child(Chip::new("BIBLIOTECA / DETALHES").icon(IconName::Library)),
+                    )
+                    .child(Headline::new(game.title.clone()).size(HeadlineSize::Large))
+                    .child(
+                        Label::new(if game.description.is_empty() {
+                            "Descrição não informada".to_owned()
+                        } else {
+                            game.description.clone()
+                        })
+                        .color(MomorColor::Muted),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                Chip::new(if game.local_bundle_path.is_some() {
+                                    "Instalado"
+                                } else {
+                                    "Online"
+                                })
+                                .icon(
+                                    if game.local_bundle_path.is_some() {
+                                        IconName::Box
+                                    } else {
+                                        IconName::CloudDownload
+                                    },
+                                ),
+                            )
+                            .child(Chip::new(game.compat_status.clone()).icon(IconName::Info)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                self.primary("detail-play", "Jogar", Action::Play(id), cx)
+                                    .start_icon(Icon::new(IconName::PlayFilled)),
+                            )
+                            .child(
+                                self.button("edit-game", "Editar", Action::Edit(id), cx)
+                                    .start_icon(Icon::new(IconName::Pencil)),
+                            )
+                            .child(
+                                self.button(
+                                    "verify-game",
+                                    "Verificar arquivos",
+                                    Action::Verify(id),
+                                    cx,
+                                )
+                                .start_icon(Icon::new(IconName::Check)),
+                            )
+                            .child(
+                                self.button(
+                                    "star-game",
+                                    if game.favorite {
+                                        "Favorito"
+                                    } else {
+                                        "Favoritar"
+                                    },
+                                    Action::Favorite(id),
+                                    cx,
+                                )
+                                .start_icon(Icon::new(
+                                    if game.favorite {
+                                        IconName::StarFilled
+                                    } else {
+                                        IconName::Star
+                                    },
+                                )),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .bg(cx.theme().colors().surface_background)
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(Headline::new("Informações").size(HeadlineSize::Small))
+                    .child(self.row(cx, "Disponibilidade", &game.compat_status))
+                    .child(self.row(
+                        cx,
+                        "Tipo",
+                        source.map(|s| s.kind.label()).unwrap_or("Não informado"),
+                    ))
+                    .child(self.row(cx, "Entrada", &game.entry_uri))
+                    .child(
+                        self.row(
+                            cx,
+                            "Origem",
+                            source
+                                .map(|s| s.location.as_str())
+                                .unwrap_or("Não informado"),
+                        ),
+                    )
+                    .child(self.row(
+                        cx,
+                        "Versão",
+                        game.version.as_deref().unwrap_or("Não informado"),
+                    ))
+                    .child(self.row(cx, "Sessões", &game.play_count.to_string()))
+                    .child(self.row(
+                        cx,
+                        "Saves",
+                        "Perfil WebView2 separado por jogo; dados preservados por origem.",
+                    ))
+                    .child(self.row(
+                        cx,
+                        "Requisitos",
+                        &format!(
+                            "WebGPU: {} · memory64: {} · memória compartilhada: {}",
+                            game.requirements.webgpu,
+                            game.requirements.wasm_memory64,
+                            game.requirements.shared_array_buffer
+                        ),
+                    ))
+                    .when(
+                        game.external_id.as_deref() == Some("gta-legacy")
+                            && game.entry_uri.starts_with("https://fiveplay.lol/"),
+                        |d| {
+                            d.child(self.row(
+                                cx,
+                                "Qualidade",
+                                if game.entry_uri.contains("wgr_quality=economy") {
+                                    "Economia: reduz texturas e distância de detalhe"
+                                } else {
+                                    "Equilibrado: texturas e distância de detalhe intermediárias"
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(self.button(
+                                        "gta-balanced",
+                                        "Equilibrado",
+                                        Action::GtaGraphics(id, "balanced"),
+                                        cx,
+                                    ))
+                                    .child(self.button(
+                                        "gta-economy",
+                                        "Economia de memória",
+                                        Action::GtaGraphics(id, "economy"),
+                                        cx,
+                                    )),
+                            )
+                        },
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .when_some(source, |d, s| {
+                        d.child(self.button(
+                            "edit-source",
+                            "Configurar fonte / arquivos",
+                            Action::EditSource(s.id),
+                            cx,
+                        ))
+                    })
+                    .child(
+                        self.button("move-up", "Mover acima", Action::Reorder(id, -1), cx)
+                            .start_icon(Icon::new(IconName::ArrowUp)),
+                    )
+                    .child(
+                        self.button("move-down", "Mover abaixo", Action::Reorder(id, 1), cx)
+                            .start_icon(Icon::new(IconName::ArrowDown)),
+                    )
+                    .child(
+                        self.button("remove-game", "Remover registro", Action::Remove(id), cx)
+                            .color(MomorColor::Error),
+                    ),
+            )
             .into_any_element()
     }
-    fn row(&self, label: &str, value: &str) -> Div {
+    fn row(&self, cx: &Context<Self>, label: &str, value: &str) -> Div {
         div()
             .flex()
             .gap_4()
             .py_2()
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(cx.theme().colors().border_variant)
             .child(
                 div()
                     .w(px(150.))
                     .flex_shrink_0()
                     .text_sm()
-                    .text_color(rgb(MUTED))
+                    .text_color(cx.theme().colors().text_muted)
                     .child(label.to_string()),
             )
             .child(div().flex_1().min_w_0().text_sm().child(value.to_string()))
@@ -1986,105 +2222,214 @@ impl Shell {
         div()
             .id("sources-list")
             .overflow_y_scroll()
-            .p_6()
+            .p_5()
             .flex()
             .flex_col()
             .gap_4()
             .size_full()
-            .child(div().text_2xl().child("Fontes da biblioteca"))
             .child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child("Links, catálogos e arquivos escolhidos por você. Sem login do WGR."),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(Headline::new("Fontes da biblioteca").size(HeadlineSize::Large))
+                            .child(
+                                Label::new("Sites, catálogos e arquivos adicionados por você.")
+                                    .color(MomorColor::Muted),
+                            ),
+                    )
+                    .child(
+                        self.primary("add-source", "Adicionar fonte", Action::Add, cx)
+                            .start_icon(Icon::new(IconName::Plus)),
+                    ),
             )
-            .child(self.primary("add-source", "+ Adicionar fonte", Action::Add, cx))
+            .child(
+                div().flex().child(
+                    Chip::new(format!("{} fontes configuradas", self.sources.len()))
+                        .icon(IconName::DatabaseZap),
+                ),
+            )
             .children(self.sources.iter().map(|source| {
                 let id = source.id;
                 div()
                     .p_4()
-                    .rounded_lg()
+                    .rounded_xl()
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(PANEL))
+                    .border_color(cx.theme().colors().border_variant)
+                    .bg(cx.theme().colors().surface_background)
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(format!(
-                        "{}{}",
-                        if source.favorite { "★ " } else { "" },
-                        source.display_name
-                    )))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(source.kind.label()),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Icon::new(
+                                    if source.kind == SourceKind::LocalWebBundle
+                                        || source.kind == SourceKind::GtaLegacyZip
+                                    {
+                                        IconName::Folder
+                                    } else {
+                                        IconName::CloudDownload
+                                    },
+                                )
+                                .color(MomorColor::Accent),
+                            )
+                            .child(
+                                Headline::new(source.display_name.clone())
+                                    .size(HeadlineSize::Small),
+                            )
+                            .when(source.favorite, |d| {
+                                d.child(Icon::new(IconName::StarFilled).color(MomorColor::Accent))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .child(Chip::new(source.kind.label()).icon(IconName::DatabaseZap)),
                     )
                     .child(div().text_sm().child(source.location.clone()))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(source.status.clone()),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Indicator::dot().color(MomorColor::Muted))
+                            .child(Label::new(source.status.clone()).color(MomorColor::Muted)),
                     )
                     .child(
                         div()
                             .flex()
                             .gap_2()
                             .flex_wrap()
-                            .child(self.button(
-                                format!("source-edit-{id}"),
-                                "Editar / testar",
-                                Action::EditSource(id),
-                                cx,
-                            ))
-                            .when(source.kind == SourceKind::RemoteCatalogApi, |d| {
-                                d.child(self.button(
-                                    format!("sync-{id}"),
-                                    "Sincronizar",
-                                    Action::Sync(id),
+                            .child(
+                                self.button(
+                                    format!("source-edit-{id}"),
+                                    "Editar / testar",
+                                    Action::EditSource(id),
                                     cx,
-                                ))
+                                )
+                                .start_icon(Icon::new(IconName::Pencil)),
+                            )
+                            .when(source.kind == SourceKind::RemoteCatalogApi, |d| {
+                                d.child(
+                                    self.button(
+                                        format!("sync-{id}"),
+                                        "Sincronizar",
+                                        Action::Sync(id),
+                                        cx,
+                                    )
+                                    .start_icon(Icon::new(IconName::RotateCw)),
+                                )
                             })
-                            .child(self.button(
-                                format!("source-star-{id}"),
-                                "☆",
-                                Action::FavoriteSource(id),
-                                cx,
-                            ))
-                            .child(self.button(
-                                format!("source-up-{id}"),
-                                "↑",
-                                Action::ReorderSource(id, -1),
-                                cx,
-                            ))
-                            .child(self.button(
-                                format!("source-down-{id}"),
-                                "↓",
-                                Action::ReorderSource(id, 1),
-                                cx,
-                            ))
-                            .child(self.button(
-                                format!("source-remove-{id}"),
-                                "Remover",
-                                Action::RemoveSource(id),
-                                cx,
-                            )),
+                            .child(
+                                self.button(
+                                    format!("source-star-{id}"),
+                                    if source.favorite {
+                                        "Favorita"
+                                    } else {
+                                        "Favoritar"
+                                    },
+                                    Action::FavoriteSource(id),
+                                    cx,
+                                )
+                                .start_icon(Icon::new(
+                                    if source.favorite {
+                                        IconName::StarFilled
+                                    } else {
+                                        IconName::Star
+                                    },
+                                )),
+                            )
+                            .child(
+                                self.button(
+                                    format!("source-up-{id}"),
+                                    "Subir",
+                                    Action::ReorderSource(id, -1),
+                                    cx,
+                                )
+                                .start_icon(Icon::new(IconName::ArrowUp)),
+                            )
+                            .child(
+                                self.button(
+                                    format!("source-down-{id}"),
+                                    "Descer",
+                                    Action::ReorderSource(id, 1),
+                                    cx,
+                                )
+                                .start_icon(Icon::new(IconName::ArrowDown)),
+                            )
+                            .child(
+                                self.button(
+                                    format!("source-remove-{id}"),
+                                    "Remover",
+                                    Action::RemoveSource(id),
+                                    cx,
+                                )
+                                .color(MomorColor::Error),
+                            ),
                     )
             }))
             .into_any_element()
     }
     fn settings_view(&self, cx: &mut Context<Self>) -> AnyElement {
-        div().p_6().flex().flex_col().gap_5().size_full().child(div().text_2xl().child("Configurações"))
-            .child(self.row("Privacidade","Telemetria desligada. Sem conta, upload ou servidor remoto obrigatório."))
-            .child(self.row("Armazenamento",&self.services.paths.root.to_string_lossy()))
-            .child(self.button("fullscreen-setting",format!("Iniciar em tela cheia: {}",if self.settings.fullscreen{"sim"}else{"não"}),Action::ToggleFullscreen,cx))
-            .child(self.button("cache-limit",format!("Limite do cache: {} MiB · clicar para alterar",self.settings.cache_limit_mib),Action::CacheLimit,cx))
-            .child(div().text_sm().text_color(rgb(MUTED)).child("O limite do cache Rust é aplicado ao iniciar. Saves e perfis nativos ocupam armazenamento separado."))
-            .child(div().flex().gap_2().child(self.button("clear-cache","Limpar cache Rust",Action::ClearCache,cx)).child(self.button("reveal","Abrir pasta de dados",Action::Reveal,cx)))
-            .child(self.row("GPU e qualidade","O player nativo usa wgpu (DirectX 12/Vulkan conforme o adaptador e driver). Teste sua GPU em Diagnóstico. Qualidade e FPS dependem do port."))
-            .child(self.row("Atalhos","Ctrl+K buscar · Ctrl+N adicionar · Ctrl+Shift+B voltar do player · F11 tela cheia · Tab/Shift+Tab navegar"))
+        div()
+            .id("settings-scroll")
+            .overflow_y_scroll()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .size_full()
+            .child(Headline::new("Configurações").size(HeadlineSize::Large))
+            .child(Label::new("Personalize sua biblioteca local, controles e armazenamento.")
+                .color(MomorColor::Muted))
+            .child(div().flex().gap_2()
+                .child(Chip::new("Sem conta obrigatória").icon(IconName::LockOutlined))
+                .child(Chip::new("Dados locais").icon(IconName::Folder)))
+            .child(div().rounded_xl().border_1()
+                .border_color(cx.theme().colors().border_variant)
+                .bg(cx.theme().colors().surface_background)
+                .p_5().flex().flex_col().gap_3()
+                .child(Headline::new("Preferências").size(HeadlineSize::Small))
+                .child(self.row(cx, "Privacidade", "Telemetria desligada. Sem conta ou upload obrigatório."))
+                .child(div().flex().gap_2().flex_wrap()
+                    .child(self.button("fullscreen-setting",
+                        format!("Iniciar em tela cheia: {}", if self.settings.fullscreen { "sim" } else { "não" }),
+                        Action::ToggleFullscreen, cx).start_icon(Icon::new(IconName::Maximize)))
+                    .child(self.button("cache-limit",
+                        format!("Limite do cache: {} MiB", self.settings.cache_limit_mib),
+                        Action::CacheLimit, cx).start_icon(Icon::new(IconName::Sliders)))))
+            .child(div().rounded_xl().border_1()
+                .border_color(cx.theme().colors().border_variant)
+                .bg(cx.theme().colors().surface_background)
+                .p_5().flex().flex_col().gap_3()
+                .child(Headline::new("Armazenamento").size(HeadlineSize::Small))
+                .child(self.row(cx, "Pasta de dados", &self.services.paths.root.to_string_lossy()))
+                .child(Label::new("O limite do cache é aplicado ao iniciar. Saves e perfis nativos são preservados separadamente.")
+                    .color(MomorColor::Muted))
+                .child(div().flex().gap_2().flex_wrap()
+                    .child(self.button("clear-cache", "Limpar cache Rust", Action::ClearCache, cx)
+                        .start_icon(Icon::new(IconName::Eraser)))
+                    .child(self.button("reveal", "Abrir pasta de dados", Action::Reveal, cx)
+                        .start_icon(Icon::new(IconName::FolderOpen)))))
+            .child(div().rounded_xl().border_1()
+                .border_color(cx.theme().colors().border_variant)
+                .bg(cx.theme().colors().surface_background)
+                .p_5().flex().flex_col().gap_2()
+                .child(Headline::new("Runtime e atalhos").size(HeadlineSize::Small))
+                .child(self.row(cx, "GPU", "O player usa wgpu. Adaptador, backend e compatibilidade podem ser verificados em Diagnóstico."))
+                .child(self.row(cx, "Atalhos", "Ctrl+K buscar · Ctrl+N adicionar · Ctrl+Shift+B voltar · F11 tela cheia · Tab navegar"))
+                .child(div().flex().child(
+                    self.button("settings-diagnostics", "Abrir diagnóstico", Action::Diagnostics, cx)
+                        .start_icon(Icon::new(IconName::Debug)))))
             .into_any_element()
     }
     fn diagnostics_view(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2113,34 +2458,59 @@ impl Shell {
                 Some(v) => format!("Não disponível · {v}"),
                 None => "Não testado".into(),
             };
-            self.row(key, &status)
-        });
-        div().id("diagnostics-scroll").overflow_y_scroll().p_6().flex().flex_col().gap_3().size_full().child(div().text_2xl().child("Diagnóstico real do runtime"))
-            .child(div().text_sm().text_color(rgb(MUTED)).child("Abra Órbita para testar o binário Wasm. O teste GPU abaixo executa diretamente em Rust, sem WebView2, Chromium ou Servo. APIs web e GPU nativa são verificações diferentes."))
-            .child(self.row("Runtime de jogo",self.diagnostic["runtime"].as_str().unwrap_or("Não testado"))).children(rows)
-            .child(self.row("GPU física (wgpu)",self.native_check["gpu"]["adapter_name"].as_str().unwrap_or("Não testada")))
-            .child(self.row("Backend GPU",self.native_check["gpu"]["adapter_backend"].as_str().unwrap_or("Não testado")))
-            .child(self.row("Quadro GPU nativo",if self.native_check["gpu"]["rendered_and_read_back"] == true{"Renderizado e lido (1x1)"}else{"Não testado"}))
-            .child(self.button("native-check","Testar GPU nativa (Rust / wgpu)",Action::NativeCheck,cx))
-            .child(self.row("Primeiro frame",&self.diagnostic.get("first_frame_ms").filter(|v|!v.is_null()).map(|v|format!("{v} ms · reportado pelo jogo")).unwrap_or_else(||"Não informado".into())))
-            .child(self.row("FPS",&self.diagnostic.get("fps").filter(|v|!v.is_null()).map(|v|format!("{v} · reportado pela fixture")).unwrap_or_else(||"Não informado".into())))
-            .child(self.button("export-diagnostic","Exportar relatório JSON",Action::Export,cx)).into_any_element()
+            self.row(cx, key, &status)
+        })
+        .collect::<Vec<_>>();
+        div().id("diagnostics-scroll").overflow_y_scroll().p_5()
+            .flex().flex_col().gap_4().size_full()
+            .child(Headline::new("Diagnóstico do runtime").size(HeadlineSize::Large))
+            .child(Label::new("Informações observadas pelo player. Testes web e GPU nativa são independentes.")
+                .color(MomorColor::Muted))
+            .child(div().flex().gap_2().flex_wrap()
+                .child(self.primary("native-check", "Testar GPU nativa", Action::NativeCheck, cx)
+                    .start_icon(Icon::new(IconName::Debug)))
+                .child(self.button("export-diagnostic", "Exportar relatório JSON", Action::Export, cx)
+                    .start_icon(Icon::new(IconName::Download))))
+            .child(div().rounded_xl().border_1()
+                .border_color(cx.theme().colors().border_variant)
+                .bg(cx.theme().colors().surface_background)
+                .p_5().flex().flex_col().gap_1()
+                .child(Headline::new("Engine e GPU").size(HeadlineSize::Small))
+                .child(self.row(cx, "Runtime", self.diagnostic["runtime"].as_str().unwrap_or("Não testado")))
+                .child(self.row(cx, "Adaptador", self.native_check["gpu"]["adapter_name"].as_str().unwrap_or("Não testada")))
+                .child(self.row(cx, "Backend", self.native_check["gpu"]["adapter_backend"].as_str().unwrap_or("Não testado")))
+                .child(self.row(cx, "Quadro GPU", if self.native_check["gpu"]["rendered_and_read_back"] == true {
+                    "Renderizado e lido (1x1)"
+                } else { "Não testado" }))
+                .child(self.row(cx, "Primeiro frame", &self.diagnostic.get("first_frame_ms")
+                    .filter(|v|!v.is_null()).map(|v|format!("{v} ms · reportado pelo jogo"))
+                    .unwrap_or_else(||"Não informado".into())))
+                .child(self.row(cx, "FPS", &self.diagnostic.get("fps")
+                    .and_then(|v|v.as_f64()).map(|value|format!("{value:.1} FPS · reportado pela fixture"))
+                    .unwrap_or_else(||"Não informado".into()))))
+            .child(div().rounded_xl().border_1()
+                .border_color(cx.theme().colors().border_variant)
+                .bg(cx.theme().colors().surface_background)
+                .p_5().flex().flex_col().gap_1()
+                .child(Headline::new("Recursos e compatibilidade").size(HeadlineSize::Small))
+                .children(rows))
+            .into_any_element()
     }
     fn modal_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(modal) = &self.modal else {
             return div().into_any_element();
         };
         let content=match modal{
-            Modal::Wizard=>{let is_preview=self.preview.is_some();div().flex().flex_col().gap_3().child(div().text_xs().text_color(rgb(ACCENT)).child(if is_preview{"3 / 3 · REVISAR E SALVAR"}else{"1 / 3 · ESCOLHER FONTE → 2 / 3 · TESTAR"}))
+        Modal::Wizard=>{let is_preview=self.preview.is_some();div().flex().flex_col().gap_3().child(div().text_xs().text_color(cx.theme().colors().text_accent).child(if is_preview{"3 / 3 · REVISAR E SALVAR"}else{"1 / 3 · ESCOLHER FONTE → 2 / 3 · TESTAR"}))
                 .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child("Adicionar jogo ou fonte"))
-                .when(!is_preview,|d|d.child(div().flex().gap_2().flex_wrap().children([SourceKind::RemoteWeb,SourceKind::RemoteCatalogApi,SourceKind::LocalWebBundle,SourceKind::GtaLegacyZip].into_iter().map(|kind|self.button(format!("kind-{kind:?}"),kind.label(),Action::Kind(kind),cx).when(kind==self.kind,|b|b.text_color(rgb(ACCENT)).border_color(rgb(ACCENT))))))
+                .when(!is_preview,|d|d.child(div().flex().gap_2().flex_wrap().children([SourceKind::RemoteWeb,SourceKind::RemoteCatalogApi,SourceKind::LocalWebBundle,SourceKind::GtaLegacyZip].into_iter().map(|kind|self.button(format!("kind-{kind:?}"),kind.label(),Action::Kind(kind),cx).when(kind==self.kind,|b|b.color(MomorColor::Accent).style(ButtonStyle::Tinted(TintColor::Accent))))))
                     .child(self.field("URL ou pasta autorizada",&self.location)).when(matches!(self.kind,SourceKind::LocalWebBundle|SourceKind::GtaLegacyZip),|d|d.child(div().flex().gap_2().child(self.button("pick-folder","Selecionar pasta",Action::PickFolder,cx)).when(self.kind==SourceKind::LocalWebBundle,|d|d.child(self.button("pick-zip","Selecionar ZIP",Action::PickZip,cx)))))
                     .when(self.kind==SourceKind::RemoteCatalogApi,|d|d.child(self.button("auth-kind",format!("Autenticação: {}",["sem autenticação","Bearer token","API key · X-API-Key","Basic · usuário:senha"][self.auth as usize]),Action::Auth,cx)).when(self.auth!=0,|d|d.child(self.field("Credencial (guardada no Windows)",&self.secret))).when(self.auth==2,|d|d.child(self.field("Header da API key",&self.header))))
                     .when(matches!(self.kind,SourceKind::RemoteWeb|SourceKind::RemoteCatalogApi),|d|d.child(self.button("dev-mode",format!("{} Permitir HTTP somente em loopback (desenvolvimento)",if self.development{"☑"}else{"☐"}),Action::Dev,cx)))
                     .when(matches!(self.kind,SourceKind::RemoteCatalogApi|SourceKind::GtaLegacyZip),|d|d.child(self.field("Origens externas explicitamente autorizadas (vírgulas)",&self.extra)))
-                    .when(self.kind==SourceKind::GtaLegacyZip,|d|d.child(div().text_sm().text_color(rgb(MUTED)).child("O jogo não está incluído. A pasta deve conter b/ e data/. O ZIP remoto será consultado somente se você autorizar abaixo."))
+                    .when(self.kind==SourceKind::GtaLegacyZip,|d|d.child(div().text_sm().text_color(cx.theme().colors().text_muted).child("O jogo não está incluído. A pasta deve conter b/ e data/. O ZIP remoto será consultado somente se você autorizar abaixo."))
                         .child(self.button("gta-consent",format!("{} Tenho autorização para os arquivos e autorizo consultar a fonte ZIP indicada no índice",if self.network{"☑"}else{"☐"}),Action::Network,cx))))
-                .when(is_preview,|d|d.child(div().text_sm().text_color(rgb(MUTED)).child(self.preview.as_ref().map(|p|p.report.clone()).unwrap_or_default()))
+                .when(is_preview,|d|d.child(div().text_sm().text_color(cx.theme().colors().text_muted).child(self.preview.as_ref().map(|p|p.report.clone()).unwrap_or_default()))
                     .child(div().text_sm().child(self.preview.as_ref().map(|p|p.games.iter().take(8).map(|g|g.title.clone()).collect::<Vec<_>>().join(" · ")).unwrap_or_default())))
                 .child(self.field("Título (catálogos preservam os títulos de cada jogo)",&self.title))
                 .child(div().flex().justify_between().child(self.button("wizard-cancel","Cancelar",Action::Cancel,cx)).child(if is_preview{self.primary("wizard-save","Salvar na biblioteca",Action::SaveImport,cx)}else{self.primary("wizard-analyze","Testar e analisar",Action::Analyze,cx)}))
@@ -2159,17 +2529,16 @@ impl Shell {
             .justify_center()
             .child(
                 div()
-                    .w(px(690.))
-                    .max_h(relative(0.93))
+                    .w(px(640.))
+                    .max_h(relative(0.90))
                     .id("modal-scroll")
                     .overflow_y_scroll()
-                    .bg(rgb(BG))
+                    .bg(cx.theme().colors().elevated_surface_background)
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .rounded_lg()
+                    .border_color(cx.theme().colors().border)
+                    .rounded_xl()
                     .shadow_xl()
                     .p_6()
-                    .h(px(550.))
                     .child(
                         momor_ui::Modal::new("wgr-dialog", None)
                             .show_dismiss(false)
@@ -2180,7 +2549,11 @@ impl Shell {
                             div()
                                 .mt_4()
                                 .text_sm()
-                                .text_color(rgb(if self.error { DANGER } else { MUTED }))
+                                .text_color(if self.error {
+                                    cx.theme().status().error
+                                } else {
+                                    cx.theme().colors().text_muted
+                                })
                                 .child(self.notice.clone()),
                         )
                     }),
@@ -2377,8 +2750,8 @@ impl Render for Shell {
             if self.error {
                 return div()
                     .size_full()
-                    .bg(rgb(BG))
-                    .text_color(rgb(TEXT))
+                    .bg(cx.theme().colors().background)
+                    .text_color(cx.theme().colors().text)
                     .font_family("Segoe UI")
                     .p_8()
                     .flex()
@@ -2387,14 +2760,14 @@ impl Render for Shell {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(DANGER))
+                            .text_color(cx.theme().status().error)
                             .child("SESSÃO INTERROMPIDA"),
                     )
                     .child(div().text_2xl().child(session.launch.game.title.clone()))
                     .child(
                         div()
                             .max_w(px(820.))
-                            .text_color(rgb(DANGER))
+                            .text_color(cx.theme().status().error)
                             .child(self.notice.clone()),
                     )
                     .child(self.primary(
@@ -2414,7 +2787,7 @@ impl Render for Shell {
                         .items_center()
                         .justify_center()
                         .bg(rgb(0x000000))
-                        .text_color(rgb(TEXT))
+                        .text_color(cx.theme().colors().text)
                         .child(self.notice.clone())
                         .into_any_element();
                 }
@@ -2426,7 +2799,7 @@ impl Render for Shell {
                     .size_full()
                     .relative()
                     .bg(rgb(0x161d28))
-                    .text_color(rgb(TEXT))
+                    .text_color(cx.theme().colors().text)
                     .font_family("Segoe UI")
                     .track_focus(&self.focus)
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -2486,7 +2859,7 @@ impl Render for Shell {
             return div()
                 .size_full()
                 .bg(rgb(0x000000))
-                .text_color(rgb(TEXT))
+                .text_color(cx.theme().colors().text)
                 .font_family("Segoe UI")
                 .into_any_element();
         }
@@ -2498,96 +2871,140 @@ impl Render for Shell {
             View::Detail(id) => self.detail(id, cx),
         };
         let sidebar = div()
-            .w(px(222.))
+            .w(px(242.))
             .flex_shrink_0()
-            .bg(rgb(SIDE))
+            .bg(cx.theme().colors().panel_background)
             .border_r_1()
-            .border_color(rgb(BORDER))
-            .p_4()
+            .border_color(cx.theme().colors().border_variant)
+            .px_3()
+            .py_4()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(MUTED))
-                    .mt_3()
-                    .mb_2()
+                    .text_color(cx.theme().colors().text_muted)
+                    .px_3()
+                    .mt_4()
+                    .mb_3()
                     .child("BIBLIOTECA"),
             )
-            .children(
-                ["Todos", "Favoritos", "Recentes", "Instalados"]
-                    .into_iter()
-                    .map(|label| {
-                        momor_ui::ListItem::new(ElementId::Name(format!("nav-{label}").into()))
-                            .rounded()
-                            .toggle_state(self.filter == label && self.view == View::Library)
-                            .child(
-                                self.button(
-                                    format!("side-{label}"),
-                                    label,
-                                    Action::Filter(label.into()),
-                                    cx,
-                                )
-                                .border_0()
-                                .when(self.filter == label && self.view == View::Library, |b| {
-                                    b.bg(rgb(HOVER)).text_color(rgb(ACCENT))
-                                }),
-                            )
-                    }),
-            )
+            .child(self.navigation_item(
+                "nav-todos",
+                "Todos os jogos",
+                IconName::Library,
+                self.view == View::Library && self.filter == "Todos",
+                Action::Filter("Todos".into()),
+                cx,
+            ))
+            .child(self.navigation_item(
+                "nav-recentes",
+                "Recentes",
+                IconName::Clock,
+                self.view == View::Library && self.filter == "Recentes",
+                Action::Filter("Recentes".into()),
+                cx,
+            ))
+            .child(self.navigation_item(
+                "nav-favoritos",
+                "Favoritos",
+                IconName::Star,
+                self.view == View::Library && self.filter == "Favoritos",
+                Action::Filter("Favoritos".into()),
+                cx,
+            ))
+            .child(self.navigation_item(
+                "nav-instalados",
+                "Instalados",
+                IconName::Box,
+                self.view == View::Library && self.filter == "Instalados",
+                Action::Filter("Instalados".into()),
+                cx,
+            ))
+            .child(self.navigation_item(
+                "nav-online",
+                "Online",
+                IconName::CloudDownload,
+                self.view == View::Library && self.filter == "Online",
+                Action::Filter("Online".into()),
+                cx,
+            ))
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(MUTED))
-                    .mt_5()
-                    .mb_2()
+                    .text_color(cx.theme().colors().text_muted)
+                    .px_3()
+                    .mt_6()
+                    .mb_3()
                     .child("FONTES"),
             )
-            .child(
-                self.button("sources", "Minhas fontes", Action::Sources, cx)
-                    .border_0(),
-            )
-            .child(
-                self.button("add-sidebar", "+ Adicionar fonte", Action::Add, cx)
-                    .border_0(),
-            )
+            .child(self.navigation_item(
+                "nav-sources",
+                "Minhas fontes",
+                IconName::DatabaseZap,
+                self.view == View::Sources,
+                Action::Sources,
+                cx,
+            ))
+            .child(self.navigation_item(
+                "nav-add-source",
+                "Adicionar fonte",
+                IconName::Plus,
+                false,
+                Action::Add,
+                cx,
+            ))
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(MUTED))
-                    .mt_5()
-                    .mb_2()
+                    .text_color(cx.theme().colors().text_muted)
+                    .px_3()
+                    .mt_6()
+                    .mb_3()
                     .child("SISTEMA"),
             )
-            .child(
-                self.button("diagnostics", "Diagnóstico", Action::Diagnostics, cx)
-                    .border_0(),
-            )
-            .child(
-                self.button("settings", "Configurações", Action::Settings, cx)
-                    .border_0(),
-            )
+            .child(self.navigation_item(
+                "nav-diagnostics",
+                "Diagnóstico",
+                IconName::Debug,
+                self.view == View::Diagnostics,
+                Action::Diagnostics,
+                cx,
+            ))
+            .child(self.navigation_item(
+                "nav-settings",
+                "Configurações",
+                IconName::Settings,
+                self.view == View::Settings,
+                Action::Settings,
+                cx,
+            ))
             .child(div().flex_1())
             .child(
                 div()
-                    .text_xs()
-                    .text_color(rgb(ACCENT))
-                    .child("●  Biblioteca local"),
+                    .px_3()
+                    .pb_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Indicator::dot().color(MomorColor::Success))
+                    .child(Label::new("Biblioteca local").color(MomorColor::Muted)),
             )
             .child(
                 div()
+                    .px_3()
                     .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("WGR 0.1.0 · Windows"),
+                    .text_color(cx.theme().colors().text_muted)
+                    .child("WGR · Windows · Rust"),
             );
         div()
             .relative()
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
+            .bg(cx.theme().colors().background)
+            .text_color(cx.theme().colors().text)
             .font_family("Segoe UI")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -2609,27 +3026,26 @@ impl Render for Shell {
             }))
             .child(
                 div()
-                    .h(px(48.))
+                    .h(px(56.))
                     .flex_shrink_0()
-                    .px_6()
-                    .bg(rgb(SIDE))
+                    .px_5()
+                    .bg(cx.theme().colors().title_bar_background)
                     .border_b_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(cx.theme().colors().border_variant)
                     .flex()
                     .items_center()
                     .gap_3()
                     .child(
-                        div()
-                            .text_xl()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(ACCENT))
-                            .child("WGR"),
+                        Icon::new(IconName::PlayOutlined)
+                            .size(IconSize::Medium)
+                            .color(MomorColor::Accent),
                     )
+                    .child(Headline::new("WGR").size(HeadlineSize::Small))
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("WEB GAME RUNTIME"),
+                            .text_color(cx.theme().colors().text_muted)
+                            .child("GAME RUNTIME"),
                     )
                     .child(
                         div()
@@ -2639,12 +3055,15 @@ impl Render for Shell {
                     )
                     .child(
                         div()
-                            .w(px(330.))
+                            .w(px(300.))
                             .rounded_md()
                             .overflow_hidden()
                             .border_1()
-                            .border_color(rgb(BORDER))
+                            .border_color(cx.theme().colors().border_variant)
                             .children(self.input_widgets.get(&self.search.entity_id()).cloned()),
+                    )
+                    .child(
+                        Chip::new(format!("{} jogos", self.games.len())).icon(IconName::Library),
                     ),
             )
             .child(
@@ -2657,20 +3076,32 @@ impl Render for Shell {
             )
             .child(
                 div()
-                    .h(px(32.))
+                    .h(px(34.))
                     .flex_shrink_0()
                     .px_4()
-                    .bg(rgb(SIDE))
+                    .bg(cx.theme().colors().panel_background)
                     .border_t_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(cx.theme().colors().border_variant)
                     .flex()
                     .items_center()
+                    .gap_2()
                     .text_xs()
-                    .text_color(rgb(if self.error { DANGER } else { MUTED }))
+                    .text_color(if self.error {
+                        cx.theme().status().error
+                    } else {
+                        cx.theme().colors().text_muted
+                    })
+                    .child(Indicator::dot().color(if self.error {
+                        MomorColor::Error
+                    } else if self.busy {
+                        MomorColor::Warning
+                    } else {
+                        MomorColor::Success
+                    }))
                     .child(if self.busy {
                         "Processando…".into()
                     } else if self.notice.is_empty() {
-                        "Seus jogos. Suas fontes. Sem conta.  ·  Ctrl+N adicionar".into()
+                        "Biblioteca local · Sem conta · Ctrl+K buscar · Ctrl+N adicionar".into()
                     } else {
                         self.notice.clone()
                     }),

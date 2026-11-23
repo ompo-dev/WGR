@@ -68,6 +68,7 @@ static OCCLUSION_ZERO: AtomicU64 = AtomicU64::new(0);
 static OCCLUSION_NONZERO: AtomicU64 = AtomicU64::new(0);
 static OCCLUSION_EMPTY: AtomicU64 = AtomicU64::new(0);
 static OCCLUSION_INCOMPLETE: AtomicU64 = AtomicU64::new(0);
+static OCCLUSION_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 static PED_GBUFFER_DUMP_AFTER_PRESENTS: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("MUGUET_PED_GBUFFER_AFTER_PRESENTS")
         .ok()
@@ -118,6 +119,35 @@ mod lighting_wait_tests {
 const ZERO_VB_SIZE: u64 = 4096;
 const OCCLUSION_CAPACITY: u32 = 2048;
 const OCCLUSION_VISIBLE_COUNT: u64 = 65536;
+
+// An unavailable query result is unknown, not proof the object is hidden.
+// Only a *completed* query that reports zero fragments may cull geometry.
+fn occlusion_guest_result(samples: Option<u64>, force_visible: bool) -> u64 {
+    if force_visible || samples.is_none_or(|count| count != 0) {
+        OCCLUSION_VISIBLE_COUNT
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod occlusion_regression_tests {
+    use super::*;
+
+    #[test]
+    fn missing_occlusion_sample_fails_open_without_disabling_valid_culling() {
+        assert_eq!(occlusion_guest_result(None, false), OCCLUSION_VISIBLE_COUNT);
+        assert_eq!(
+            occlusion_guest_result(Some(42), false),
+            OCCLUSION_VISIBLE_COUNT
+        );
+        assert_eq!(occlusion_guest_result(Some(0), false), 0);
+        assert_eq!(
+            occlusion_guest_result(Some(0), true),
+            OCCLUSION_VISIBLE_COUNT
+        );
+    }
+}
 const BG_LIMIT: usize = 48000;
 static PERF_DIAGNOSTICS: LazyLock<bool> =
     LazyLock::new(|| std::env::var("MUGUET_PERF_DIAGNOSTICS").as_deref() == Ok("1"));
@@ -2522,6 +2552,11 @@ impl Gpu {
             self.submits += 1;
             self.on_submitted();
             self.counter_slot = 0;
+        } else if !self.pending_events.is_empty() {
+            // Queries with no recorded GPU commands still need completion.
+            // A queue callback preserves ordering with prior submissions and
+            // prevents hanging on an event when there is no encoder to submit.
+            self.on_submitted();
         }
         if let Some(r) = resolves {
             self.map_pending(r.buf, r.kind);
@@ -8729,11 +8764,7 @@ impl Gpu {
                             }
                             self.query_store(
                                 addr,
-                                if *FORCE_OCCLUSION_VISIBLE || sum != 0 {
-                                    OCCLUSION_VISIBLE_COUNT
-                                } else {
-                                    0
-                                },
+                                occlusion_guest_result(Some(sum), *FORCE_OCCLUSION_VISIBLE),
                                 seq as u32,
                             );
                         }
@@ -8799,6 +8830,13 @@ impl Gpu {
             return;
         }
         if self.occlusion_next >= OCCLUSION_CAPACITY {
+            // Fail open when a frame exhausts query slots. Otherwise a
+            // skipped part of the bounding volume can return a false zero,
+            // permanently hiding world geometry in later GTA frames.
+            if let Some(Obj::Query(query)) = self.obj_mut(q) {
+                query.skipped_draw = true;
+            }
+            OCCLUSION_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
             log_once("qfull", "occlusion query set exhausted");
             return;
         }
@@ -8869,17 +8907,16 @@ impl Gpu {
                 continue;
             };
             if slots.is_empty() {
-                OCCLUSION_ZERO.fetch_add(1, Ordering::Relaxed);
                 OCCLUSION_EMPTY.fetch_add(1, Ordering::Relaxed);
-                self.query_store(
-                    addr,
-                    if *FORCE_OCCLUSION_VISIBLE {
-                        OCCLUSION_VISIBLE_COUNT
-                    } else {
-                        0
-                    },
+                // There was no GPU query slot to resolve, possibly because
+                // no pass was opened or slots were exhausted. Reporting zero
+                // used to hide entire tiles; instead fail open and complete
+                // after preceding GPU work (never synchronously before submit).
+                self.pending_events.push((
+                    id,
                     seq,
-                );
+                    occlusion_guest_result(None, *FORCE_OCCLUSION_VISIBLE),
+                ));
                 continue;
             }
             let consecutive = slots.windows(2).all(|w| w[1] == w[0] + 1);
@@ -9268,11 +9305,12 @@ impl Gpu {
             }
             if std::env::var_os("MUGUET_DIAG_OCCLUSION_VISIBLE").is_some() {
                 log(&format!(
-                    "occlusion diagnostic: visible={} zero={} empty={} incomplete={} force_visible={}",
+                    "occlusion diagnostic: visible={} zero={} empty={} incomplete={} exhausted={} force_visible={}",
                     OCCLUSION_NONZERO.load(Ordering::Relaxed),
                     OCCLUSION_ZERO.load(Ordering::Relaxed),
                     OCCLUSION_EMPTY.load(Ordering::Relaxed),
                     OCCLUSION_INCOMPLETE.load(Ordering::Relaxed),
+                    OCCLUSION_EXHAUSTED.load(Ordering::Relaxed),
                     *FORCE_OCCLUSION_VISIBLE
                 ));
             }

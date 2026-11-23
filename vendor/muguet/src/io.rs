@@ -9,19 +9,88 @@ use std::fs::File;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use wasmtime::SharedMemory;
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 const MAX_OPEN: usize = 1024;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 struct DataHint {
     file: usize,
     offset: u64,
     length: u64,
     low: bool,
+}
+
+const HINT_BLOCK_SIZE: u64 = 128 << 10;
+const HIGH_HINT_RETRY: Duration = Duration::from_millis(50);
+const LOW_HINT_RETRY: Duration = Duration::from_millis(350);
+static SOURCE_HINTS_COALESCED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct HintWindow {
+    file: usize,
+    first: u64,
+    last: u64,
+    low: bool,
+}
+
+impl DataHint {
+    fn window(self) -> HintWindow {
+        let last_byte = self
+            .offset
+            .saturating_add(self.length.min(1 << 20))
+            .saturating_sub(1);
+        HintWindow {
+            file: self.file,
+            first: self.offset / HINT_BLOCK_SIZE,
+            last: last_byte / HINT_BLOCK_SIZE,
+            low: self.low,
+        }
+    }
+}
+
+/// The guest can emit the same 128-KiB hint hundreds of times per second.
+/// Deduplicate *before* formatting asset paths or locking the remote cache.
+/// Short timeouts preserve retries of rejected, transient requests; high
+/// priority requests are never blocked by low-priority observations.
+#[derive(Default)]
+struct HintThrottle {
+    recent: HashMap<HintWindow, Instant>,
+}
+
+impl HintThrottle {
+    fn allow(&mut self, hint: DataHint, now: Instant) -> bool {
+        let key = hint.window();
+        let retry = if hint.low {
+            LOW_HINT_RETRY
+        } else {
+            HIGH_HINT_RETRY
+        };
+        if self
+            .recent
+            .get(&key)
+            .is_some_and(|last| now.saturating_duration_since(*last) < retry)
+        {
+            return false;
+        }
+        // Avoid an unbounded table or an O(n) cleanup on every new hint.
+        if self.recent.len() >= 8192 {
+            self.recent
+                .retain(|_, last| now.saturating_duration_since(*last) < LOW_HINT_RETRY);
+            if self.recent.len() >= 8192 {
+                self.recent.clear();
+            }
+        }
+        self.recent.insert(key, now);
+        true
+    }
+}
+
+pub fn source_hints_coalesced() -> u64 {
+    SOURCE_HINTS_COALESCED.load(Ordering::Relaxed)
 }
 fn take_hints(mem: &SharedMemory, table: u64) -> Vec<DataHint> {
     let (_, bytes) = mem_base_len(mem);
@@ -143,6 +212,32 @@ mod tests {
         assert!(take_hints(&mem, table).is_empty());
     }
     #[test]
+    fn throttles_repeated_hint_windows_without_delaying_distinct_or_urgent_data() {
+        let start = Instant::now();
+        let mut throttle = HintThrottle::default();
+        let low = DataHint {
+            file: 7,
+            offset: 3,
+            length: 100,
+            low: true,
+        };
+        assert!(throttle.allow(low, start));
+        assert!(!throttle.allow(low, start + Duration::from_millis(100)));
+        assert!(throttle.allow(low, start + LOW_HINT_RETRY));
+        let high = DataHint { low: false, ..low };
+        assert!(throttle.allow(high, start + Duration::from_millis(101)));
+        assert!(!throttle.allow(high, start + Duration::from_millis(120)));
+        assert!(throttle.allow(high, start + Duration::from_millis(151)));
+        assert!(throttle.allow(DataHint { file: 8, ..high }, start));
+        assert!(throttle.allow(
+            DataHint {
+                offset: HINT_BLOCK_SIZE,
+                ..high
+            },
+            start
+        ));
+    }
+    #[test]
     fn rejects_out_of_bounds_before_read_and_reports_short_source() {
         let mem = memory();
         assert!(copy_to_guest(&mem, (32 << 20) - 8, 0, 16, |_, _| panic!(
@@ -204,6 +299,7 @@ fn serve_remote(mem: SharedMemory, table: u64) {
         .thread_name(|n| format!("native-io-{n}"))
         .build()
         .expect("I/O workers");
+    let mut hint_throttle = HintThrottle::default();
     loop {
         let seen = atomic_i32(&mem, table).load(Ordering::Acquire);
         let count = atomic_i32(&mem, table + 4).load(Ordering::Acquire);
@@ -246,6 +342,10 @@ fn serve_remote(mem: SharedMemory, table: u64) {
         let mut hints = take_hints(&mem, table);
         hints.sort_by_key(|hint| hint.low);
         for hint in hints {
+            if !hint_throttle.allow(hint, Instant::now()) {
+                SOURCE_HINTS_COALESCED.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             if let Some((path, size)) = files.get(hint.file) {
                 crate::remote::prefetch_data(path, *size, hint.offset, hint.length, hint.low);
             }

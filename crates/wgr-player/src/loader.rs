@@ -177,7 +177,7 @@ mod tests {
     fn parses_the_bundled_port_descriptor() {
         let port = Port::parse(PORT).unwrap();
         assert_eq!(port.format, "wgr.port.v1");
-        assert_eq!(port.assets.base, "https://fiveplay.lol/data/");
+        assert_eq!(port.assets.base, "https://v2.fiveplay.lol/data/");
         assert!(port.binary.url.starts_with("https://cdn.fiveplay.lol/"));
     }
 

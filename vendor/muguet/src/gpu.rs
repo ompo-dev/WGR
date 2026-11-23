@@ -121,6 +121,39 @@ const OCCLUSION_VISIBLE_COUNT: u64 = 65536;
 const BG_LIMIT: usize = 48000;
 static PERF_DIAGNOSTICS: LazyLock<bool> =
     LazyLock::new(|| std::env::var("MUGUET_PERF_DIAGNOSTICS").as_deref() == Ok("1"));
+// These diagnostics were previously checking the Windows process environment
+// on the critical path of *every* draw (often thousands per frame). Read each
+// switch once at GPU initialization; all are immutable after process start.
+static TEXTURE_DIAGNOSTICS: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some());
+static LIGHTING_TRACE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("MUGUET_DIAG_LIGHTING_TRACE").as_deref() == Ok("1"));
+static SKIPPED_DRAW_TRACE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("MUGUET_DIAG_SKIPPED_DRAWS").as_deref() == Ok("1"));
+static PED_PROBE: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("MUGUET_PED_PROBE").as_deref() == Ok("1") || *TEXTURE_DIAGNOSTICS
+});
+static PED_GBUFFER_PATH: LazyLock<Option<PathBuf>> =
+    LazyLock::new(|| std::env::var_os("MUGUET_PED_GBUFFER_DUMP_PATH").map(PathBuf::from));
+
+fn label_contains_ped(label: &str) -> bool {
+    label
+        .as_bytes()
+        .windows(3)
+        .any(|text| text.eq_ignore_ascii_case(b"ped"))
+}
+
+#[cfg(test)]
+mod hotpath_tests {
+    #[test]
+    fn ped_shader_classification_is_allocation_free_and_case_insensitive() {
+        assert!(super::label_contains_ped("ped::PS_DeferredPedTexturedC"));
+        assert!(super::label_contains_ped("PED::PS"));
+        assert!(super::label_contains_ped("blendPeDMaterials"));
+        assert!(!super::label_contains_ped("deferred_lighting::PS_Screen"));
+        assert!(!super::label_contains_ped("pe"));
+    }
+}
 static UNIFORM_CACHE_ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var("MUGUET_UNIFORM_CACHE").as_deref() != Ok("0"));
 static UNIFORM_CACHE_AB: LazyLock<bool> =
@@ -168,6 +201,10 @@ impl std::ops::DerefMut for OpcodeCounts {
 
 #[derive(Default)]
 struct PerfCounters {
+    readback_pool_hits: u64,
+    readback_pool_misses: u64,
+    readback_buffers: u64,
+    readback_textures: u64,
     frame_ms: f64,
     max_frame_ms: f64,
     frames: u64,
@@ -2001,6 +2038,9 @@ pub struct Gpu {
     pending_resolve: Vec<(u32, u32, Vec<u32>)>,
     pending_events: Vec<(u32, u32, u64)>,
     pending_maps: Vec<PendingMap>,
+    readback_pool: HashMap<u64, Vec<Buffer>>,
+    readback_pool_bytes: u64,
+    readback_pool_items: usize,
     counter_src: Option<Buffer>,
     counter_slot: u32,
     frame_slot_done: Vec<Option<SubmissionIndex>>,
@@ -2296,6 +2336,9 @@ impl Gpu {
             pending_resolve: Vec::new(),
             pending_events: Vec::new(),
             pending_maps: Vec::new(),
+            readback_pool: HashMap::new(),
+            readback_pool_bytes: 0,
+            readback_pool_items: 0,
             counter_src: None,
             counter_slot: 0,
             frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(),
@@ -3222,7 +3265,7 @@ impl Gpu {
         let (tex, a8, bc, half, astc, packed_unorm) =
             (t.tex.clone(), t.a8, t.bc, t.half, t.astc, t.packed_unorm);
         let small_format = t.format;
-        if std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some() && w <= 8 && h <= 8 && d == 1 {
+        if *TEXTURE_DIAGNOSTICS && w <= 8 && h <= 8 && d == 1 {
             let n = size.min(32).max(8);
             log_once(
                 &format!("small{id}"),
@@ -5509,9 +5552,7 @@ impl Gpu {
                             entries.push((b.binding, Res::View(v)));
                         }
                         None => {
-                            if stage == 1
-                                && prog.label.to_ascii_lowercase().contains("ped")
-                                && std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some()
+                            if *TEXTURE_DIAGNOSTICS && stage == 1 && label_contains_ped(&prog.label)
                             {
                                 let reason = if id == 0 {
                                     "SRV nao vinculado"
@@ -5661,10 +5702,17 @@ impl Gpu {
                 }
             }
         }
-        if stage == 1
-            && prog.label.to_ascii_lowercase().contains("ped")
+        // JSON-based texture tracing is diagnostic only. Running it in a
+        // normal session allocates buffers and grows a set every 600 frames.
+        if *PED_PROBE
+            && stage == 1
+            && label_contains_ped(&prog.label)
             && !self.ped_probes.contains(&(prog.uid, self.presents / 600))
         {
+            if self.ped_probes.len() > 256 {
+                let oldest = (self.presents / 600).saturating_sub(1);
+                self.ped_probes.retain(|(_, epoch)| *epoch >= oldest);
+            }
             self.ped_probes.insert((prog.uid, self.presents / 600));
             let mut textures = Vec::new();
             for b in bindings {
@@ -5800,16 +5848,16 @@ impl Gpu {
         } else {
             None
         };
-        let strides: Vec<u32> = (0..16)
-            .map(|i| {
-                let v = &self.s.vb[i];
-                if v.buf != 0 && self.buf(v.buf).map(|b| b.gpu.is_some()).unwrap_or(false) {
-                    v.stride
-                } else {
-                    0
-                }
-            })
-            .collect();
+        // A draw's sixteen vertex-stream strides have a fixed upper bound.
+        // Compute them on the stack instead of allocating a Vec per draw.
+        let strides: [u32; 16] = std::array::from_fn(|i| {
+            let v = &self.s.vb[i];
+            if v.buf != 0 && self.buf(v.buf).map(|b| b.gpu.is_some()).unwrap_or(false) {
+                v.stride
+            } else {
+                0
+            }
+        });
         let st = PipeStates {
             sig: self.vs_sig()?,
             rs: if self.s.rs != 0 {
@@ -5839,9 +5887,9 @@ impl Gpu {
         // once per exact pipeline state and with a bounded timeout.
         let wait_critical =
             critical_lighting_pipeline(&vs.label, ps.map(|program| program.label.as_str()))
-                && !matches!(self.pipelines.get(&key), Some(PipeEntry::Done(_)))
+                && !matches!(self.pipelines.get(key.as_slice()), Some(PipeEntry::Done(_)))
                 && self.lighting_waited.len() < 24
-                && self.lighting_waited.insert(key.clone());
+                && self.lighting_waited.insert(key.clone().into_vec());
         let wait_budget = if wait_critical {
             LIGHT_PIPELINE_WAIT
         } else {
@@ -5859,12 +5907,12 @@ impl Gpu {
             );
         }
         let _ = (vs_id, ps_id);
-        match self.pipelines.get(&key) {
+        match self.pipelines.get(key.as_slice()) {
             Some(PipeEntry::Done(p)) => return p.clone(),
             Some(PipeEntry::Pending) => {
                 let start = Instant::now();
                 let deadline = start + wait_budget;
-                while !matches!(self.pipelines.get(&key), Some(PipeEntry::Done(_))) {
+                while !matches!(self.pipelines.get(key.as_slice()), Some(PipeEntry::Done(_))) {
                     let Ok((done, pipeline)) = self
                         .pipe_results
                         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -5876,7 +5924,7 @@ impl Gpu {
                 if !wait_critical {
                     self.pipe_wait_left = self.pipe_wait_left.saturating_sub(start.elapsed());
                 }
-                if let Some(PipeEntry::Done(p)) = self.pipelines.get(&key) {
+                if let Some(PipeEntry::Done(p)) = self.pipelines.get(key.as_slice()) {
                     return p.clone();
                 }
                 self.pending_skips += 1;
@@ -5888,15 +5936,16 @@ impl Gpu {
         let Some((job, vb_req)) =
             self.create_pipeline(vs, ps, layout, &strides, topo, strip_fmt, &pi, &st)
         else {
-            self.pipelines.insert(key, PipeEntry::Done(None));
+            self.pipelines.insert(key.into_vec(), PipeEntry::Done(None));
             return None;
         };
         self.record_recipe(vs, ps, layout, &strides, strip_code, &st, &pi);
         if let Some(tx) = self.pipe_jobs.clone() {
             let id = self.uid();
             self.pipe_pending
-                .insert(id, (key.clone(), vb_req, job.label.clone()));
-            self.pipelines.insert(key.clone(), PipeEntry::Pending);
+                .insert(id, (key.clone().into_vec(), vb_req, job.label.clone()));
+            self.pipelines
+                .insert(key.clone().into_vec(), PipeEntry::Pending);
             let _ = tx.send((id, job));
             let start = Instant::now();
             let deadline = start + wait_budget;
@@ -5912,7 +5961,7 @@ impl Gpu {
             if !wait_critical {
                 self.pipe_wait_left = self.pipe_wait_left.saturating_sub(start.elapsed());
             }
-            if let Some(PipeEntry::Done(p)) = self.pipelines.get(&key) {
+            if let Some(PipeEntry::Done(p)) = self.pipelines.get(key.as_slice()) {
                 return p.clone();
             }
             self.pending_skips += 1;
@@ -5927,7 +5976,8 @@ impl Gpu {
                 label: job.label,
             })
         });
-        self.pipelines.insert(key, PipeEntry::Done(pl.clone()));
+        self.pipelines
+            .insert(key.into_vec(), PipeEntry::Done(pl.clone()));
         pl
     }
 
@@ -6223,6 +6273,12 @@ impl Gpu {
     }
 
     fn collect_pipelines(&mut self) {
+        // Most frames have no compiling pipelines. Avoid locking/polling the
+        // receiver thousands of times per frame after warmup is complete.
+        // Every compiler submission registers itself in pipe_pending first.
+        if self.pipe_pending.is_empty() {
+            return;
+        }
         while let Ok((id, pipeline)) = self.pipe_results.try_recv() {
             self.finish_pipeline(id, pipeline);
         }
@@ -6239,12 +6295,13 @@ impl Gpu {
         strip_code: i64,
         st: &PipeStates,
         pi: &PassInfo,
-    ) -> Vec<i64> {
-        let mut key: Vec<i64> = vec![
+    ) -> smallvec::SmallVec<[i64; 48]> {
+        let mut key = smallvec::SmallVec::<[i64; 48]>::new();
+        key.extend([
             vs.stable as i64,
             ps.map(|p| p.stable as i64).unwrap_or(0),
             layout.stable as i64,
-        ];
+        ]);
         for uid in std::iter::once(vs.uid).chain(ps.map(|p| p.uid)) {
             if let Some(m) = self.unfilt.get(&uid) {
                 key.extend([-9, m.0 as i64, (m.0 >> 64) as i64]);
@@ -6480,7 +6537,7 @@ impl Gpu {
             &st,
             &pi,
         );
-        if self.pipelines.contains_key(&key) {
+        if self.pipelines.contains_key(key.as_slice()) {
             return None;
         }
         let (job, vb_req) = self.create_pipeline(
@@ -6496,8 +6553,8 @@ impl Gpu {
         let tx = self.pipe_jobs.clone()?;
         let id = self.uid();
         self.pipe_pending
-            .insert(id, (key.clone(), vb_req, job.label.clone()));
-        self.pipelines.insert(key, PipeEntry::Pending);
+            .insert(id, (key.clone().into_vec(), vb_req, job.label.clone()));
+        self.pipelines.insert(key.into_vec(), PipeEntry::Pending);
         let _ = tx.send((id, job));
         Some(())
     }
@@ -6555,7 +6612,7 @@ impl Gpu {
                 query.skipped_draw = true;
             }
         }
-        if std::env::var("MUGUET_DIAG_SKIPPED_DRAWS").as_deref() == Ok("1") {
+        if *SKIPPED_DRAW_TRACE {
             let origin = std::panic::Location::caller();
             let labels = [self.s.shader[0], self.s.shader[1]]
                 .map(|id| match self.obj(id) {
@@ -6612,7 +6669,7 @@ impl Gpu {
         let vs_id = self.s.shader[0];
         let ps_id = self.s.shader[1];
         let Some(vs) = self.shader_program(vs_id) else {
-            if std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some() {
+            if *TEXTURE_DIAGNOSTICS {
                 log_once(
                     &format!("missing-vs-{vs_id}"),
                     &format!("draw skipped: VS {vs_id} not available"),
@@ -6625,7 +6682,7 @@ impl Gpu {
             match self.shader_program(ps_id) {
                 Some(p) => Some(p),
                 None => {
-                    if std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some() {
+                    if *TEXTURE_DIAGNOSTICS {
                         log_once(
                             &format!("missing-ps-{ps_id}"),
                             &format!("draw skipped: PS {ps_id} not available (VS {})", vs.label),
@@ -6715,8 +6772,8 @@ impl Gpu {
         };
         let ped_label = ps
             .as_ref()
-            .filter(|p| p.label.to_ascii_lowercase().contains("ped"));
-        if std::env::var("MUGUET_DIAG_LIGHTING_TRACE").as_deref() == Ok("1") {
+            .filter(|p| *TEXTURE_DIAGNOSTICS && label_contains_ped(&p.label));
+        if *LIGHTING_TRACE {
             if let Some(light) = ps.as_ref().filter(|p| {
                 p.label.starts_with("deferred_lighting")
                     || p.label.starts_with("tiled_lighting")
@@ -6737,7 +6794,7 @@ impl Gpu {
                 );
             }
         }
-        if std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some() {
+        if *TEXTURE_DIAGNOSTICS {
             if let Some(ped) = ped_label {
                 log_once(
                     &format!("ped-draw-{}", ped.uid),
@@ -6759,11 +6816,9 @@ impl Gpu {
             self.skip();
             return;
         }
-        if let (true, Some(ped), Some(pi)) = (
-            std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some(),
-            ped_label,
-            self.pass_info.as_ref(),
-        ) {
+        if let (true, Some(ped), Some(pi)) =
+            (*TEXTURE_DIAGNOSTICS, ped_label, self.pass_info.as_ref())
+        {
             let blend = self.state(self.s.blend.0);
             let targets = pi
                 .rt_formats
@@ -6789,7 +6844,7 @@ impl Gpu {
             pl
         };
         let Some(pl) = pl else {
-            if std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some() {
+            if *TEXTURE_DIAGNOSTICS {
                 if let Some(ped) = ped_label {
                     log_once(
                         &format!("ped-no-pipeline-{}", ped.uid),
@@ -6840,7 +6895,10 @@ impl Gpu {
         let v_first = if indexed || fold_v { 0 } else { start };
         let i_first = if fold_i { 0 } else { start_instance };
 
-        let mut vb_binds: Vec<(u32, Buffer, u64, u64)> = Vec::new();
+        // Binding a handful of vertex streams should not allocate a Vec on
+        // every draw; SmallVec spills only for unusually large layouts.
+        let mut vb_binds: smallvec::SmallVec<[(u32, Buffer, u64, u64); 8]> =
+            smallvec::SmallVec::new();
         for &(slot, cls) in &layout.slots {
             let vb = self.s.vb[slot as usize].clone();
             match self
@@ -6922,7 +6980,13 @@ impl Gpu {
                 self.use_buf(ibid);
             }
         }
-        let pi = self.pass_info.clone().unwrap();
+        // Avoid cloning PassInfo's attachment Vec for every draw when only
+        // the two dimensions are needed for a scissor rectangle.
+        let (pass_width, pass_height) = self
+            .pass_info
+            .as_ref()
+            .map(|pi| (pi.width, pi.height))
+            .unwrap();
         let rs_scissor = self.s.rs != 0
             && self
                 .state(self.s.rs)
@@ -6930,13 +6994,13 @@ impl Gpu {
                 .unwrap_or(false);
         let scissor = if rs_scissor && !self.s.scissors.is_empty() {
             let c = self.s.scissors[0];
-            let x0 = pi.width.min(c[0]);
-            let y0 = pi.height.min(c[1]);
-            let x1 = pi.width.min(x0.max(c[2]));
-            let y1 = pi.height.min(y0.max(c[3]));
+            let x0 = pass_width.min(c[0]);
+            let y0 = pass_height.min(c[1]);
+            let x1 = pass_width.min(x0.max(c[2]));
+            let y1 = pass_height.min(y0.max(c[3]));
             [x0, y0, x1 - x0, y1 - y0]
         } else {
-            [0, 0, pi.width, pi.height]
+            [0, 0, pass_width, pass_height]
         };
         let viewport = self.s.viewports.first().copied();
         let bf = self.s.blend.1;
@@ -7083,7 +7147,7 @@ impl Gpu {
         // One-shot, opt-in G-buffer readback after a real ped draw. Unlike a
         // screenshot of the final swapchain, this reveals whether the
         // deferred material's RT0 contains the debug albedo before lighting.
-        let gbuffer_dump = std::env::var_os("MUGUET_PED_GBUFFER_DUMP_PATH");
+        let gbuffer_dump = PED_GBUFFER_PATH.as_ref();
         if self.presents >= *PED_GBUFFER_DUMP_AFTER_PRESENTS
             && crate::bridge::world_ready()
             && ps
@@ -7092,7 +7156,7 @@ impl Gpu {
             && gbuffer_dump.is_some()
             && !PED_GBUFFER_DUMPED.swap(true, Ordering::SeqCst)
         {
-            let path = PathBuf::from(gbuffer_dump.unwrap());
+            let path = gbuffer_dump.unwrap().clone();
             for slot in 0..4 {
                 let rt = self.s.rt[slot].clone();
                 if rt.tex == 0 {
@@ -7219,8 +7283,7 @@ impl Gpu {
             self.skipped += 1;
             return;
         };
-        if std::env::var("MUGUET_DIAG_LIGHTING_TRACE").as_deref() == Ok("1")
-            && (prog.label.contains("lighting") || prog.label.contains("Luminance"))
+        if *LIGHTING_TRACE && (prog.label.contains("lighting") || prog.label.contains("Luminance"))
         {
             log_once(
                 &format!("compute-light-trace-{}", prog.uid),
@@ -8383,6 +8446,46 @@ impl Gpu {
         self.mark_color_dirty(res);
     }
 
+    /// Reuse *unmapped* staging buffers only. Mapped or in-flight buffers stay
+    /// owned by PendingMap until the GPU has finished and the guest has been
+    /// notified, so no two readbacks can alias the same destination.
+    fn staging_readback(&mut self, size: u64) -> Buffer {
+        if let Some(buf) = self.readback_pool.get_mut(&size).and_then(Vec::pop) {
+            if self.readback_pool.get(&size).is_some_and(Vec::is_empty) {
+                self.readback_pool.remove(&size);
+            }
+            self.readback_pool_bytes -= size;
+            self.readback_pool_items -= 1;
+            if *PERF_DIAGNOSTICS {
+                self.perf.readback_pool_hits += 1;
+            }
+            return buf;
+        }
+        if *PERF_DIAGNOSTICS {
+            self.perf.readback_pool_misses += 1;
+        }
+        self.device.create_buffer(&BufferDescriptor {
+            label: Some("pooled readback"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn recycle_staging_readback(&mut self, buf: Buffer) {
+        let size = buf.size();
+        // Bounded retained memory. Large screenshot/video copies are never
+        // retained and normal small queries reuse the same exact-size buffer.
+        if size <= 1 << 20
+            && self.readback_pool_items < 48
+            && self.readback_pool_bytes.saturating_add(size) <= 8 << 20
+        {
+            self.readback_pool.entry(size).or_default().push(buf);
+            self.readback_pool_bytes += size;
+            self.readback_pool_items += 1;
+        }
+    }
+
     fn readback(&mut self, p: u64) {
         let mb = self.base;
         let u = move |w: u64| unsafe {
@@ -8413,18 +8516,16 @@ impl Gpu {
                 done(self);
                 return;
             };
+            if *PERF_DIAGNOSTICS {
+                self.perf.readback_buffers += 1;
+            }
             let n = if has_box {
                 (r - l) as u64
             } else {
                 size.min(bsize)
             };
             let padded = ((n + 3) & !3).max(4);
-            let rb = self.device.create_buffer(&BufferDescriptor {
-                label: Some("readback"),
-                size: padded,
-                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
+            let rb = self.staging_readback(padded);
             self.end_pass();
             let from = if has_box { l as u64 } else { 0 };
             let copy = padded.min(g.size().saturating_sub(from)) & !3;
@@ -8471,6 +8572,9 @@ impl Gpu {
             done(self);
             return;
         }
+        if *PERF_DIAGNOSTICS {
+            self.perf.readback_textures += 1;
+        }
         let (mip, layer) = Self::sub_of(&desc, sub);
         let (mw, mh) = ((desc.w >> mip).max(1), (desc.h >> mip).max(1));
         let three = desc.dim == TextureDimension::D3;
@@ -8487,12 +8591,7 @@ impl Gpu {
         let row_bytes = (bx * bytes) as u64;
         let bpr = row_bytes.div_ceil(256) * 256;
         let rb_size = bpr * by as u64 * d as u64;
-        let rb = self.device.create_buffer(&BufferDescriptor {
-            label: Some("readback"),
-            size: rb_size.max(4),
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let rb = self.staging_readback(rb_size.max(4));
         self.end_pass();
         self.encoder().copy_texture_to_buffer(
             TexelCopyTextureInfo {
@@ -8642,11 +8741,15 @@ impl Gpu {
                 }
             }
             pm.buf.unmap();
+            let recycled = matches!(&pm.kind, MapKind::Readback { .. });
             if let MapKind::Readback { flag, .. } = pm.kind {
                 if flag != 0 {
                     atomic(&self.mem, flag).store(0, Ordering::SeqCst);
                     let _ = self.mem.atomic_notify(flag, u32::MAX);
                 }
+            }
+            if recycled {
+                self.recycle_staging_readback(pm.buf);
             }
         }
     }
@@ -9147,7 +9250,7 @@ impl Gpu {
                     self.uniform_cache_on
                 ));
                 log(&format!(
-                    "perf-ops: draws={} draw_ms/frame={:.2} readbacks={} readback_ms/frame={:.2} dispatch_ms/frame={:.2} buffer_upload_ms/frame={:.2} texture_upload_ms/frame={:.2} idle_wait_ms/frame={:.2}",
+                    "perf-ops: draws={} draw_ms/frame={:.2} readbacks={} readback_ms/frame={:.2} dispatch_ms/frame={:.2} buffer_upload_ms/frame={:.2} texture_upload_ms/frame={:.2} idle_wait_ms/frame={:.2} readback_pool_hits={} readback_pool_misses={} buffer_readbacks={} texture_readbacks={}",
                     self.perf.opcode_calls[32],
                     self.perf.opcode_ns[32] as f64 / 1_000_000.0 / n,
                     self.perf.opcode_calls[42],
@@ -9155,7 +9258,11 @@ impl Gpu {
                     self.perf.opcode_ns[39] as f64 / 1_000_000.0 / n,
                     (self.perf.opcode_ns[12] + self.perf.opcode_ns[47]) as f64 / 1_000_000.0 / n,
                     self.perf.opcode_ns[13] as f64 / 1_000_000.0 / n,
-                    self.perf.idle_wait_ns as f64 / 1_000_000.0 / n
+                    self.perf.idle_wait_ns as f64 / 1_000_000.0 / n,
+                    self.perf.readback_pool_hits,
+                    self.perf.readback_pool_misses,
+                    self.perf.readback_buffers,
+                    self.perf.readback_textures,
                 ));
                 self.perf = PerfCounters::default();
             }
@@ -9169,7 +9276,7 @@ impl Gpu {
                     *FORCE_OCCLUSION_VISIBLE
                 ));
             }
-            if std::env::var_os("MUGUET_TEXTURE_DIAGNOSTICS").is_some() {
+            if *TEXTURE_DIAGNOSTICS {
                 log(&format!(
                     "unorm16 fallback counters: textures={} gpu_bc1_copies={} eager_clears={}",
                     PACKED_UNORM_TEXTURES.load(Ordering::Relaxed),

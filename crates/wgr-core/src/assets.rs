@@ -63,7 +63,25 @@ impl DiskCache {
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         // Evictable downloads only: WAL/NORMAL avoids a disk flush on every LRU
         // touch. A power loss may discard recent cache entries, never saves.
-        db.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;PRAGMA journal_size_limit=8388608;CREATE TABLE IF NOT EXISTS objects(hash TEXT PRIMARY KEY,size INTEGER NOT NULL,last_access INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS refs(key TEXT PRIMARY KEY,hash TEXT NOT NULL);CREATE INDEX IF NOT EXISTS cache_lru ON objects(last_access);")?;
+        db.execute_batch("PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            PRAGMA journal_size_limit=8388608;
+            CREATE TABLE IF NOT EXISTS objects(hash TEXT PRIMARY KEY,size INTEGER NOT NULL,last_access INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS refs(key TEXT PRIMARY KEY,hash TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS cache_lru ON objects(last_access);
+            -- This total is read for every downloaded 128-KiB asset block.
+            -- Computing SUM(size) over thousands of files per INSERT made
+            -- the entire 32-lane streaming queue serialize on disk writes.
+            -- Seed older caches once and maintain the total transactionally.
+            CREATE TABLE IF NOT EXISTS cache_totals(id INTEGER PRIMARY KEY CHECK(id=1),bytes INTEGER NOT NULL);
+            INSERT OR IGNORE INTO cache_totals(id,bytes)
+                SELECT 1,COALESCE(SUM(size),0) FROM objects;
+            CREATE TRIGGER IF NOT EXISTS cache_objects_insert AFTER INSERT ON objects
+                BEGIN UPDATE cache_totals SET bytes=bytes+NEW.size WHERE id=1; END;
+            CREATE TRIGGER IF NOT EXISTS cache_objects_delete AFTER DELETE ON objects
+                BEGIN UPDATE cache_totals SET bytes=bytes-OLD.size WHERE id=1; END;
+            CREATE TRIGGER IF NOT EXISTS cache_objects_size AFTER UPDATE OF size ON objects
+                BEGIN UPDATE cache_totals SET bytes=bytes+NEW.size-OLD.size WHERE id=1; END;")?;
         Ok(Self {
             root,
             db: Mutex::new(db),
@@ -95,8 +113,23 @@ impl DiskCache {
     }
     /// Bounded, verified bytes in one file pass; callers need no path pin.
     pub fn read(&self, key: &str, limit: usize) -> Result<Option<Vec<u8>>> {
-        self.lookup(key, false, |path, hash| {
-            let file = match File::open(path) {
+        // The original shared SQLite lock covered disk I/O and SHA-256 of
+        // the entire 128-KiB object. During gameplay dozens of parallel
+        // readers therefore queued on *one* file read/hash. Look up a stable
+        // content-addressed hash first; verify bytes outside the DB lock;
+        // then revalidate the key before touching the LRU timestamp.
+        let hash: Option<String> = {
+            let db = self
+                .db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Cache ocupado"))?;
+            db.query_row("SELECT hash FROM refs WHERE key=?1", [key], |r| r.get(0))
+                .optional()?
+        };
+        let Some(hash) = hash else { return Ok(None) };
+        let path = self.path(&hash)?;
+        let bytes = (|| -> Result<Option<Vec<u8>>> {
+            let file = match File::open(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error.into()),
@@ -113,7 +146,37 @@ impl DiskCache {
                 "Objeto de cache excede o limite de leitura"
             );
             Ok((sha256(&bytes) == hash).then_some(bytes))
-        })
+        })()?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Cache ocupado"))?;
+        let current: Option<String> = db
+            .query_row("SELECT hash FROM refs WHERE key=?1", [key], |r| r.get(0))
+            .optional()?;
+        if current.as_deref() != Some(hash.as_str()) {
+            // A writer/evictor changed the mapping while the file was being
+            // verified. Do not overwrite its new mapping or return old bytes.
+            return Ok(None);
+        }
+        if let Some(bytes) = bytes {
+            db.execute(
+                "UPDATE objects SET last_access=?1 WHERE hash=?2 AND last_access<>?1",
+                params![crate::domain::now(), hash],
+            )?;
+            return Ok(Some(bytes));
+        }
+        // A parallel writer may have replaced the damaged/missing file just
+        // before we acquired the lock; never delete its repaired contents.
+        if path.is_file() && file_hash(&path).is_ok_and(|valid| valid == hash) {
+            return Ok(None);
+        }
+        db.execute("DELETE FROM refs WHERE hash=?1", [&hash])?;
+        db.execute("DELETE FROM objects WHERE hash=?1", [&hash])?;
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        Ok(None)
     }
     fn lookup<T>(
         &self,
@@ -162,6 +225,127 @@ impl DiskCache {
             }
         }
     }
+
+    /// Stores a *bounded* HTTP range (up to 8 blocks of 128 KiB) as one
+    /// SQLite transaction, instead of serializing one transaction per block.
+    /// Each object remains content-addressed and SHA-256 verified on reads.
+    /// Existing single-object writers and the cache's pin/eviction policy
+    /// continue to operate on the same schema.
+    pub fn put_batch(&self, entries: &[(String, &[u8])]) -> Result<()> {
+        ensure!(entries.len() <= 64, "Lote de cache excessivo");
+        if entries.is_empty() {
+            return Ok(());
+        }
+        ensure!(
+            entries.iter().all(|(_, bytes)| bytes.len() <= 128 << 10),
+            "Bloco de cache maior que 128 KiB"
+        );
+        struct Prepared<'a> {
+            key: &'a str,
+            hash: String,
+            size: u64,
+            temporary: PathBuf,
+        }
+        let mut items = Vec::with_capacity(entries.len());
+        let result: Result<()> = (|| {
+            for (key, bytes) in entries {
+                let size = bytes.len() as u64;
+                ensure!(size <= self.limit, "Bloco excede o limite do cache");
+                let temporary = self.temporary();
+                fs::write(&temporary, bytes)?;
+                items.push(Prepared {
+                    key,
+                    hash: sha256(bytes),
+                    size,
+                    temporary,
+                });
+            }
+            let mut db = self
+                .db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Cache ocupado"))?;
+            let mut pinned = self
+                .pinned
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Cache ocupado"))?;
+            let mut used: u64 =
+                db.query_row("SELECT bytes FROM cache_totals WHERE id=1", [], |row| {
+                    row.get(0)
+                })?;
+            let mut requested = HashSet::<String>::new();
+            let mut needed = 0u64;
+            for item in &items {
+                if !requested.insert(item.hash.clone()) {
+                    continue;
+                }
+                let present: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM objects WHERE hash=?1)",
+                    [&item.hash],
+                    |row| row.get(0),
+                )?;
+                if !present {
+                    needed = needed.saturating_add(item.size);
+                }
+            }
+            ensure!(needed <= self.limit, "Lote excede orçamento do cache");
+            if used.saturating_add(needed) > self.limit {
+                let candidates = db
+                    .prepare("SELECT hash,size FROM objects ORDER BY last_access,hash")?
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                for (hash, size) in candidates {
+                    if used.saturating_add(needed) <= self.limit {
+                        break;
+                    }
+                    if pinned.contains(&hash) || requested.contains(&hash) {
+                        continue;
+                    }
+                    let path = self.path(&hash)?;
+                    if path.exists() {
+                        fs::remove_file(path)?;
+                    }
+                    db.execute("DELETE FROM refs WHERE hash=?1", [&hash])?;
+                    db.execute("DELETE FROM objects WHERE hash=?1", [&hash])?;
+                    used = used.saturating_sub(size);
+                }
+                ensure!(
+                    used.saturating_add(needed) <= self.limit,
+                    "Cache em uso pela sessão; não há espaço para este lote"
+                );
+            }
+            let tx = db.transaction()?;
+            let now = crate::domain::now();
+            for item in &items {
+                let destination = self.path(&item.hash)?;
+                fs::create_dir_all(destination.parent().context("Cache sem diretório")?)?;
+                if destination.exists() && file_hash(&destination)? != item.hash {
+                    fs::remove_file(&destination)?;
+                }
+                if !destination.exists() {
+                    fs::rename(&item.temporary, &destination)?;
+                }
+                tx.execute(
+                    "INSERT INTO objects(hash,size,last_access) VALUES(?1,?2,?3) ON CONFLICT(hash) DO UPDATE SET last_access=excluded.last_access",
+                    params![item.hash,item.size,now],
+                )?;
+                tx.execute(
+                    "INSERT INTO refs(key,hash) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET hash=excluded.hash",
+                    params![item.key,item.hash],
+                )?;
+            }
+            tx.commit()?;
+            pinned.extend(requested);
+            Ok(())
+        })();
+        // On success, all staging files were moved or replaced by an existing
+        // content-addressed object. On failure remove only our own staging.
+        for item in &items {
+            let _ = fs::remove_file(&item.temporary);
+        }
+        result
+    }
     pub fn promote(&self, key: &str, temporary: &Path) -> Result<PathBuf> {
         ensure!(
             temporary.parent() == Some(self.root.join("staging").as_path()),
@@ -187,7 +371,7 @@ impl DiskCache {
             .pinned
             .lock()
             .map_err(|_| anyhow::anyhow!("Cache ocupado"))?;
-        let mut used: u64 = db.query_row("SELECT COALESCE(SUM(size),0) FROM objects", [], |r| {
+        let mut used: u64 = db.query_row("SELECT bytes FROM cache_totals WHERE id=1", [], |r| {
             r.get(0)
         })?;
         if !exists && used.saturating_add(size) > self.limit {
@@ -246,7 +430,7 @@ impl DiskCache {
             .lock()
             .map_err(|_| anyhow::anyhow!("Cache ocupado"))?;
         let (bytes, objects) = db.query_row(
-            "SELECT COALESCE(SUM(size),0),count(*) FROM objects",
+            "SELECT (SELECT bytes FROM cache_totals WHERE id=1), count(*) FROM objects",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -441,6 +625,114 @@ pub fn import_zip(zip_path: &Path, bundles: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn concurrent_verified_readers_and_batch_writers_keep_cache_consistent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cache = std::sync::Arc::new(DiskCache::open(temp.path().into(), 16 << 20)?);
+        let contents: Vec<u8> = (0..128 << 10).map(|i| (i % 251) as u8).collect();
+        cache.put("constant", &contents)?;
+        cache.unpin_all();
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                let cache = cache.clone();
+                let expected = &contents;
+                scope.spawn(move || {
+                    for _ in 0..30 {
+                        assert_eq!(
+                            cache.read("constant", 128 << 10).unwrap().as_deref(),
+                            Some(expected.as_slice())
+                        );
+                    }
+                });
+            }
+            let cache = cache.clone();
+            scope.spawn(move || {
+                for number in 0..30 {
+                    let key = format!("other-{number}");
+                    let block = vec![number as u8; 256];
+                    cache.put_batch(&[(key, block.as_slice())]).unwrap();
+                    cache.unpin_all();
+                }
+            });
+        });
+        assert_eq!(cache.read("constant", 128 << 10)?, Some(contents));
+        assert!(cache.stats()?.bytes <= cache.stats()?.limit);
+        Ok(())
+    }
+    #[test]
+    fn bounded_cache_range_batch_is_atomic_for_refs_and_quota() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cache = DiskCache::open(temp.path().into(), 12)?;
+        cache.put_batch(&[
+            ("a".into(), b"abcd"),
+            ("b".into(), b"efgh"),
+            ("c".into(), b"abcd"),
+        ])?;
+        assert_eq!(cache.stats()?.objects, 2, "identical chunks share a hash");
+        assert_eq!(cache.stats()?.bytes, 8);
+        assert_eq!(cache.read("c", 8)?.as_deref(), Some(&b"abcd"[..]));
+        assert!(cache.put_batch(&[("too-big".into(), &[0; 13])]).is_err());
+        assert_eq!(cache.stats()?.bytes, 8);
+        assert!(
+            cache.put_batch(&[("d".into(), b"ijklmn")]).is_err(),
+            "pinned batch cannot exceed quota"
+        );
+        assert_eq!(cache.stats()?.bytes, 8);
+        cache.unpin_all();
+        cache.put_batch(&[("d".into(), b"ijklmn")])?;
+        assert!(cache.stats()?.bytes <= 12);
+        assert_eq!(cache.read("d", 12)?.as_deref(), Some(&b"ijklmn"[..]));
+        cache.unpin_all();
+        cache.put_batch(&[("d".into(), b"ijklmn")])?;
+        assert_eq!(
+            cache.stats()?.bytes,
+            10,
+            "reusing a hash cannot double-account bytes"
+        );
+        Ok(())
+    }
+    #[test]
+    fn cache_total_migrates_and_tracks_evictions_and_corruption() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        // Model a database created by a previous WGR version.
+        {
+            let db = Connection::open(temp.path().join("cache.sqlite"))?;
+            db.execute_batch("CREATE TABLE objects(hash TEXT PRIMARY KEY,size INTEGER NOT NULL,last_access INTEGER NOT NULL);
+                CREATE TABLE refs(key TEXT PRIMARY KEY,hash TEXT NOT NULL);")?;
+        }
+        let cache = DiskCache::open(temp.path().into(), 12)?;
+        cache.put("first", b"aaaa")?;
+        cache.put("second", b"bbbb")?;
+        assert_eq!(cache.stats()?.bytes, 8);
+        cache.unpin_all();
+        cache.put("third", b"cccccccccccc")?;
+        assert_eq!(cache.stats()?.bytes, 12);
+        assert_eq!(cache.stats()?.objects, 1);
+        assert_eq!(cache.read("third", 12)?, Some(b"cccccccccccc".to_vec()));
+        drop(cache);
+        let cache = DiskCache::open(temp.path().into(), 12)?;
+        assert_eq!(
+            cache.stats()?.bytes,
+            12,
+            "reopening must preserve the total"
+        );
+        cache.unpin_all();
+        let path = cache.get("third")?.context("cached object")?;
+        cache.unpin_all();
+        fs::write(path, b"corrupt")?;
+        assert_eq!(cache.read("third", 12)?, None);
+        assert_eq!(
+            cache.stats()?.bytes,
+            0,
+            "corrupt deletions update the total"
+        );
+        cache.put("last", b"ok")?;
+        cache.unpin_all();
+        assert_eq!(cache.stats()?.bytes, 2);
+        cache.clear()?;
+        assert_eq!(cache.stats()?.bytes, 0);
+        Ok(())
+    }
     #[test]
     fn corrupt_cache_hashes_are_rejected_without_poisoning_the_cache() -> Result<()> {
         let temp = tempfile::tempdir()?;

@@ -1,16 +1,17 @@
 //! WGR's bounded native asset transport. No HTML, JavaScript, or browser runtime.
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use wgr_core::assets::{sha256, DiskCache};
 use wgr_core::security::{rooted_file, safe_relative, HttpClient, NetworkPolicy};
 
 const DISK_BUDGET: u64 = 6 << 30;
 const MIN_DISK_BUDGET: u64 = 2 << 30;
 const FREE_DISK_RESERVE: u64 = 12 << 30;
-const HOT_BUDGET: usize = 48 << 20;
+const DEFAULT_HOT_BUDGET_MIB: usize = 128;
+const MAX_HOT_BUDGET_MIB: usize = 256;
 const BLOCK: u64 = 128 << 10;
 const FETCH_WINDOW: u64 = 1 << 20;
 const BOOT_PREFETCH_BUDGET: u64 = 64 << 20;
@@ -42,6 +43,15 @@ const HEADER_PREFETCH_WORKERS: usize = 2;
 const MAX_HIGH_HINTS: usize = 16;
 const MAX_LOW_HINTS: usize = 1;
 const HINT_RECENT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn hot_budget() -> usize {
+    std::env::var("WGR_ASSET_HOT_CACHE_MIB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|value| (48..=MAX_HOT_BUDGET_MIB).contains(value))
+        .unwrap_or(DEFAULT_HOT_BUDGET_MIB)
+        << 20
+}
 
 /// The browser loader sends its I/O worker origin + /data/.
 /// The v2 dataset differs from the old fiveplay.lol dataset. Never reuse
@@ -386,9 +396,29 @@ mod tests {
         assert!(allow_hint(false, 30, 0, 0));
         assert!(allow_hint(false, 30, MAX_HIGH_HINTS - 1, 0));
         assert!(!allow_hint(false, 30, MAX_HIGH_HINTS, 0));
-        assert!(!allow_hint(true, 4, 0, 0));
+        assert!(!allow_hint(true, 12, 0, 0));
+        assert!(allow_hint(true, 11, 0, 0));
         assert!(!allow_hint(true, 0, 0, MAX_LOW_HINTS));
         assert!(allow_hint(true, 0, 0, 0));
+    }
+
+    #[test]
+    fn memory_cache_evicts_oldest_bytes_without_eviction_scans() {
+        let mut cache = Hot::new(6);
+        for (key, byte) in [("a", 1), ("b", 2), ("c", 3)] {
+            cache.insert(key.into(), Arc::new(vec![byte; 2]));
+        }
+        assert_eq!(&cache.get("a").unwrap()[..], &[1, 1]);
+        cache.insert("d".into(), Arc::new(vec![4; 2]));
+        assert!(cache.get("b").is_none(), "b is the least recently used");
+        assert_eq!(cache.bytes, 6);
+        assert_eq!(cache.oldest.len(), cache.entries.len());
+        cache.insert("a".into(), Arc::new(vec![8; 3]));
+        assert_eq!(&cache.get("a").unwrap()[..], &[8, 8, 8]);
+        assert!(cache.bytes <= 6);
+        assert_eq!(cache.oldest.len(), cache.entries.len());
+        cache.insert("oversize".into(), Arc::new(vec![0; 7]));
+        assert!(cache.get("oversize").is_none());
     }
 
     #[test]
@@ -426,9 +456,34 @@ static HINTS_HIGH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 static HINTS_LOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HINTS_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HINTS_DUPLICATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DISK_LOOKUP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DISK_STORE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NETWORK_FETCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn metrics() -> Value {
     use std::sync::atomic::Ordering::Relaxed;
-    serde_json::json!({"hot_hits":HOT_HITS.load(Relaxed),"disk_hits":DISK_HITS.load(Relaxed),"transport_fetches":FETCHES.load(Relaxed),"decoded_asset_bytes":DECODED_BYTES.load(Relaxed),"hints_queued":HINTS_QUEUED.load(Relaxed),"hints_completed":HINTS_DONE.load(Relaxed),"hints_high":HINTS_HIGH.load(Relaxed),"hints_low":HINTS_LOW.load(Relaxed),"hints_deferred":HINTS_DEFERRED.load(Relaxed),"hints_duplicate":HINTS_DUPLICATE.load(Relaxed),"live_io_active":LIVE_IO_ACTIVE.load(Relaxed)})
+    let (hot_bytes, hot_entries, hot_capacity_bytes) = ASSETS
+        .get()
+        .and_then(|assets| assets.hot.lock().ok())
+        .map(|hot| (hot.bytes, hot.entries.len(), hot.budget))
+        .unwrap_or((0, 0, 0));
+    let (dns_lookups, dns_cache_hits) = ASSETS
+        .get()
+        .map(|assets| assets.http.dns_cache_stats())
+        .unwrap_or((0, 0));
+    serde_json::json!({
+        "hot_hits":HOT_HITS.load(Relaxed),"disk_hits":DISK_HITS.load(Relaxed),
+        "transport_fetches":FETCHES.load(Relaxed),"decoded_asset_bytes":DECODED_BYTES.load(Relaxed),
+        "hints_queued":HINTS_QUEUED.load(Relaxed),"hints_completed":HINTS_DONE.load(Relaxed),
+        "hints_high":HINTS_HIGH.load(Relaxed),"hints_low":HINTS_LOW.load(Relaxed),
+        "hints_deferred":HINTS_DEFERRED.load(Relaxed),"hints_duplicate":HINTS_DUPLICATE.load(Relaxed),
+        "hints_source_coalesced":crate::io::source_hints_coalesced(),
+        "live_io_active":LIVE_IO_ACTIVE.load(Relaxed),"hot_cache_bytes":hot_bytes,
+        "hot_cache_entries":hot_entries,"hot_cache_capacity_bytes":hot_capacity_bytes,
+        "disk_lookup_ms":DISK_LOOKUP_NS.load(Relaxed)/1_000_000,
+        "disk_store_ms":DISK_STORE_NS.load(Relaxed)/1_000_000,
+        "network_fetch_ms":NETWORK_FETCH_NS.load(Relaxed)/1_000_000,
+        "dns_lookups":dns_lookups,"dns_cache_hits":dns_cache_hits,
+    })
 }
 
 struct LiveRead;
@@ -446,7 +501,9 @@ impl Drop for LiveRead {
 
 fn allow_hint(low: bool, active: usize, pending: usize, low_pending: usize) -> bool {
     if low {
-        active == 0 && pending < MAX_HIGH_HINTS && low_pending < MAX_LOW_HINTS
+        // Speculative streaming is useful before the player moves. Reserve
+        // at least twenty live I/O lanes and permit just one low hint at once.
+        active < 12 && pending < MAX_HIGH_HINTS && low_pending < MAX_LOW_HINTS
     } else {
         pending < MAX_HIGH_HINTS
     }
@@ -456,14 +513,64 @@ fn hint_recently_satisfied(since: Option<&std::time::Instant>, now: std::time::I
     since.is_some_and(|last| now.saturating_duration_since(*last) < HINT_RECENT_TTL)
 }
 struct Hot {
-    entries: HashMap<String, (Arc<Vec<u8>>, u64)>,
+    entries: HashMap<Arc<str>, (Arc<Vec<u8>>, u64)>,
+    oldest: BTreeMap<u64, Arc<str>>,
     bytes: usize,
     clock: u64,
+    budget: usize,
+}
+impl Hot {
+    fn new(budget: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            oldest: BTreeMap::new(),
+            bytes: 0,
+            clock: 0,
+            budget,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Arc<Vec<u8>>> {
+        let (owned_key, data, old_age) = self
+            .entries
+            .get_key_value(key)
+            .map(|(owned_key, (data, age))| (owned_key.clone(), data.clone(), *age))?;
+        self.oldest.remove(&old_age);
+        self.clock = self.clock.saturating_add(1);
+        if let Some((_, age)) = self.entries.get_mut(key) {
+            *age = self.clock;
+        }
+        self.oldest.insert(self.clock, owned_key);
+        Some(data)
+    }
+
+    fn insert(&mut self, key: String, data: Arc<Vec<u8>>) {
+        if data.len() > self.budget {
+            return;
+        }
+        if let Some((old, age)) = self.entries.remove(key.as_str()) {
+            self.bytes -= old.len();
+            self.oldest.remove(&age);
+        }
+        while self.bytes + data.len() > self.budget {
+            let Some((_, victim)) = self.oldest.pop_first() else {
+                break;
+            };
+            if let Some((old, _)) = self.entries.remove(victim.as_ref()) {
+                self.bytes -= old.len();
+            }
+        }
+        self.clock = self.clock.saturating_add(1);
+        self.bytes += data.len();
+        let key: Arc<str> = key.into();
+        self.oldest.insert(self.clock, key.clone());
+        self.entries.insert(key, (data, self.clock));
+    }
 }
 struct Assets {
     runtime: tokio::runtime::Runtime,
     http: HttpClient,
-    cache: Mutex<DiskCache>,
+    cache: RwLock<DiskCache>,
     cache_root: PathBuf,
     hot: Mutex<Hot>,
     locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
@@ -517,7 +624,8 @@ pub fn prepare(support: &Path) -> Result<Option<PathBuf>> {
             "https://v2.fiveplay.lol".into(),
         ],
         development_loopback: false,
-    });
+    })
+    .with_dns_pin_ttl(std::time::Duration::from_secs(30));
     let data_base = descriptor["assets"]["base"]
         .as_str()
         .context("Origem dos dados ausente")?
@@ -573,16 +681,12 @@ pub fn prepare(support: &Path) -> Result<Option<PathBuf>> {
     let assets = Arc::new(Assets {
         runtime,
         http,
-        cache: Mutex::new(DiskCache::open(
+        cache: RwLock::new(DiskCache::open(
             cache_root.clone(),
             safe_cache_budget(support),
         )?),
         cache_root,
-        hot: Mutex::new(Hot {
-            entries: HashMap::new(),
-            bytes: 0,
-            clock: 0,
-        }),
+        hot: Mutex::new(Hot::new(hot_budget())),
         locks: Mutex::new(HashMap::new()),
         prefetching: Mutex::new(HashSet::new()),
         hinting: Mutex::new(HashMap::new()),
@@ -640,7 +744,7 @@ pub fn configure_budget(support: &Path, wasm: &Path) -> Result<()> {
         .checked_sub(overhead)
         .filter(|n| *n >= 128 << 20)
         .context("Código compilado excede o orçamento disponível de cache")?;
-    *assets.cache.lock().unwrap() = DiskCache::open(assets.cache_root.clone(), budget)?;
+    *assets.cache.write().unwrap() = DiskCache::open(assets.cache_root.clone(), budget)?;
     eprintln!(
         "[native-assets] cache total <= {} GiB; dados <= {} MiB; RAM de transporte <= 48 MiB",
         total_budget >> 30,
@@ -934,7 +1038,7 @@ impl Assets {
             "Lote truncado: {} de {expected}",
             bytes.len()
         );
-        let cache = self.cache.lock().unwrap();
+        let cache = self.cache.read().unwrap();
         let mut position = 0;
         for (path, size) in files {
             for (number, chunk) in bytes[position..position + *size as usize]
@@ -981,10 +1085,15 @@ impl Assets {
             HOT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(Some(data));
         }
-        let cache = self.cache.lock().unwrap();
+        let cache = self.cache.read().unwrap();
+        let disk_started = std::time::Instant::now();
         let result = cache.read(key, 8 << 20);
         cache.unpin_all();
         drop(cache);
+        DISK_LOOKUP_NS.fetch_add(
+            disk_started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some(bytes) = result? {
             DISK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let data = Arc::new(bytes);
@@ -1035,6 +1144,7 @@ impl Assets {
             .any(|extension| path.ends_with(extension));
         let origin = if whole { 0 } else { window_start };
         FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let network_started = std::time::Instant::now();
         let bytes = self.runtime.block_on(async {
             let _permit = self.network.acquire().await?;
             if whole {
@@ -1048,56 +1158,47 @@ impl Assets {
             }
             self.http.range(url, window_start, finish - 1, size).await
         })?;
+        NETWORK_FETCH_NS.fetch_add(
+            network_started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         DECODED_BYTES.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let mut first = None;
-        let cache = self.cache.lock().unwrap();
-        for (number, chunk) in bytes.chunks(BLOCK as usize).enumerate() {
+        let store_started = std::time::Instant::now();
+        let blocks: Vec<(String, &[u8])> = bytes
+            .chunks(BLOCK as usize)
+            .enumerate()
+            .map(|(number, chunk)| {
+                let at = origin + number as u64 * BLOCK;
+                (
+                    data_cache_key(&self.data_base, &self.version, path, at, size),
+                    chunk,
+                )
+            })
+            .collect();
+        let cache = self.cache.read().unwrap();
+        cache.put_batch(&blocks)?;
+        cache.unpin_all();
+        drop(cache);
+        DISK_STORE_NS.fetch_add(
+            store_started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        for (number, (block_key, chunk)) in blocks.into_iter().enumerate() {
             let at = origin + number as u64 * BLOCK;
-            let block_key = data_cache_key(&self.data_base, &self.version, path, at, size);
-            cache.put(&block_key, chunk)?;
             let data = Arc::new(chunk.to_vec());
             if at == start {
                 first = Some(data.clone());
             }
             self.remember(block_key, data);
         }
-        cache.unpin_all();
         first.context("Intervalo remoto vazio")
     }
     fn hot(&self, key: &str) -> Option<Arc<Vec<u8>>> {
-        let mut hot = self.hot.lock().unwrap();
-        hot.clock += 1;
-        let clock = hot.clock;
-        hot.entries.get_mut(key).map(|(data, age)| {
-            *age = clock;
-            data.clone()
-        })
+        self.hot.lock().unwrap().get(key)
     }
     fn remember(&self, key: String, data: Arc<Vec<u8>>) {
-        if data.len() > HOT_BUDGET {
-            return;
-        }
-        let mut hot = self.hot.lock().unwrap();
-        if let Some((old, _)) = hot.entries.remove(&key) {
-            hot.bytes -= old.len();
-        }
-        while hot.bytes + data.len() > HOT_BUDGET {
-            let Some(key) = hot
-                .entries
-                .iter()
-                .min_by_key(|(_, (_, age))| *age)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            if let Some((old, _)) = hot.entries.remove(&key) {
-                hot.bytes -= old.len();
-            }
-        }
-        hot.clock += 1;
-        let age = hot.clock;
-        hot.bytes += data.len();
-        hot.entries.insert(key, (data, age));
+        self.hot.lock().unwrap().insert(key, data);
     }
     fn fetch(&self, key: &str, url: &str, range: Option<(u64, u64, u64)>) -> Result<Arc<Vec<u8>>> {
         if let Some(data) = self.hot(key) {
@@ -1120,7 +1221,7 @@ impl Assets {
             return Ok(data);
         }
         let cached = {
-            let cache = self.cache.lock().unwrap();
+            let cache = self.cache.read().unwrap();
             let result = cache.read(key, 8 << 20);
             cache.unpin_all();
             result?
@@ -1140,7 +1241,7 @@ impl Assets {
                 Ok(reply.body)
             })?;
             DECODED_BYTES.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            let cache = self.cache.lock().unwrap();
+            let cache = self.cache.read().unwrap();
             cache.put(key, &bytes)?;
             cache.unpin_all();
             bytes
@@ -1263,6 +1364,9 @@ pub fn prefetch_data(path: &str, size: u64, offset: u64, length: u64, low: bool)
         let mut recent = assets.recent_hints.lock().unwrap();
         if recent.len() > 8192 {
             recent.retain(|_, last| now.saturating_duration_since(*last) < HINT_RECENT_TTL);
+            if recent.len() > 8192 {
+                recent.clear();
+            }
         }
         if hint_recently_satisfied(recent.get(&key), now) {
             HINTS_DUPLICATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

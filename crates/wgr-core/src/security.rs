@@ -9,8 +9,11 @@ use std::{
     collections::BTreeMap,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 use url::Url;
 
@@ -181,8 +184,15 @@ pub fn remove_owned_directory(root: &Path, target: &Path) -> Result<()> {
 pub struct HttpClient {
     pub policy: NetworkPolicy,
     clients: Arc<Mutex<PinnedClients>>,
+    dns_pin_ttl: Duration,
+    dns_lookups: Arc<AtomicU64>,
+    dns_cache_hits: Arc<AtomicU64>,
 }
-type PinnedClients = BTreeMap<String, (Vec<SocketAddr>, reqwest::Client)>;
+type PinnedClients = BTreeMap<String, (Vec<SocketAddr>, reqwest::Client, Instant)>;
+
+fn dns_pin_valid(since: Instant, ttl: Duration, now: Instant) -> bool {
+    !ttl.is_zero() && now.saturating_duration_since(since) < ttl
+}
 pub struct HttpReply {
     pub status: reqwest::StatusCode,
     pub headers: HeaderMap,
@@ -194,7 +204,26 @@ impl HttpClient {
         Self {
             policy,
             clients: Arc::new(Mutex::new(BTreeMap::new())),
+            // Other app requests retain the previous fresh-DNS-per-request
+            // policy. Only fixed, explicitly authorized asset origins opt in.
+            dns_pin_ttl: Duration::ZERO,
+            dns_lookups: Arc::new(AtomicU64::new(0)),
+            dns_cache_hits: Arc::new(AtomicU64::new(0)),
         }
+    }
+    /// Reuse verified public DNS addresses for short-lived, pinned requests.
+    /// Only URLs admitted by NetworkPolicy can use this pool; the reqwest
+    /// client stays pinned to the IPs that passed validate_addresses.
+    pub fn with_dns_pin_ttl(mut self, ttl: Duration) -> Self {
+        self.dns_pin_ttl = ttl.min(Duration::from_secs(60));
+        self
+    }
+
+    pub fn dns_cache_stats(&self) -> (u64, u64) {
+        (
+            self.dns_lookups.load(Ordering::Relaxed),
+            self.dns_cache_hits.load(Ordering::Relaxed),
+        )
     }
     pub async fn request(
         &self,
@@ -220,49 +249,68 @@ impl HttpClient {
         );
         let mut url = self.policy.validate(input)?;
         for _ in 0..=5 {
-            let host = url
-                .host_str()
-                .context("Servidor ausente")?
-                .trim_matches(['[', ']']);
-            let mut addresses: Vec<SocketAddr> = tokio::time::timeout(
-                Duration::from_secs(8),
-                tokio::net::lookup_host((host, url.port_or_known_default().unwrap_or(443))),
-            )
-            .await
-            .context("Timeout DNS")??
-            .collect();
-            addresses.sort_unstable();
-            addresses.dedup();
-            ensure!(!addresses.is_empty(), "DNS sem endereços");
-            validate_addresses(&addresses, self.policy.development_loopback)?;
-            // Pin the verified DNS answer to this connection; redirects re-enter validation.
             let key = url.origin().ascii_serialization();
-            let client = {
-                let mut clients = self
+            let reused = {
+                let clients = self
                     .clients
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Pool HTTP ocupado"))?;
-                if let Some((_, client)) =
-                    clients.get(&key).filter(|(pinned, _)| *pinned == addresses)
-                {
-                    client.clone()
-                } else {
-                    let client = reqwest::Client::builder()
-                        .no_proxy()
-                        .tcp_nodelay(true)
-                        .http2_adaptive_window(true)
-                        .pool_max_idle_per_host(32)
-                        .redirect(reqwest::redirect::Policy::none())
-                        .connect_timeout(Duration::from_secs(10))
-                        .timeout(Duration::from_secs(45))
-                        .resolve_to_addrs(host, &addresses)
-                        .build()?;
-                    if clients.len() >= 32 {
-                        clients.clear();
+                clients
+                    .get(&key)
+                    .filter(|(_, _, since)| dns_pin_valid(*since, self.dns_pin_ttl, Instant::now()))
+                    .map(|(_, client, _)| client.clone())
+            };
+            let client = if let Some(client) = reused {
+                self.dns_cache_hits.fetch_add(1, Ordering::Relaxed);
+                client
+            } else {
+                let host = url
+                    .host_str()
+                    .context("Servidor ausente")?
+                    .trim_matches(['[', ']']);
+                self.dns_lookups.fetch_add(1, Ordering::Relaxed);
+                let mut addresses: Vec<SocketAddr> = tokio::time::timeout(
+                    Duration::from_secs(8),
+                    tokio::net::lookup_host((host, url.port_or_known_default().unwrap_or(443))),
+                )
+                .await
+                .context("Timeout DNS")??
+                .collect();
+                addresses.sort_unstable();
+                addresses.dedup();
+                ensure!(!addresses.is_empty(), "DNS sem endereços");
+                validate_addresses(&addresses, self.policy.development_loopback)?;
+                // Pin the verified DNS answer to this connection; redirects re-enter validation.
+                let client = {
+                    let mut clients = self
+                        .clients
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Pool HTTP ocupado"))?;
+                    if let Some((_, client, since)) = clients
+                        .get_mut(&key)
+                        .filter(|(pinned, _, _)| *pinned == addresses)
+                    {
+                        *since = Instant::now();
+                        client.clone()
+                    } else {
+                        let client = reqwest::Client::builder()
+                            .no_proxy()
+                            .tcp_nodelay(true)
+                            .http2_adaptive_window(true)
+                            .pool_max_idle_per_host(32)
+                            .redirect(reqwest::redirect::Policy::none())
+                            .connect_timeout(Duration::from_secs(10))
+                            .timeout(Duration::from_secs(45))
+                            .resolve_to_addrs(host, &addresses)
+                            .build()?;
+                        if clients.len() >= 32 {
+                            clients.clear();
+                        }
+                        clients.insert(key, (addresses, client.clone(), Instant::now()));
+                        client
                     }
-                    clients.insert(key, (addresses, client.clone()));
-                    client
-                }
+                };
+                client
             };
             let response = client
                 .request(method.clone(), url.clone())
@@ -448,6 +496,27 @@ pub fn decode_gzip_bounded(bytes: &[u8], limit: usize) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dns_pinning_requires_an_explicit_ttl_and_expires_safely() {
+        use super::*;
+        let now = Instant::now();
+        assert!(!dns_pin_valid(now, Duration::ZERO, now));
+        assert!(dns_pin_valid(now, Duration::from_secs(30), now));
+        assert!(!dns_pin_valid(
+            now - Duration::from_secs(31),
+            Duration::from_secs(30),
+            now,
+        ));
+        let policy = NetworkPolicy {
+            allowed_origins: vec!["https://example.com".into()],
+            development_loopback: false,
+        };
+        let client = HttpClient::new(policy).with_dns_pin_ttl(Duration::from_secs(500));
+        assert_eq!(client.dns_pin_ttl, Duration::from_secs(60));
+        assert_eq!(client.dns_cache_stats(), (0, 0));
+        assert!(client.policy.validate("https://example.com/a").is_ok());
+        assert!(client.policy.validate("https://example.org/a").is_err());
+    }
     #[test]
     fn gzip_decoding_enforces_expanded_limit_and_integrity() {
         use std::io::Write;

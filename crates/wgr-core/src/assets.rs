@@ -4,15 +4,44 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicI64, AtomicU64, Ordering},
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
 pub const MAX_EXPANDED: u64 = 4 * 1024 * 1024 * 1024;
+static CACHE_ACCESS_CLOCK: AtomicI64 = AtomicI64::new(0);
+
+// Previous cache files recorded seconds since epoch; this monotonic
+// microsecond-scale timestamp is compatible with the same SQLite INTEGER
+// column, while ensuring two hot objects touched in one second have an
+// unambiguous order. Legacy seconds naturally rank as older than new reads.
+fn next_cache_access_stamp() -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_micros().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    let mut previous = CACHE_ACCESS_CLOCK.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(previous.saturating_add(1));
+        match CACHE_ACCESS_CLOCK.compare_exchange_weak(
+            previous,
+            next,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(latest) => previous = latest,
+        }
+    }
+}
 pub fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -36,6 +65,13 @@ pub struct DiskCache {
     db: Mutex<Connection>,
     limit: u64,
     pinned: Mutex<HashSet<String>>,
+    // Defer repetitive cache-LRU writes into short SQLite transactions.
+    // Reads still validate the current key and SHA-256 before returning.
+    accessed: Mutex<HashMap<String, i64>>,
+    read_lock_wait_ns: AtomicU64,
+    read_verify_ns: AtomicU64,
+    lru_batch_count: AtomicU64,
+    lru_entries_written: AtomicU64,
 }
 #[derive(serde::Serialize)]
 pub struct CacheStats {
@@ -44,6 +80,14 @@ pub struct CacheStats {
     pub limit: u64,
 }
 impl DiskCache {
+    /// Reconfigure an existing cache budget without reopening SQLite. The
+    /// previous implementation recreated the connection after GPU boot and
+    /// rescanned staging, while background archive prefetch had already
+    /// started. Future writes enforce the new limit exactly as on open.
+    pub fn set_limit(&mut self, limit: u64) {
+        self.limit = limit;
+    }
+
     pub fn open(root: PathBuf, limit: u64) -> Result<Self> {
         fs::create_dir_all(root.join("objects"))?;
         fs::create_dir_all(root.join("staging"))?;
@@ -87,6 +131,11 @@ impl DiskCache {
             db: Mutex::new(db),
             limit,
             pinned: Mutex::new(HashSet::new()),
+            accessed: Mutex::new(HashMap::new()),
+            read_lock_wait_ns: AtomicU64::new(0),
+            read_verify_ns: AtomicU64::new(0),
+            lru_batch_count: AtomicU64::new(0),
+            lru_entries_written: AtomicU64::new(0),
         })
     }
     fn path(&self, hash: &str) -> Result<PathBuf> {
@@ -104,6 +153,42 @@ impl DiskCache {
             .join("staging")
             .join(format!("{}.partial", Uuid::new_v4()))
     }
+
+    fn flush_accesses(&self, db: &mut Connection) -> Result<()> {
+        let mut accessed = self
+            .accessed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Fila LRU ocupada"))?;
+        if accessed.is_empty() {
+            return Ok(());
+        }
+        let tx = db.transaction()?;
+        {
+            let mut update = tx.prepare_cached(
+                "UPDATE objects SET last_access=?1 WHERE hash=?2 AND last_access<>?1",
+            )?;
+            for (hash, access) in accessed.iter() {
+                update.execute(params![access, hash])?;
+            }
+        }
+        tx.commit()?;
+        self.lru_batch_count.fetch_add(1, Ordering::Relaxed);
+        self.lru_entries_written
+            .fetch_add(accessed.len() as u64, Ordering::Relaxed);
+        accessed.clear();
+        Ok(())
+    }
+
+    /// Diagnostic counters are cumulative, including parallel readers.
+    /// Milliseconds here are *not* the same as wall-clock game loading time.
+    pub fn read_timings(&self) -> (u64, u64, u64, u64) {
+        (
+            self.read_lock_wait_ns.load(Ordering::Relaxed) / 1_000_000,
+            self.read_verify_ns.load(Ordering::Relaxed) / 1_000_000,
+            self.lru_batch_count.load(Ordering::Relaxed),
+            self.lru_entries_written.load(Ordering::Relaxed),
+        )
+    }
     pub fn get(&self, key: &str) -> Result<Option<PathBuf>> {
         self.lookup(key, true, |path, hash| {
             Ok(file_hash(path)
@@ -118,27 +203,31 @@ impl DiskCache {
         // readers therefore queued on *one* file read/hash. Look up a stable
         // content-addressed hash first; verify bytes outside the DB lock;
         // then revalidate the key before touching the LRU timestamp.
+        let waited = Instant::now();
         let hash: Option<String> = {
             let db = self
                 .db
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Cache ocupado"))?;
+            self.read_lock_wait_ns
+                .fetch_add(waited.elapsed().as_nanos() as u64, Ordering::Relaxed);
             db.query_row("SELECT hash FROM refs WHERE key=?1", [key], |r| r.get(0))
                 .optional()?
         };
         let Some(hash) = hash else { return Ok(None) };
         let path = self.path(&hash)?;
+        let started_verify = Instant::now();
         let bytes = (|| -> Result<Option<Vec<u8>>> {
             let file = match File::open(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
-            ensure!(
-                file.metadata()?.len() <= limit as u64,
-                "Objeto de cache excede o limite de leitura"
-            );
-            let mut bytes = Vec::new();
+            // The bounded take below already rejects an oversized file.
+            // Avoid a separate metadata syscall on every content-addressed
+            // 128-KiB block; Windows may otherwise incur another filesystem
+            // and antivirus roundtrip before it starts reading the bytes.
+            let mut bytes = Vec::with_capacity(limit.min(128 << 10));
             file.take(limit.saturating_add(1) as u64)
                 .read_to_end(&mut bytes)?;
             ensure!(
@@ -147,10 +236,17 @@ impl DiskCache {
             );
             Ok((sha256(&bytes) == hash).then_some(bytes))
         })()?;
-        let db = self
+        self.read_verify_ns.fetch_add(
+            started_verify.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        let waited = Instant::now();
+        let mut db = self
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("Cache ocupado"))?;
+        self.read_lock_wait_ns
+            .fetch_add(waited.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let current: Option<String> = db
             .query_row("SELECT hash FROM refs WHERE key=?1", [key], |r| r.get(0))
             .optional()?;
@@ -160,10 +256,17 @@ impl DiskCache {
             return Ok(None);
         }
         if let Some(bytes) = bytes {
-            db.execute(
-                "UPDATE objects SET last_access=?1 WHERE hash=?2 AND last_access<>?1",
-                params![crate::domain::now(), hash],
-            )?;
+            let should_flush = {
+                let mut accessed = self
+                    .accessed
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Fila LRU ocupada"))?;
+                accessed.insert(hash, next_cache_access_stamp());
+                accessed.len() >= 64
+            };
+            if should_flush {
+                self.flush_accesses(&mut db)?;
+            }
             return Ok(Some(bytes));
         }
         // A parallel writer may have replaced the damaged/missing file just
@@ -196,7 +299,7 @@ impl DiskCache {
             if let Some(value) = load(&path, &hash)? {
                 db.execute(
                     "UPDATE objects SET last_access=?1 WHERE hash=?2 AND last_access<>?1",
-                    params![crate::domain::now(), hash],
+                    params![next_cache_access_stamp(), hash],
                 )?;
                 if pin {
                     self.pinned
@@ -264,6 +367,9 @@ impl DiskCache {
                 .db
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Cache ocupado"))?;
+            // Eviction must see all recent verified reads, even when the
+            // normal 64-item batch has not filled yet.
+            self.flush_accesses(&mut db)?;
             let mut pinned = self
                 .pinned
                 .lock()
@@ -316,7 +422,6 @@ impl DiskCache {
                 );
             }
             let tx = db.transaction()?;
-            let now = crate::domain::now();
             for item in &items {
                 let destination = self.path(&item.hash)?;
                 fs::create_dir_all(destination.parent().context("Cache sem diretório")?)?;
@@ -328,7 +433,7 @@ impl DiskCache {
                 }
                 tx.execute(
                     "INSERT INTO objects(hash,size,last_access) VALUES(?1,?2,?3) ON CONFLICT(hash) DO UPDATE SET last_access=excluded.last_access",
-                    params![item.hash,item.size,now],
+                    params![item.hash,item.size,next_cache_access_stamp()],
                 )?;
                 tx.execute(
                     "INSERT INTO refs(key,hash) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET hash=excluded.hash",
@@ -362,6 +467,7 @@ impl DiskCache {
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("Cache ocupado"))?;
+        self.flush_accesses(&mut db)?;
         let exists: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM objects WHERE hash=?1)",
             [&hash],
@@ -410,7 +516,7 @@ impl DiskCache {
             fs::remove_file(temporary)?;
         }
         let tx = db.transaction()?;
-        tx.execute("INSERT INTO objects(hash,size,last_access) VALUES(?1,?2,?3) ON CONFLICT(hash) DO UPDATE SET last_access=excluded.last_access",params![hash,size,crate::domain::now()])?;
+        tx.execute("INSERT INTO objects(hash,size,last_access) VALUES(?1,?2,?3) ON CONFLICT(hash) DO UPDATE SET last_access=excluded.last_access",params![hash,size,next_cache_access_stamp()])?;
         tx.execute("INSERT INTO refs(key,hash) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET hash=excluded.hash",params![key,hash])?;
         tx.commit()?;
         self.pinned
@@ -466,7 +572,21 @@ impl DiskCache {
             }
         }
         db.execute_batch("DELETE FROM refs;DELETE FROM objects;")?;
+        self.accessed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Fila LRU ocupada"))?
+            .clear();
         Ok(n)
+    }
+}
+
+impl Drop for DiskCache {
+    fn drop(&mut self) {
+        // Preserve the last partial touch batch across normal clean exits.
+        // The cache is disposable; failure to update recency must not panic.
+        if let Ok(mut db) = self.db.lock() {
+            let _ = self.flush_accesses(&mut db);
+        }
     }
 }
 
@@ -625,6 +745,138 @@ pub fn import_zip(zip_path: &Path, bundles: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Manual, synthetic I/O comparison. Not a substitute for GTA cold/warm
+    /// scene timings: intentionally ignored by ordinary CI tests.
+    #[test]
+    #[ignore = "perfil de cache: benchmark manual de I/O local"]
+    fn compare_verified_lru_reads_under_contention() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cache = std::sync::Arc::new(DiskCache::open(temp.path().into(), 32 << 20)?);
+        let mut keys = Vec::new();
+        for chunk in 0..12 {
+            let owned: Vec<(String, Vec<u8>)> = (0..8)
+                .map(|n| {
+                    let k = chunk * 8 + n;
+                    let bytes: Vec<u8> = (0..128 << 10)
+                        .map(|j| ((j * 37 + k * 113 + j / 79) % 251) as u8)
+                        .collect();
+                    (format!("block-{k}"), bytes)
+                })
+                .collect();
+            let borrowed: Vec<(String, &[u8])> = owned
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_slice()))
+                .collect();
+            cache.put_batch(&borrowed)?;
+            cache.unpin_all();
+            keys.extend(owned.into_iter().map(|(key, _)| key));
+        }
+        let compare = |old: bool| {
+            let started = Instant::now();
+            std::thread::scope(|scope| {
+                for worker in 0..16 {
+                    let cache = cache.clone();
+                    let keys = &keys;
+                    scope.spawn(move || {
+                        for n in 0..450usize {
+                            let key = &keys[(n * 17 + worker * 13) % keys.len()];
+                            if old {
+                                // Reference implementation from 7e79295:
+                                // identical two SQL lookups, verify each
+                                // 128-KiB file, immediate LRU update.
+                                let hash: String = cache
+                                    .db
+                                    .lock()
+                                    .unwrap()
+                                    .query_row("SELECT hash FROM refs WHERE key=?1", [key], |r| r.get(0))
+                                    .unwrap();
+                                let path = cache.path(&hash).unwrap();
+                                let file = File::open(path).unwrap();
+                                assert!(file.metadata().unwrap().len() <= 128 << 10);
+                                let mut bytes = Vec::new();
+                                file.take((128 << 10) + 1).read_to_end(&mut bytes).unwrap();
+                                assert_eq!(sha256(&bytes), hash);
+                                let db = cache.db.lock().unwrap();
+                                let current: String = db
+                                    .query_row("SELECT hash FROM refs WHERE key=?1", [key], |r| r.get(0))
+                                    .unwrap();
+                                assert_eq!(hash, current);
+                                db.execute(
+                                    "UPDATE objects SET last_access=?1 WHERE hash=?2 AND last_access<>?1",
+                                    params![crate::domain::now(), hash],
+                                )
+                                .unwrap();
+                            } else {
+                                assert_eq!(cache.read(key, 128 << 10).unwrap().unwrap().len(), 128 << 10);
+                            }
+                        }
+                    });
+                }
+            });
+            started.elapsed()
+        };
+        let legacy_a = compare(true);
+        let new = compare(false);
+        let legacy_b = compare(true);
+        eprintln!(
+            "cache synthetic benchmark: 7200 verified reads, legacy A={:.2}s, batched={:.2}s, legacy B={:.2}s",
+            legacy_a.as_secs_f64(),
+            new.as_secs_f64(),
+            legacy_b.as_secs_f64()
+        );
+        Ok(())
+    }
+    #[test]
+    fn batched_lru_touches_are_applied_before_eviction() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cache = DiskCache::open(temp.path().into(), 8)?;
+        cache.put("old", b"aaaa")?;
+        cache.put("recent", b"bbbb")?;
+        cache.unpin_all();
+        // Force deterministic recency ordering instead of sleeping for a
+        // wall-clock second (crate::domain::now uses seconds).
+        {
+            let db = cache.db.lock().unwrap();
+            db.execute(
+                "UPDATE objects SET last_access=1 WHERE hash=?1",
+                [sha256(b"bbbb")],
+            )?;
+            db.execute(
+                "UPDATE objects SET last_access=0 WHERE hash=?1",
+                [sha256(b"aaaa")],
+            )?;
+        }
+        assert_eq!(cache.read("old", 4)?, Some(b"aaaa".to_vec()));
+        assert_eq!(cache.read_timings().2, 0, "one touch stays pending");
+        cache.put("new", b"cccc")?;
+        assert_eq!(cache.read("old", 4)?, Some(b"aaaa".to_vec()));
+        assert_eq!(
+            cache.read("recent", 4)?,
+            None,
+            "untouched older object evicted"
+        );
+        assert_eq!(cache.read("new", 4)?, Some(b"cccc".to_vec()));
+        assert!(cache.read_timings().2 >= 1);
+        Ok(())
+    }
+    #[test]
+    fn cache_budget_change_preserves_content_and_enforces_next_eviction() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut cache = DiskCache::open(temp.path().into(), 16)?;
+        cache.put("first", b"aaaa")?;
+        cache.put("second", b"bbbb")?;
+        cache.unpin_all();
+        cache.set_limit(8);
+        assert_eq!(cache.stats()?.limit, 8);
+        assert_eq!(cache.read("first", 4)?, Some(b"aaaa".to_vec()));
+        cache.put("third", b"cccc")?;
+        assert_eq!(cache.stats()?.bytes, 8);
+        assert_eq!(cache.read("first", 4)?, Some(b"aaaa".to_vec()));
+        assert!(cache.read("second", 4)?.is_none());
+        assert_eq!(cache.read("third", 4)?, Some(b"cccc".to_vec()));
+        Ok(())
+    }
     #[test]
     fn concurrent_verified_readers_and_batch_writers_keep_cache_consistent() -> Result<()> {
         let temp = tempfile::tempdir()?;

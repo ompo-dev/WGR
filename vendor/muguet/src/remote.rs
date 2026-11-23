@@ -470,6 +470,11 @@ pub fn metrics() -> Value {
         .get()
         .map(|assets| assets.http.dns_cache_stats())
         .unwrap_or((0, 0));
+    let (cache_db_wait_ms, cache_verify_ms, cache_lru_batches, cache_lru_entries) = ASSETS
+        .get()
+        .and_then(|assets| assets.cache.read().ok())
+        .map(|cache| cache.read_timings())
+        .unwrap_or((0, 0, 0, 0));
     serde_json::json!({
         "hot_hits":HOT_HITS.load(Relaxed),"disk_hits":DISK_HITS.load(Relaxed),
         "transport_fetches":FETCHES.load(Relaxed),"decoded_asset_bytes":DECODED_BYTES.load(Relaxed),
@@ -480,6 +485,8 @@ pub fn metrics() -> Value {
         "live_io_active":LIVE_IO_ACTIVE.load(Relaxed),"hot_cache_bytes":hot_bytes,
         "hot_cache_entries":hot_entries,"hot_cache_capacity_bytes":hot_capacity_bytes,
         "disk_lookup_ms":DISK_LOOKUP_NS.load(Relaxed)/1_000_000,
+        "disk_db_wait_ms":cache_db_wait_ms,"disk_verify_ms":cache_verify_ms,
+        "disk_lru_batches":cache_lru_batches,"disk_lru_entries":cache_lru_entries,
         "disk_store_ms":DISK_STORE_NS.load(Relaxed)/1_000_000,
         "network_fetch_ms":NETWORK_FETCH_NS.load(Relaxed)/1_000_000,
         "dns_lookups":dns_lookups,"dns_cache_hits":dns_cache_hits,
@@ -571,7 +578,6 @@ struct Assets {
     runtime: tokio::runtime::Runtime,
     http: HttpClient,
     cache: RwLock<DiskCache>,
-    cache_root: PathBuf,
     hot: Mutex<Hot>,
     locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     prefetching: Mutex<HashSet<String>>,
@@ -685,7 +691,6 @@ pub fn prepare(support: &Path) -> Result<Option<PathBuf>> {
             cache_root.clone(),
             safe_cache_budget(support),
         )?),
-        cache_root,
         hot: Mutex::new(Hot::new(hot_budget())),
         locks: Mutex::new(HashMap::new()),
         prefetching: Mutex::new(HashSet::new()),
@@ -744,7 +749,10 @@ pub fn configure_budget(support: &Path, wasm: &Path) -> Result<()> {
         .checked_sub(overhead)
         .filter(|n| *n >= 128 << 20)
         .context("Código compilado excede o orçamento disponível de cache")?;
-    *assets.cache.write().unwrap() = DiskCache::open(assets.cache_root.clone(), budget)?;
+    // Keep the validated SQLite connection and any active prewarm state.
+    // Reopening here made the hot startup path redo database setup and dropped
+    // diagnostic counters while background I/O was warming archive headers.
+    assets.cache.write().unwrap().set_limit(budget);
     eprintln!(
         "[native-assets] cache total <= {} GiB; dados <= {} MiB; RAM de transporte <= 48 MiB",
         total_budget >> 30,

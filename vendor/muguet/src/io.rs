@@ -294,8 +294,14 @@ pub fn start(mem: &SharedMemory, table: u64) {
 
 fn serve_remote(mem: SharedMemory, table: u64) {
     let files = std::sync::Arc::new(manifest_files());
+    let worker_count = std::env::var("WGR_IO_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(32)
+        .clamp(4, 32);
+    eprintln!("[io] native worker budget: {worker_count}");
     let workers = rayon::ThreadPoolBuilder::new()
-        .num_threads(32)
+        .num_threads(worker_count)
         .thread_name(|n| format!("native-io-{n}"))
         .build()
         .expect("I/O workers");
@@ -329,7 +335,12 @@ fn serve_remote(mem: SharedMemory, table: u64) {
                     let (path,size) = files.get(id).ok_or_else(|| anyhow::anyhow!("Unknown file id {id}"))?;
                     if offset >= *size { return Ok(0); }
                                         let length = requested.min(size-offset);
-                    copy_to_guest(&mem,destination,offset,length,|position,bytes|crate::remote::read_data(path,*size,position,bytes))
+                    copy_to_guest_parts(&mem,destination,offset,length,|position,guest,bytes| {
+                        crate::remote::read_data_chunks(path,*size,position,bytes,|relative,data| {
+                            anyhow::ensure!(crate::write_bytes(&mem,guest+relative,data),"I/O destination outside guest memory");
+                            Ok(())
+                        })
+                    })
                 })();
                 let value = match result { Ok(n) => n, Err(e) => { eprintln!("[native-io-error] file={id} offset={offset} length={requested}: {e:#}"); -1 } };
                 let elapsed = began.elapsed().as_secs_f64()*1000.0;
@@ -354,12 +365,40 @@ fn serve_remote(mem: SharedMemory, table: u64) {
     }
 }
 
+#[cfg(test)]
 fn copy_to_guest(
     mem: &SharedMemory,
     destination: u64,
     offset: u64,
     length: u64,
     read: impl Fn(u64, u64) -> anyhow::Result<Vec<u8>> + Sync,
+) -> anyhow::Result<i32> {
+    copy_to_guest_parts(
+        mem,
+        destination,
+        offset,
+        length,
+        |position, guest, amount| {
+            let data = read(position, amount)?;
+            anyhow::ensure!(
+                data.len() as u64 == amount,
+                "I/O source returned a short block"
+            );
+            anyhow::ensure!(
+                crate::write_bytes(mem, guest, &data),
+                "I/O destination outside guest memory"
+            );
+            Ok(())
+        },
+    )
+}
+
+fn copy_to_guest_parts(
+    mem: &SharedMemory,
+    destination: u64,
+    offset: u64,
+    length: u64,
+    copy: impl Fn(u64, u64, u64) -> anyhow::Result<()> + Sync,
 ) -> anyhow::Result<i32> {
     let (_, memory_bytes) = mem_base_len(mem);
     let memory_bytes = memory_bytes as u64;
@@ -373,6 +412,14 @@ fn copy_to_guest(
         offset.checked_add(length).is_some(),
         "I/O source offset overflow"
     );
+    // Most streaming requests are smaller than one MiB. Avoid creating
+    // nested Rayon work for them; the outer I/O pool is already concurrent.
+    if length <= 1 << 20 {
+        if length != 0 {
+            copy(offset, destination, length)?;
+        }
+        return Ok(length as i32);
+    }
     use rayon::prelude::*;
     // Nested work uses the same bounded I/O pool. A single large RPF request
     // must not serialize all of its network segments before releasing the game.
@@ -381,16 +428,7 @@ fn copy_to_guest(
         .try_for_each(|part| -> anyhow::Result<()> {
             let done = part * (1 << 20);
             let amount = (length - done).min(1 << 20);
-            let data = read(offset + done, amount)?;
-            anyhow::ensure!(
-                data.len() as u64 == amount,
-                "I/O source returned a short block"
-            );
-            anyhow::ensure!(
-                crate::write_bytes(mem, destination + done, &data),
-                "I/O destination outside guest memory"
-            );
-            Ok(())
+            copy(offset + done, destination + done, amount)
         })?;
     Ok(length as i32)
 }

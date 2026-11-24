@@ -29,7 +29,12 @@ if (uri.protocol !== "https:" || !["fiveplay.lol", "v2.fiveplay.lol"].includes(u
 const autoPlay = argv.includes("--play");
 const output = resolve(arg("--output", "artifacts/browser-reference-edge"));
 const edge = arg("--browser", "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe");
-const ownProfile = join(output, "isolated-profile");
+const ownProfile = join(resolve(arg("--reuse-profile-from", output)), "isolated-profile");
+const viewport = arg("--viewport", "");
+const dimensions = viewport.match(/^(\d{3,4})x(\d{3,4})$/)?.slice(1).map(Number);
+if (viewport && (!dimensions || dimensions.some(n => n < 320 || n > 4096))) {
+  throw new Error("Invalid benchmark viewport");
+}
 await mkdir(output, { recursive: true });
 
 function timeout(promise, limitMs, label) {
@@ -106,7 +111,8 @@ const report = {
   kind: "wgr-browser-reference-v1",
   started_at: new Date().toISOString(),
   browser: "Microsoft Edge (Chromium)",
-  profile: "new and isolated (not the user's personal profile)",
+  profile: argv.includes("--reuse-profile-from") ? "reused isolated benchmark profile" : "isolated benchmark profile",
+  requested_viewport: dimensions ?? null,
   target_origin: uri.origin,
   target_path: uri.pathname,
   requested_seconds: seconds,
@@ -128,7 +134,7 @@ const child = spawn(edge, [
   `--user-data-dir=${ownProfile}`,
   "--no-first-run",
   "--no-default-browser-check",
-  "--window-size=1280,800",
+  `--window-size=${dimensions?.join(",") ?? "1280,800"}`,
   "about:blank",
 ], { windowsHide: false, stdio: "ignore" });
 let browser;
@@ -187,6 +193,11 @@ try {
     page.call("Log.enable"),
     page.call("Performance.enable"),
   ]);
+  if (dimensions) {
+    await page.call("Emulation.setDeviceMetricsOverride", {
+      width: dimensions[0], height: dimensions[1], deviceScaleFactor: 1, mobile: false,
+    });
+  }
   // Noninvasive inspection: observe the real browser's APIs and resources.
   try {
     const gpu = await browser.call("SystemInfo.getInfo", {}, 10000);
@@ -245,6 +256,8 @@ try {
             id: c.id.slice(0,50), width:c.width, height:c.height,
             visible: !!c.getClientRects().length
           }));
+          const fps = document.getElementById('fps');
+          if (fps?.hidden && window.GTAGameUI?.toggleFps) window.GTAGameUI.toggleFps();
           const bodyText = document.body?.innerText || '';
           return {
             ready: document.readyState, title: document.title.slice(0,100),
@@ -253,6 +266,8 @@ try {
             wasm_resources: wasm.map(r=>({name:new URL(r.name).pathname, duration_ms:Math.round(r.duration),
               transfer_bytes:r.transferSize, decoded_bytes:r.decodedBodySize})).slice(0,12),
             body_status: bodyText.slice(0,250),
+            game_fps: Number.parseInt(fps?.textContent || '', 10) || null,
+            world_ready: /Ready\\s+100%/.test(bodyText),
             webgpu_exposed:!!navigator.gpu,
           };
         })()`,
@@ -263,6 +278,7 @@ try {
     } catch (error) {
       report.warnings.push(`sample ${tick}: ${error.message}`);
     }
+    if (dom.world_ready && report.world_ready_seconds === undefined) report.world_ready_seconds = nowSeconds;
     report.samples.push({
       elapsed_seconds: nowSeconds,
       ...metrics,
@@ -292,7 +308,7 @@ try {
         errors: report.runtime_errors.length + report.console_errors.length,
       }));
     }
-    await sleep(Math.min(5000, Math.max(0, seconds * 1000 - (Date.now() - start))));
+    await sleep(Math.min(1000, Math.max(0, seconds * 1000 - (Date.now() - start))));
   }
   report.finished_at = new Date().toISOString();
   report.success = true;

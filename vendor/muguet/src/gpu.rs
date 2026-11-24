@@ -32,6 +32,13 @@ const BIND_RT: u32 = 0x20;
 const BIND_DS: u32 = 0x40;
 const BIND_UAV: u32 = 0x80;
 const RING_CHUNK: u64 = 8 << 20;
+static UNIFORM_CHUNK_BYTES: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("WGR_UNIFORM_CHUNK_MIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| matches!(v, 2 | 4 | 8))
+        .map_or(RING_CHUNK, |v| v << 20)
+});
 const UBO_WINDOW: u64 = 65536;
 const FRAME_SLOTS: usize = 3;
 const PIPELINE_WAIT: Duration = Duration::from_millis(8);
@@ -239,10 +246,13 @@ struct PerfCounters {
     max_frame_ms: f64,
     frames: u64,
     submit_ms: f64,
+    finish_ms: f64,
+    uniform_upload_ms: f64,
     acquire_ms: f64,
     fence_wait_ms: f64,
     bind_group_ms: f64,
     bind_hits: u64,
+    local_bind_hits: u64,
     bind_misses: u64,
     bind_trims: u64,
     staged_buffer_updates: u64,
@@ -1287,6 +1297,22 @@ struct PackMember {
 struct Pack {
     members: Vec<PackMember>,
     size: u64,
+    layout_id: u64,
+}
+
+static SHARED_UNIFORM_LAYOUTS: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("WGR_SHARED_UNIFORM_LAYOUTS").as_deref() == Ok("1"));
+
+fn intern_uniform_layout(layouts: &mut FxHashMap<Vec<(u32, u64, u64)>, u64>, pack: &Pack) -> u64 {
+    // Exact structural equality, not just a hash fingerprint. A layout ID
+    // identifies the entire byte-copy recipe including each source slot.
+    let key = pack
+        .members
+        .iter()
+        .map(|m| (m.binding, m.offset, m.size))
+        .collect::<Vec<_>>();
+    let next = layouts.len() as u64 + 1;
+    *layouts.entry(key).or_insert(next)
 }
 
 /// WGSL struct fields are comma-separated (some legacy translated shaders
@@ -1342,6 +1368,30 @@ fn uniform_type_registers(ty: &str) -> u64 {
 #[cfg(test)]
 mod uniform_tests {
     use super::*;
+
+    #[test]
+    fn shared_layout_identity_requires_exact_copy_recipe() {
+        let mut layouts = FxHashMap::default();
+        let mut pack = Pack {
+            members: vec![PackMember {
+                binding: 2,
+                offset: 0,
+                size: 32,
+            }],
+            size: 32,
+            layout_id: 0,
+        };
+        let id = intern_uniform_layout(&mut layouts, &pack);
+        assert_eq!(id, intern_uniform_layout(&mut layouts, &pack));
+        pack.members[0].binding = 3;
+        assert_ne!(id, intern_uniform_layout(&mut layouts, &pack));
+        pack.members[0].binding = 2;
+        pack.members[0].size = 16;
+        assert_ne!(id, intern_uniform_layout(&mut layouts, &pack));
+        pack.members[0].size = 32;
+        pack.members[0].offset = 16;
+        assert_ne!(id, intern_uniform_layout(&mut layouts, &pack));
+    }
 
     #[test]
     fn retains_every_ped_material_register() {
@@ -1446,6 +1496,7 @@ fn pack_uniforms(text: &str) -> (String, Option<Pack>) {
         Some(Pack {
             members: pm,
             size: off,
+            layout_id: 0,
         }),
     )
 }
@@ -1605,6 +1656,10 @@ struct Program {
     text: String,
     flat: Vec<u32>,
     group_bindings: BTreeMap<u32, Vec<Binding>>,
+    // Negative scans are safe only while the SRVs and their parents have
+    // the same identity. Positive scans must refresh dirty proxies.
+    depth_scan: std::cell::Cell<[Option<(u64, u64)>; 3]>,
+    local_bg: RefCell<[Option<Box<LocalBg>>; 3]>,
     variants: RefCell<HashMap<String, Option<ShaderModule>>>,
     label: String,
     uid: u64,
@@ -1617,6 +1672,38 @@ struct Program {
     clip: bool,
     clip_locs: Vec<u32>,
 }
+
+// One recent binding set per shader/stage, with no additional GPU handles.
+// The global cache remains the sole owner of reusable bind groups.
+struct LocalBg {
+    layout: u64,
+    group: u32,
+    mask: (u128, u128),
+    key: smallvec::SmallVec<[u64; 40]>,
+    uniform_chunk: Option<u64>,
+    textures: smallvec::SmallVec<[(usize, u32, u64, u32, u64); 8]>,
+    samplers: smallvec::SmallVec<[(usize, u32, u64); 8]>,
+    validated: std::cell::Cell<(u64, u64, u64)>,
+}
+
+static LOCAL_BG_CACHE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("WGR_LOCAL_BIND_CACHE").as_deref() == Ok("1"));
+static LOCAL_BG_EPOCHS: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("WGR_LOCAL_BIND_EPOCHS").as_deref() == Ok("1"));
+static ENCODER_WORKERS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("WGR_ENCODER_WORKERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| (2..=8).contains(n))
+        .unwrap_or(4)
+});
+static ENCODER_BATCH_PASSES: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("WGR_ENCODER_BATCH_PASSES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| (8..=128).contains(n))
+        .unwrap_or(32)
+});
 #[derive(Clone, Copy)]
 struct El {
     sem: u32,
@@ -1680,25 +1767,25 @@ enum Obj {
     Query(QueryObj),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default)]
 struct Vb {
     buf: u32,
     stride: u32,
     offset: u32,
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default)]
 struct Cb {
     buf: u32,
     first: u32,
 }
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct Rt {
     tex: u32,
     mip: u32,
     slice: u32,
     fmt: u32,
 }
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct Ds {
     tex: u32,
     mip: u32,
@@ -1711,13 +1798,13 @@ struct State {
     shader: [u32; 3],
     layout: u32,
     topo: u32,
-    vb: Vec<Vb>,
+    vb: [Vb; 16],
     ib: (u32, u32, u32),
-    cb: [Vec<Cb>; 3],
-    srv: [Vec<u32>; 3],
-    uav: [Vec<u32>; 3],
-    smp: [Vec<u32>; 3],
-    rt: Vec<Rt>,
+    cb: [[Cb; 16]; 3],
+    srv: [[u32; 128]; 3],
+    uav: [[u32; 8]; 3],
+    smp: [[u32; 16]; 3],
+    rt: [Rt; 8],
     ds: Ds,
     blend: (u32, [f64; 4]),
     dss: (u32, u32),
@@ -1731,13 +1818,13 @@ impl State {
             shader: [0; 3],
             layout: 0,
             topo: 4,
-            vb: vec![Vb::default(); 16],
+            vb: [Vb::default(); 16],
             ib: (0, 0, 0),
-            cb: std::array::from_fn(|_| vec![Cb::default(); 16]),
-            srv: std::array::from_fn(|_| vec![0; 128]),
-            uav: std::array::from_fn(|_| vec![0; 8]),
-            smp: std::array::from_fn(|_| vec![0; 16]),
-            rt: vec![Rt::default(); 8],
+            cb: [[Cb::default(); 16]; 3],
+            srv: [[0; 128]; 3],
+            uav: [[0; 8]; 3],
+            smp: [[0; 16]; 3],
+            rt: [Rt::default(); 8],
             ds: Ds::default(),
             blend: (0, [1.0; 4]),
             dss: (0, 0),
@@ -1750,7 +1837,7 @@ impl State {
 
 #[derive(Clone)]
 struct PassInfo {
-    rt_formats: Vec<Option<TextureFormat>>,
+    rt_formats: smallvec::SmallVec<[Option<TextureFormat>; 8]>,
     samples: u32,
     ds_format: Option<TextureFormat>,
     ro_depth: bool,
@@ -1762,7 +1849,7 @@ struct PassInfo {
 struct PassSt {
     pl: Option<u64>,
     bg: [Option<(u64, u32)>; 2],
-    vb: Vec<Option<(u64, u64)>>,
+    vb: [Option<(u64, u64)>; 16],
     ib: Option<(u64, IndexFormat, u64)>,
     vp: Option<[f32; 6]>,
     sc: Option<[u32; 4]>,
@@ -1773,6 +1860,8 @@ struct PassSt {
 struct Pl {
     pipeline: RenderPipeline,
     uid: u64,
+    used: std::cell::Cell<bool>,
+    recipe_id: Option<u64>,
     vb_req: Vec<VbReq>,
     label: String,
 }
@@ -1803,6 +1892,34 @@ struct PipeStates {
 const RECIPE_LIMIT: u64 = 32 << 20;
 static PIPE_CACHE: LazyLock<bool> =
     LazyLock::new(|| std::env::var("MUGUET_PIPE_CACHE").map_or(true, |v| v != "0"));
+static SHADER_AWARE_WARMUP: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("WGR_SHADER_AWARE_WARMUP").as_deref() == Ok("1"));
+
+fn missing_recipe_shader<'a>(
+    recipe: &'a serde_json::Value,
+    seen: &HashSet<String>,
+) -> Option<&'a str> {
+    ["vs", "ps"]
+        .into_iter()
+        .filter_map(|name| recipe[name].as_str())
+        .find(|hash| !hash.is_empty() && !seen.contains(*hash))
+}
+
+#[cfg(test)]
+#[test]
+fn warm_recipe_waits_for_both_shader_declarations() {
+    let recipe = serde_json::json!({"vs":"a","ps":"b"});
+    let mut seen = HashSet::new();
+    assert_eq!(missing_recipe_shader(&recipe, &seen), Some("a"));
+    seen.insert("a".into());
+    assert_eq!(missing_recipe_shader(&recipe, &seen), Some("b"));
+    seen.insert("b".into());
+    assert_eq!(missing_recipe_shader(&recipe, &seen), None);
+    assert_eq!(
+        missing_recipe_shader(&serde_json::json!({"vs":"a","ps":null}), &seen),
+        None
+    );
+}
 
 fn parse_format(name: &str) -> Option<TextureFormat> {
     use TextureFormat as F;
@@ -1860,7 +1977,11 @@ fn parse_format(name: &str) -> Option<TextureFormat> {
     ALL.iter().copied().find(|f| format!("{f:?}") == name)
 }
 
-fn compile_pipeline(device: &Device, job: &PipeJob) -> Option<RenderPipeline> {
+fn compile_pipeline(
+    device: &Device,
+    job: &PipeJob,
+    cache: Option<&PipelineCache>,
+) -> Option<RenderPipeline> {
     let started = Instant::now();
     let vbs: Vec<Option<VertexBufferLayout>> = job
         .vbs
@@ -1892,7 +2013,7 @@ fn compile_pipeline(device: &Device, job: &PipeJob) -> Option<RenderPipeline> {
             targets: &job.targets,
         }),
         multiview_mask: None,
-        cache: None,
+        cache,
     };
     let scope = device.push_error_scope(ErrorFilter::Validation);
     let p = device.create_render_pipeline(&desc);
@@ -1960,8 +2081,50 @@ enum MapKind {
         rows: Vec<(u64, u64, u64)>,
     },
     Occlusion {
-        list: Vec<(u64, u32, u64, bool, usize)>,
+        list: Vec<(smallvec::SmallVec<[u64; 4]>, u64, u32)>,
     },
+}
+
+/// Pack only allocated, completed query slots into aligned resolve ranges.
+/// No unissued queries are resolved; the returned offsets preserve the
+/// original query-to-result association even across interrupted passes.
+fn pack_query_slots(slots: &mut [u32]) -> (Vec<(std::ops::Range<u32>, u64)>, u64) {
+    slots.sort_unstable();
+    let mut ranges = Vec::new();
+    let mut bytes = 0u64;
+    let mut i = 0;
+    while i < slots.len() {
+        let first = slots[i];
+        let mut end = first + 1;
+        i += 1;
+        while i < slots.len() && slots[i] <= end {
+            end = end.max(slots[i] + 1);
+            i += 1;
+        }
+        ranges.push((first..end, bytes));
+        bytes += (u64::from(end - first) * 8).div_ceil(256) * 256;
+    }
+    (ranges, bytes)
+}
+
+#[cfg(test)]
+mod query_packing_tests {
+    use super::*;
+
+    #[test]
+    fn merges_adjacent_slots_without_resolving_holes() {
+        let (ranges, bytes) = pack_query_slots(&mut [9, 2, 3, 8, 9, 5]);
+        assert_eq!(ranges, vec![(2..4, 0), (5..6, 256), (8..10, 512)]);
+        assert_eq!(bytes, 768);
+        assert_eq!(pack_query_slots(&mut []).1, 0);
+    }
+    #[test]
+    fn dense_queries_use_one_resolve_and_aligned_storage() {
+        let mut slots: Vec<u32> = (0..1000).collect();
+        let (ranges, bytes) = pack_query_slots(&mut slots);
+        assert_eq!(ranges, vec![(0..1000, 0)]);
+        assert_eq!(bytes, 8192);
+    }
 }
 
 struct AstcJob {
@@ -1996,10 +2159,20 @@ pub struct Gpu {
     /// A numeric guest ID can be destroyed and reused for a different GPU
     /// object. Cached bind groups must not alias the previous allocation.
     obj_gen: Vec<u64>,
+    object_epoch: u64,
+    sampler_epoch: [u64; 3],
+    texture_epoch: u64,
+    srv_epoch: [u64; 3],
     enc: Option<CommandEncoder>,
+    // Batches end at render-pass boundaries; all command buffers are
+    // submitted in original order in the same queue submission.
+    sealed_encoders: Vec<CommandEncoder>,
+    encoder_pass_start: u64,
+    finish_pool: Option<rayon::ThreadPool>,
     enc_epoch: u64,
     pass: Option<RenderPass<'static>>,
     pass_key: Option<smallvec::SmallVec<[u32; 40]>>,
+    pass_targets_dirty: bool,
     pass_info: Option<PassInfo>,
     pass_st: PassSt,
     s: State,
@@ -2008,31 +2181,39 @@ pub struct Gpu {
     shader_index: HashMap<String, serde_json::Value>,
     shader_dir: PathBuf,
     map_programs: HashMap<String, Rc<Program>>,
-    warm: std::collections::VecDeque<serde_json::Value>,
+    warm: std::collections::VecDeque<(u64, serde_json::Value)>,
+    warm_seen: HashSet<String>,
+    warm_waiting: HashMap<String, Vec<(u64, serde_json::Value)>>,
     warm_programs: HashMap<String, Rc<Program>>,
     shader_failures: HashMap<String, Instant>,
     warmed: u64,
     warm_t0: Option<Instant>,
     recipe_bytes: u64,
+    recipe_batch: String,
+    recipe_ids: HashSet<u64>,
+    hot_recipe_ids: Vec<u64>,
+    driver_pipeline_cache: Option<PipelineCache>,
+    pipeline_layouts: FxHashMap<(u64, u64), PipelineLayout>,
     next_uid: u64,
     bgl_cache: FxHashMap<(u64, u128, u32, u32), (BindGroupLayout, u64)>,
     empty_bgl: Option<(BindGroupLayout, u64)>,
     pipelines: FxHashMap<Vec<i64>, PipeEntry>,
     pipe_jobs: Option<std::sync::mpsc::Sender<(u64, PipeJob)>>,
     pipe_results: std::sync::mpsc::Receiver<(u64, Option<RenderPipeline>)>,
-    pipe_pending: HashMap<u64, (Vec<i64>, Vec<VbReq>, String)>,
+    pipe_pending: HashMap<u64, (Vec<i64>, Vec<VbReq>, String, Option<u64>)>,
     pending_skips: u64,
     pending_skips0: u64,
     pipe_wait_left: Duration,
     lighting_waited: HashSet<Vec<i64>>,
     compute: HashMap<String, Option<(ComputePipeline, BindGroupLayout, u64, Rc<Program>)>>,
-    bind_groups: FxHashMap<Vec<u64>, (BindGroup, u64)>,
+    bind_groups: FxHashMap<Vec<u64>, (BindGroup, u64, u64)>,
     ubo_slots: Vec<Vec<Chunk>>,
     ubo_shared: Vec<(Buffer, u64)>,
     ubo_slot: usize,
     ubo_chunk: usize,
     ubo_off: u64,
     packed_uniform_cache: FxHashMap<UniformCacheKey, (usize, u64)>,
+    uniform_layouts: FxHashMap<Vec<(u32, u64, u64)>, u64>,
     uniform_cache_on: bool,
     uniform_ab_epoch: Instant,
     dummy_tex: HashMap<String, TextureView>,
@@ -2062,12 +2243,14 @@ pub struct Gpu {
     mip_pipelines: HashMap<TextureFormat, RenderPipeline>,
     mip_sampler: Option<Sampler>,
     occlusion_set: Option<QuerySet>,
+    occlusion_resolve_scratch: Option<Buffer>,
     occlusion_next: u32,
     occlusion_active: Option<u32>,
     occlusion_pass_slot: Option<u32>,
     pending_resolve: Vec<(u32, u32, Vec<u32>)>,
     pending_events: Vec<(u32, u32, u64)>,
     pending_maps: Vec<PendingMap>,
+    readback_batch: Vec<(Buffer, MapKind)>,
     readback_pool: HashMap<u64, Vec<Buffer>>,
     readback_pool_bytes: u64,
     readback_pool_items: usize,
@@ -2165,6 +2348,11 @@ impl Gpu {
             | Features::DUAL_SOURCE_BLENDING
             | Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
             | Features::TEXTURE_COMPRESSION_ASTC;
+        let want = if std::env::var("WGR_DRIVER_PIPELINE_CACHE").as_deref() == Ok("0") {
+            want
+        } else {
+            want | Features::PIPELINE_CACHE
+        };
         let features = want & adapter.features();
         if !features.contains(Features::FLOAT32_FILTERABLE) {
             F32_HALF.store(true, Ordering::Relaxed);
@@ -2253,18 +2441,32 @@ impl Gpu {
             shader_dir.display()
         ));
 
+        // Empty cache: no external driver binaries are deserialized. The
+        // adapter can reuse compiled shader/pipeline data within this run.
+        let driver_pipeline_cache = features.contains(Features::PIPELINE_CACHE).then(|| unsafe {
+            device.create_pipeline_cache(&PipelineCacheDescriptor {
+                label: Some("WGR session pipeline cache"),
+                data: None,
+                fallback: true,
+            })
+        });
+        log(&format!(
+            "session driver pipeline cache: {}",
+            driver_pipeline_cache.is_some()
+        ));
         let (res_tx, pipe_results) = std::sync::mpsc::channel::<(u64, Option<RenderPipeline>)>();
         let pipe_jobs = {
             let (job_tx, job_rx) = std::sync::mpsc::channel::<(u64, PipeJob)>();
             let job_rx = Arc::new(Mutex::new(job_rx));
             for i in 0..4 {
                 let (dev, rx, tx) = (device.clone(), job_rx.clone(), res_tx.clone());
+                let cache = driver_pipeline_cache.clone();
                 std::thread::Builder::new()
                     .name(format!("pipeline-compile-{i}"))
                     .spawn(move || loop {
                         let job = rx.lock().unwrap().recv();
                         let Ok((id, job)) = job else { return };
-                        let p = compile_pipeline(&dev, &job);
+                        let p = compile_pipeline(&dev, &job, cache.as_ref());
                         if tx.send((id, p)).is_err() {
                             return;
                         }
@@ -2301,19 +2503,42 @@ impl Gpu {
             surface_size: (0, 0),
             objs: Vec::new(),
             obj_gen: Vec::new(),
+            object_epoch: 0,
+            sampler_epoch: [0; 3],
+            texture_epoch: 0,
+            srv_epoch: [0; 3],
             enc: None,
+            sealed_encoders: Vec::new(),
+            encoder_pass_start: 0,
+            finish_pool: if std::env::var("WGR_PARALLEL_FINISH").as_deref() == Ok("1") {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(*ENCODER_WORKERS)
+                    .thread_name(|i| format!("gpu-encode-{i}"))
+                    .build()
+                    .ok()
+            } else {
+                None
+            },
             enc_epoch: 1,
             pass: None,
             pass_key: None,
+            pass_targets_dirty: true,
             pass_info: None,
             pass_st: PassSt::default(),
             map_programs: HashMap::new(),
             warm: Default::default(),
+            warm_seen: HashSet::new(),
+            warm_waiting: HashMap::new(),
             warm_programs: HashMap::new(),
             shader_failures: HashMap::new(),
             warmed: 0,
             warm_t0: None,
             recipe_bytes: 0,
+            recipe_batch: String::new(),
+            recipe_ids: HashSet::new(),
+            hot_recipe_ids: Vec::new(),
+            driver_pipeline_cache,
+            pipeline_layouts: FxHashMap::default(),
             s: State::new(),
             pdirty: true,
             last_pl: None,
@@ -2331,6 +2556,7 @@ impl Gpu {
             ubo_chunk: 0,
             ubo_off: 0,
             packed_uniform_cache: FxHashMap::default(),
+            uniform_layouts: FxHashMap::default(),
             uniform_cache_on: *UNIFORM_CACHE_ENABLED,
             uniform_ab_epoch: Instant::now(),
             dummy_tex: HashMap::new(),
@@ -2360,12 +2586,14 @@ impl Gpu {
             mip_pipelines: HashMap::new(),
             mip_sampler: None,
             occlusion_set: None,
+            occlusion_resolve_scratch: None,
             occlusion_next: 0,
             occlusion_active: None,
             occlusion_pass_slot: None,
             pending_resolve: Vec::new(),
             pending_events: Vec::new(),
             pending_maps: Vec::new(),
+            readback_batch: Vec::new(),
             readback_pool: HashMap::new(),
             readback_pool_bytes: 0,
             readback_pool_items: 0,
@@ -2429,6 +2657,14 @@ impl Gpu {
             self.objs.resize_with(i + 1, || None);
         }
         mark_resource_created(&mut self.obj_gen, i);
+        self.object_epoch = self.object_epoch.wrapping_add(1);
+        // Also handle replacement of an existing texture/view by another
+        // object type, even if a guest reuses an ID without a destroy op.
+        if matches!(&o, Obj::Tex(_) | Obj::Srv(_) | Obj::Uav(_))
+            || matches!(self.obj(id), Some(Obj::Tex(_) | Obj::Srv(_) | Obj::Uav(_)))
+        {
+            self.texture_epoch = self.texture_epoch.wrapping_add(1);
+        }
         self.objs[i] = Some(Box::new(o));
     }
     fn obj_generation(&self, id: u32) -> u64 {
@@ -2514,6 +2750,7 @@ impl Gpu {
 
     fn encoder(&mut self) -> &mut CommandEncoder {
         if self.enc.is_none() {
+            self.encoder_pass_start = self.passes;
             self.enc = Some(
                 self.device
                     .create_command_encoder(&CommandEncoderDescriptor::default()),
@@ -2530,23 +2767,65 @@ impl Gpu {
             self.pass_key = None;
             self.pass_info = None;
             self.pass_st = PassSt::default();
+            if self.finish_pool.is_some()
+                && self.sealed_encoders.len() < *ENCODER_WORKERS * 2 - 1
+                && self.passes.saturating_sub(self.encoder_pass_start) >= *ENCODER_BATCH_PASSES
+            {
+                if let Some(enc) = self.enc.take() {
+                    self.sealed_encoders.push(enc);
+                }
+            }
         }
     }
     fn flush(&mut self) {
         self.flush_astc();
         self.astc_in_encoder = 0;
         self.end_pass();
+        let uniform_start = (*PERF_DIAGNOSTICS).then(Instant::now);
         self.flush_uniforms();
+        if let Some(start) = uniform_start {
+            self.perf.uniform_upload_ms += start.elapsed().as_secs_f64() * 1000.0;
+        }
         let resolves = if self.pending_resolve.is_empty() {
             None
         } else {
             self.record_resolves()
         };
-        if let Some(enc) = self.enc.take() {
-            let perf_start = Instant::now();
-            let idx = self.queue.submit([enc.finish()]);
-            if *PERF_DIAGNOSTICS {
-                self.perf.submit_ms += perf_start.elapsed().as_secs_f64() * 1000.0;
+        if self.enc.is_some() || !self.sealed_encoders.is_empty() {
+            let finish_start = (*PERF_DIAGNOSTICS).then(Instant::now);
+            let commands: smallvec::SmallVec<[CommandBuffer; 8]> =
+                if self.sealed_encoders.is_empty() {
+                    self.enc
+                        .take()
+                        .map(CommandEncoder::finish)
+                        .into_iter()
+                        .collect()
+                } else {
+                    let mut encoders = std::mem::take(&mut self.sealed_encoders);
+                    encoders.extend(self.enc.take());
+                    use rayon::prelude::*;
+                    // Indexed collection retains original encoder order. Each
+                    // encoder's deferred validation and resource tracking stays
+                    // enabled; queue.submit inserts inter-buffer transitions.
+                    let pool = self
+                        .finish_pool
+                        .as_ref()
+                        .expect("sealed encoder without finish pool");
+                    pool.install(move || {
+                        encoders
+                            .into_par_iter()
+                            .map(CommandEncoder::finish)
+                            .collect::<Vec<_>>()
+                    })
+                    .into()
+                };
+            if let Some(start) = finish_start {
+                self.perf.finish_ms += start.elapsed().as_secs_f64() * 1000.0;
+            }
+            let submit_start = (*PERF_DIAGNOSTICS).then(Instant::now);
+            let idx = self.queue.submit(commands);
+            if let Some(start) = submit_start {
+                self.perf.submit_ms += start.elapsed().as_secs_f64() * 1000.0;
             }
             self.last_submit = Some(idx);
             self.submits += 1;
@@ -2560,6 +2839,11 @@ impl Gpu {
         }
         if let Some(r) = resolves {
             self.map_pending(r.buf, r.kind);
+        }
+        // All copies in the current encoder are now submitted. Mapping any
+        // of these buffers before submission would violate wgpu ordering.
+        for (buffer, kind) in std::mem::take(&mut self.readback_batch) {
+            self.map_pending(buffer, kind);
         }
         self.enc_epoch += 1;
     }
@@ -2643,6 +2927,12 @@ impl Gpu {
                 continue;
             }
             let p = base + 2;
+            // Only combine adjacent readback commands that are already in
+            // the published guest ring. Flush before any other opcode, or
+            // before returning to an idle ring so a waiting guest is woken.
+            if op != 42 {
+                self.flush_readbacks();
+            }
             let op_start = (*PERF_DIAGNOSTICS).then(Instant::now);
             self.exec(op, p, n);
             if let Some(start) = op_start {
@@ -2655,6 +2945,7 @@ impl Gpu {
             tail += (n * 4 + 8) as i32;
             since += 1;
             if since >= 512 {
+                self.flush_readbacks();
                 since = 0;
                 self.hdr(3).fetch_add(executed, Ordering::Relaxed);
                 executed = 0;
@@ -2666,6 +2957,7 @@ impl Gpu {
                 }
             }
         }
+        self.flush_readbacks();
         self.hdr(3).fetch_add(executed, Ordering::Relaxed);
         tail
     }
@@ -2795,7 +3087,11 @@ impl Gpu {
                 let (st, s, c) = (u(0) as usize, u(1) as usize, u(2) as usize);
                 for i in 0..c {
                     if s + i < 128 && st < 3 {
-                        self.s.srv[st][s + i] = u(3 + i as u64);
+                        let id = u(3 + i as u64);
+                        if self.s.srv[st][s + i] != id {
+                            self.s.srv[st][s + i] = id;
+                            self.srv_epoch[st] = self.srv_epoch[st].wrapping_add(1);
+                        }
                     }
                 }
             }
@@ -2803,28 +3099,41 @@ impl Gpu {
                 let (st, s, c) = (u(0) as usize, u(1) as usize, u(2) as usize);
                 for i in 0..c {
                     if s + i < 16 && st < 3 {
-                        self.s.smp[st][s + i] = u(3 + i as u64);
+                        let id = u(3 + i as u64);
+                        if self.s.smp[st][s + i] != id {
+                            self.s.smp[st][s + i] = id;
+                            self.sampler_epoch[st] = self.sampler_epoch[st].wrapping_add(1);
+                        }
                     }
                 }
             }
             26 => {
                 for i in 0..8 {
                     let q = i as u64 * 4;
-                    self.s.rt[i] = Rt {
+                    let next = Rt {
                         tex: u(q),
                         mip: u(q + 1),
                         slice: u(q + 2),
                         fmt: u(q + 3),
                     };
+                    if self.s.rt[i] != next {
+                        self.pdirty = true;
+                        self.pass_targets_dirty = true;
+                        self.s.rt[i] = next;
+                    }
                 }
-                self.s.ds = Ds {
+                let next = Ds {
                     tex: u(32),
                     mip: u(33),
                     slice: u(34),
                     fmt: u(35),
                     flags: u(36),
                 };
-                self.pdirty = true;
+                if self.s.ds != next {
+                    self.pdirty = true;
+                    self.pass_targets_dirty = true;
+                    self.s.ds = next;
+                }
             }
             27 => {
                 if self.s.blend.0 != u(0) {
@@ -2912,6 +3221,8 @@ impl Gpu {
 
     fn reset_state(&mut self) {
         self.pdirty = true;
+        self.srv_epoch = self.srv_epoch.map(|e| e.wrapping_add(1));
+        self.sampler_epoch = self.sampler_epoch.map(|e| e.wrapping_add(1));
         self.s = State::new();
         self.end_pass();
     }
@@ -2930,6 +3241,10 @@ impl Gpu {
         }
         if self.obj(id).is_none() {
             return;
+        }
+        self.object_epoch = self.object_epoch.wrapping_add(1);
+        if matches!(self.obj(id), Some(Obj::Tex(_) | Obj::Srv(_) | Obj::Uav(_))) {
+            self.texture_epoch = self.texture_epoch.wrapping_add(1);
         }
         if self.used(id) {
             if *PERF_DIAGNOSTICS {
@@ -3214,9 +3529,9 @@ impl Gpu {
         let used = self.used(id);
         let Some(b) = self.buf_mut(id) else { return };
         if let Some(sh) = b.shadow.as_mut() {
-            let end = ((offset + size) as usize).min(sh.len());
-            if (offset as usize) < end {
-                sh[offset as usize..end].copy_from_slice(&data[..end - offset as usize]);
+            if let Some(remaining) = sh.get_mut(offset as usize..) {
+                let n = remaining.len().min(data.len());
+                remaining[..n].copy_from_slice(&data[..n]);
             }
             b.version += 1;
         }
@@ -3620,6 +3935,13 @@ impl Gpu {
         let stage = self.u(p + 1);
         let hash = format!("{:08x}{:08x}", self.u(p + 3), self.u(p + 2));
         crate::remote::prefetch_shader(&hash);
+        if *SHADER_AWARE_WARMUP && self.warm_seen.insert(hash.clone()) {
+            if let Some(recipes) = self.warm_waiting.remove(&hash) {
+                for (id, recipe) in recipes {
+                    self.schedule_warm_recipe(id, recipe);
+                }
+            }
+        }
         let nin = self.u(p + 4) as u64;
         let sig = (0..nin)
             .map(|i| SigEl {
@@ -3855,7 +4177,12 @@ impl Gpu {
             } else {
                 (source, Vec::new())
             };
-        let (text, pack) = pack_uniforms(&source);
+        let (text, mut pack) = pack_uniforms(&source);
+        if *SHARED_UNIFORM_LAYOUTS {
+            if let Some(pack) = pack.as_mut() {
+                pack.layout_id = intern_uniform_layout(&mut self.uniform_layouts, pack);
+            }
+        }
         let module = self.scoped(&format!("shader {label}"), |d| {
             d.create_shader_module(ShaderModuleDescriptor {
                 label: Some(&label),
@@ -3926,6 +4253,8 @@ impl Gpu {
             text,
             flat,
             group_bindings,
+            depth_scan: std::cell::Cell::new([None; 3]),
+            local_bg: RefCell::new(std::array::from_fn(|_| None)),
             variants: RefCell::new(HashMap::new()),
             label,
             uid,
@@ -4191,7 +4520,7 @@ impl Gpu {
         self.bgl_cache.insert(key, (bgl.clone(), uid));
         (bgl, uid)
     }
-    fn empty_bgl(&mut self) -> BindGroupLayout {
+    fn empty_bgl(&mut self) -> (BindGroupLayout, u64) {
         if self.empty_bgl.is_none() {
             let b = self
                 .device
@@ -4202,7 +4531,7 @@ impl Gpu {
             let uid = self.uid();
             self.empty_bgl = Some((b, uid));
         }
-        self.empty_bgl.as_ref().unwrap().0.clone()
+        self.empty_bgl.as_ref().unwrap().clone()
     }
 
     fn target_view(
@@ -4279,6 +4608,11 @@ impl Gpu {
     }
 
     fn ensure_pass(&mut self) -> bool {
+        // Only opcode 26 changes the attachment state; reset_state ends the
+        // pass. Avoid serializing all 37 words for every unchanged draw.
+        if self.pass.is_some() && !self.pass_targets_dirty {
+            return true;
+        }
         // Eight color targets (4 words each) plus five depth/stencil words.
         // This key is computed on every draw; keeping it inline avoids an
         // otherwise unconditional heap allocation in the render hot path.
@@ -4289,15 +4623,17 @@ impl Gpu {
         let d = &self.s.ds;
         key.extend([d.tex, d.mip, d.slice, d.fmt, d.flags]);
         if self.pass.is_some() && self.pass_key.as_ref() == Some(&key) {
+            self.pass_targets_dirty = false;
             return true;
         }
         self.end_pass();
-        let mut colors: Vec<Option<(TextureView, TextureFormat)>> = Vec::new();
+        let mut colors: smallvec::SmallVec<[Option<(TextureView, TextureFormat)>; 8]> =
+            smallvec::SmallVec::new();
         let mut samples = 1;
         let mut any = false;
         let (mut pw, mut ph) = (1, 1);
         for i in 0..8 {
-            let r = self.s.rt[i].clone();
+            let r = self.s.rt[i];
             if r.tex == 0 || self.tex(r.tex).is_none() {
                 colors.push(None);
                 continue;
@@ -4319,7 +4655,7 @@ impl Gpu {
         while matches!(colors.last(), Some(None)) {
             colors.pop();
         }
-        let ds = self.s.ds.clone();
+        let ds = self.s.ds;
         let mut ds_att = None;
         let mut ds_format = None;
         let (ro_d, ro_s) = (ds.flags & 1 != 0, ds.flags & 2 != 0);
@@ -4356,9 +4692,9 @@ impl Gpu {
             me.clears_folded += 1;
             Some(c)
         };
-        let mut color_loads = Vec::with_capacity(colors.len());
+        let mut color_loads = smallvec::SmallVec::<[LoadOp<Color>; 8]>::new();
         for (i, c) in colors.iter().enumerate() {
-            let r = self.s.rt[i].clone();
+            let r = self.s.rt[i];
             let load = match c {
                 Some(_) => match take(self, r.tex, r.mip, r.slice) {
                     Some(pc) => pc.color.map(LoadOp::Clear).unwrap_or(LoadOp::Load),
@@ -4373,7 +4709,7 @@ impl Gpu {
         } else {
             None
         };
-        let color_atts: Vec<Option<RenderPassColorAttachment>> = colors
+        let color_atts: smallvec::SmallVec<[Option<RenderPassColorAttachment>; 8]> = colors
             .iter()
             .zip(&color_loads)
             .map(|(c, load)| {
@@ -4430,6 +4766,7 @@ impl Gpu {
         self.pass = Some(pass);
         self.passes += 1;
         self.pass_key = Some(key);
+        self.pass_targets_dirty = false;
         self.pdirty = true;
         self.pass_info = Some(PassInfo {
             rt_formats: colors.iter().map(|c| c.as_ref().map(|x| x.1)).collect(),
@@ -4916,6 +5253,12 @@ impl Gpu {
     }
 
     fn prepare_depth_proxies(&mut self, prog: &Program, stage: usize) {
+        let stamp = (self.srv_epoch[stage], self.texture_epoch);
+        let mut scans = prog.depth_scan.get();
+        if scans[stage] == Some(stamp) {
+            return;
+        }
+        let mut needs_scan = false;
         for b in prog
             .info
             .bindings
@@ -4939,6 +5282,7 @@ impl Gpu {
                     || (half_of(tformat).is_some()
                         && (tdesc.dim == TextureDimension::D3 || tdesc.samples > 1)));
             if point {
+                needs_scan = true;
                 let mut m = self.unfilt.get(&prog.uid).copied().unwrap_or((0, 0));
                 if m.0 & (1 << b.binding) == 0 {
                     m.0 |= 1 << b.binding;
@@ -4949,13 +5293,18 @@ impl Gpu {
                 }
             }
             if is_depth(tformat) && b.sample != Sample::Depth {
+                needs_scan = true;
                 self.depth_proxy(res, b.sample == Sample::Uint);
             } else if !is_depth(tformat) && b.sample == Sample::Depth {
+                needs_scan = true;
                 self.float_to_depth_proxy(res);
             } else if self.needs_half(tformat, b) {
+                needs_scan = true;
                 self.half_proxy(res);
             }
         }
+        scans[stage] = (!needs_scan).then_some(stamp);
+        prog.depth_scan.set(scans);
     }
 
     fn srv_view(&mut self, srv_id: u32, b: &Binding) -> Option<TextureView> {
@@ -4976,6 +5325,20 @@ impl Gpu {
                 bb.saturating_sub(desc.skip.saturating_sub(a)).max(1),
             )
         };
+        // Ordinary SRVs have an immutable cached view. Avoid cloning the
+        // underlying texture handle on every cache hit; proxy refresh still
+        // follows its original dirty-data and synchronization path.
+        let needs_proxy = (is_depth(tformat) && b.sample != Sample::Depth)
+            || (!is_depth(tformat) && b.sample == Sample::Depth)
+            || (self.needs_half(tformat, b)
+                && desc.dim != TextureDimension::D3
+                && desc.samples == 1);
+        if !needs_proxy {
+            let key = srv_view_key(b.dim, false);
+            if let Some(v) = self.view_obj(srv_id).and_then(|v| v.views.get(key)) {
+                return Some(v.clone());
+            }
+        }
         let mut proxied = false;
         let (tex, format) = if is_depth(tformat) && b.sample != Sample::Depth {
             proxied = true;
@@ -5081,7 +5444,7 @@ impl Gpu {
         let slot = self.ubo_slot;
         let need_new = match self.ubo_slots[slot].get(self.ubo_chunk) {
             None => true,
-            Some(_) => self.ubo_off + size + UBO_WINDOW > RING_CHUNK,
+            Some(_) => self.ubo_off + size + UBO_WINDOW > *UNIFORM_CHUNK_BYTES,
         };
         if need_new {
             if self.ubo_slots[slot].get(self.ubo_chunk).is_some() {
@@ -5092,7 +5455,7 @@ impl Gpu {
                 while self.ubo_shared.len() <= self.ubo_chunk {
                     let buf = self.device.create_buffer(&BufferDescriptor {
                         label: Some("uniform ring"),
-                        size: RING_CHUNK * FRAME_SLOTS as u64,
+                        size: *UNIFORM_CHUNK_BYTES * FRAME_SLOTS as u64,
                         // The browser's safe buffer-update path reuses this
                         // fenced ring to copy data in GPU command order.
                         usage: BufferUsages::UNIFORM
@@ -5108,7 +5471,7 @@ impl Gpu {
                     self.ubo_slots[slot].push(Chunk {
                         buf: buf.clone(),
                         id,
-                        base: slot as u64 * RING_CHUNK,
+                        base: slot as u64 * *UNIFORM_CHUNK_BYTES,
                         stage: Vec::new(),
                         lo: u64::MAX,
                         hi: 0,
@@ -5121,20 +5484,17 @@ impl Gpu {
         (self.ubo_chunk, off)
     }
     fn flush_uniforms(&mut self) {
-        for slot in &mut self.ubo_slots {
-            for c in slot.iter_mut() {
-                if c.lo >= c.hi {
-                    continue;
-                }
-                let hi = ((c.hi + 3) & !3).min(c.stage.len() as u64);
-                self.queue.write_buffer(
-                    &c.buf,
-                    c.base + c.lo,
-                    &c.stage[c.lo as usize..hi as usize],
-                );
-                c.lo = u64::MAX;
-                c.hi = 0;
+        // Only the active slot can have writes: present flushes before
+        // rotating slots. Like the browser, skip untouched chunks.
+        for c in &mut self.ubo_slots[self.ubo_slot] {
+            if c.lo >= c.hi {
+                continue;
             }
+            let hi = ((c.hi + 3) & !3).min(c.stage.len() as u64);
+            self.queue
+                .write_buffer(&c.buf, c.base + c.lo, &c.stage[c.lo as usize..hi as usize]);
+            c.lo = u64::MAX;
+            c.hi = 0;
         }
     }
 
@@ -5149,7 +5509,9 @@ impl Gpu {
         data: &[u8],
     ) -> bool {
         let size = data.len() as u64;
-        if !can_stage_ordered_buffer_upload(destination_offset, size) {
+        if !can_stage_ordered_buffer_upload(destination_offset, size)
+            || size > *UNIFORM_CHUNK_BYTES - UBO_WINDOW
+        {
             return false;
         }
         if size == 0 {
@@ -5161,7 +5523,9 @@ impl Gpu {
             let end = (off + size) as usize;
             if chunk.stage.len() < end {
                 chunk.stage.resize(
-                    end.max(262144).next_power_of_two().min(RING_CHUNK as usize),
+                    end.max(262144)
+                        .next_power_of_two()
+                        .min(*UNIFORM_CHUNK_BYTES as usize),
                     0,
                 );
             }
@@ -5199,8 +5563,18 @@ impl Gpu {
         // generations prevent stale reuse after a D3D resource ID is recycled;
         // versions and CB offsets track subsequent writes and subranges.
         let key = self.uniform_cache_on.then(|| UniformCacheKey {
-            program: prog.uid,
-            stage: stage as u32,
+            // Same layout and source stamps guarantee identical packed
+            // bytes even across different shader programs and stages.
+            program: if *SHARED_UNIFORM_LAYOUTS {
+                pack.layout_id
+            } else {
+                prog.uid
+            },
+            stage: if *SHARED_UNIFORM_LAYOUTS {
+                0
+            } else {
+                stage as u32
+            },
             bindings: pack
                 .members
                 .iter()
@@ -5238,19 +5612,22 @@ impl Gpu {
                 chunk.stage.resize(
                     (end.max(262144))
                         .next_power_of_two()
-                        .min(RING_CHUNK as usize),
+                        .min(*UNIFORM_CHUNK_BYTES as usize),
                     0,
                 );
             }
             std::mem::take(&mut chunk.stage)
         };
         let block = &mut stage_buf[off as usize..end];
-        block.fill(0);
+        // pack_uniforms constructs contiguous members, so only zero the
+        // missing suffix of each member, rather than clearing the entire
+        // allocation and immediately overwriting its populated bytes.
         for m in &pack.members {
             let (cb_buf, cb_first) = self.s.cb[stage]
                 .get(m.binding as usize)
                 .map(|c| (c.buf, c.first))
                 .unwrap_or_default();
+            let mut copied = 0;
             if let Some(Buf {
                 shadow: Some(sh),
                 size,
@@ -5262,8 +5639,10 @@ impl Gpu {
                 if len > 0 {
                     block[m.offset as usize..(m.offset + len) as usize]
                         .copy_from_slice(&sh[from as usize..(from + len) as usize]);
+                    copied = len;
                 }
             }
+            block[(m.offset + copied) as usize..(m.offset + m.size) as usize].fill(0);
         }
         let chunk = &mut self.ubo_slots[self.ubo_slot][ci];
         chunk.stage = stage_buf;
@@ -5431,6 +5810,105 @@ impl Gpu {
         )
     }
 
+    fn local_bg_hit(
+        &mut self,
+        prog: &Program,
+        stage: usize,
+        group: u32,
+        layout: u64,
+    ) -> Option<BgResult> {
+        let cache = prog.local_bg.borrow();
+        let entry = cache[stage].as_ref()?;
+        if entry.layout != layout
+            || entry.group != group
+            || entry.mask != self.unfilt.get(&prog.uid).copied().unwrap_or((0, 0))
+        {
+            return None;
+        }
+        let stamp = (
+            self.object_epoch,
+            self.srv_epoch[stage],
+            self.sampler_epoch[stage],
+        );
+        let unchanged = *LOCAL_BG_EPOCHS && entry.validated.get() == stamp;
+        for &(slot, id, generation, res, res_generation) in &entry.textures {
+            if !unchanged {
+                if self.s.srv[stage].get(slot).copied().unwrap_or(0) != id
+                    || self.obj_generation(id) != generation
+                {
+                    return None;
+                }
+                if id == 0 {
+                    if self.obj(0).is_some() {
+                        return None;
+                    }
+                    continue;
+                }
+                if self.view_obj(id).is_none()
+                    || self.obj_generation(res) != res_generation
+                    || self.tex(res).is_none()
+                {
+                    return None;
+                }
+            }
+            // Content writes can schedule clears or ASTC work without
+            // changing identity; never skip these synchronization checks.
+            if id != 0
+                && (self.pending_clears.contains_key(&res) || self.astc_pending.contains(&res))
+            {
+                return None;
+            }
+        }
+        if !unchanged {
+            for &(slot, id, generation) in &entry.samplers {
+                if self.s.smp[stage].get(slot).copied().unwrap_or(0) != id
+                    || self.obj_generation(id) != generation
+                {
+                    return None;
+                }
+                if id == 0 {
+                    if self.obj(0).is_some() {
+                        return None;
+                    }
+                } else if !matches!(self.obj(id), Some(Obj::State(_))) {
+                    return None;
+                }
+            }
+            entry.validated.set(stamp);
+        }
+        // One hash lookup, not contains_key followed by get_mut. Keep the
+        // owned handle while the dynamic constants are packed.
+        let (bg, uid) = {
+            let (bg, uid, frame) = self.bind_groups.get_mut(entry.key.as_slice())?;
+            *frame = self.presents;
+            (bg.clone(), *uid)
+        };
+        let dyn_off = if let Some(chunk_id) = entry.uniform_chunk {
+            if !self.uniform_cache_on {
+                return None;
+            }
+            let (ci, off) = self.pack_copy(prog, stage)?;
+            let chunk = &self.ubo_slots[self.ubo_slot][ci];
+            if chunk.id != chunk_id {
+                return None;
+            }
+            Some((chunk.base + off) as u32)
+        } else {
+            None
+        };
+        let result = BgResult { bg, uid, dyn_off };
+        for &(_, id, _, res, _) in &entry.textures {
+            if id != 0 {
+                self.use_tex(res);
+            }
+        }
+        if *PERF_DIAGNOSTICS {
+            self.perf.bind_hits += 1;
+            self.perf.local_bind_hits += 1;
+        }
+        Some(result)
+    }
+
     fn stage_bind_group(
         &mut self,
         stage: usize,
@@ -5443,15 +5921,39 @@ impl Gpu {
             View(TextureView),
             Smp(Sampler),
         }
-        let none = Vec::new();
-        let bindings = prog.group_bindings.get(&group).unwrap_or(&none);
+        let bindings = prog
+            .group_bindings
+            .get(&group)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let local_enabled = *LOCAL_BG_CACHE
+            && stage < 2
+            && !*PED_PROBE
+            && !*TEXTURE_DIAGNOSTICS
+            && !prog.label.starts_with("cascadeshadows_rendering");
+        if local_enabled {
+            if let Some(hit) = self.local_bg_hit(prog, stage, group, bgl.1) {
+                return Some(hit);
+            }
+        }
+        let mut local = local_enabled.then(|| LocalBg {
+            layout: bgl.1,
+            group,
+            mask: self.unfilt.get(&prog.uid).copied().unwrap_or((0, 0)),
+            key: smallvec::SmallVec::new(),
+            uniform_chunk: None,
+            textures: smallvec::SmallVec::new(),
+            samplers: smallvec::SmallVec::new(),
+            // First hit runs the full validation before setting the stamp.
+            validated: std::cell::Cell::new((u64::MAX, u64::MAX, u64::MAX)),
+        });
         // Most shaders use a handful of resources. Avoid allocating heap
         // vectors twice per draw before doing a bind-group cache lookup.
         // This changes only the temporary representation, not binding order
         // or the persistent cache key.
         let mut entries: smallvec::SmallVec<[(u32, Res); 8]> =
             smallvec::SmallVec::with_capacity(bindings.len());
-        let mut key: smallvec::SmallVec<[u64; 24]> =
+        let mut key: smallvec::SmallVec<[u64; 40]> =
             smallvec::SmallVec::with_capacity(bindings.len() * 2 + 3);
         key.extend([bgl.1, prog.uid, stage as u64]);
         let mut dyn_off = None;
@@ -5494,6 +5996,9 @@ impl Gpu {
                     ));
                     dyn_off = Some((c.base + off) as u32);
                     key.push(c.id);
+                    if let Some(entry) = local.as_mut() {
+                        entry.uniform_chunk = Some(c.id);
+                    }
                 }
                 Kind::Sampler | Kind::SamplerCmp => {
                     let sid = *self.s.smp[stage]
@@ -5501,6 +6006,17 @@ impl Gpu {
                         .unwrap_or(&0);
                     let want_cmp = b.kind == Kind::SamplerCmp;
                     let st = self.state(sid);
+                    if let Some(entry) = local.as_mut() {
+                        if st.is_some() || (sid == 0 && self.obj(0).is_none()) {
+                            entry.samplers.push((
+                                (b.binding as usize).wrapping_sub(16),
+                                sid,
+                                self.obj_generation(sid),
+                            ));
+                        } else {
+                            local = None;
+                        }
+                    }
                     let point = !want_cmp
                         && b.binding < 128
                         && self
@@ -5563,18 +6079,46 @@ impl Gpu {
                     let id = *self.s.srv[stage]
                         .get((b.binding as usize).wrapping_sub(32))
                         .unwrap_or(&0);
-                    let is_tex = self.view_obj(id).map(|v| !v.is_buf).unwrap_or(false);
-                    if is_tex {
-                        if let Some(r) = self.view_obj(id).map(|v| v.res) {
-                            if self.pending_clears.contains_key(&r) {
-                                self.materialize_clears(r);
-                            }
+                    let tex_res = self.view_obj(id).filter(|v| !v.is_buf).map(|v| v.res);
+                    if let Some(r) = tex_res {
+                        if self.pending_clears.contains_key(&r) {
+                            self.materialize_clears(r);
                         }
                     }
+                    let is_tex = tex_res.is_some();
                     let v = if is_tex { self.srv_view(id, b) } else { None };
+                    if let Some(entry) = local.as_mut() {
+                        if id == 0 && self.obj(0).is_none() {
+                            entry.textures.push((
+                                (b.binding as usize).wrapping_sub(32),
+                                0,
+                                self.obj_generation(0),
+                                0,
+                                0,
+                            ));
+                        } else if let Some(res) = tex_res.filter(|_| v.is_some()) {
+                            if self.tex(res).is_some_and(|t| {
+                                !is_depth(t.format)
+                                    && b.sample != Sample::Depth
+                                    && !self.needs_half(t.format, b)
+                            }) {
+                                entry.textures.push((
+                                    (b.binding as usize).wrapping_sub(32),
+                                    id,
+                                    self.obj_generation(id),
+                                    res,
+                                    self.obj_generation(res),
+                                ));
+                            } else {
+                                local = None;
+                            }
+                        } else {
+                            local = None;
+                        }
+                    }
                     match v {
                         Some(v) => {
-                            let res = self.view_obj(id).unwrap().res;
+                            let res = tex_res.unwrap();
                             let view_gen = self.obj_generation(id);
                             let texture_gen = self.obj_generation(res);
                             self.use_tex(res);
@@ -5613,6 +6157,7 @@ impl Gpu {
                     }
                 }
                 Kind::ReadOnlyStorage | Kind::Storage => {
+                    local = None;
                     let is_counter = b.binding >= 176;
                     let is_uav = b.binding >= 160;
                     let id = if is_uav {
@@ -5679,6 +6224,7 @@ impl Gpu {
                     entries.push((b.binding, Res::Buf(gb, res_off, res_size)));
                 }
                 Kind::StorageTexture => {
+                    local = None;
                     let uid = *self.s.uav[stage]
                         .get((b.binding as usize).wrapping_sub(160))
                         .unwrap_or(&0);
@@ -5804,9 +6350,19 @@ impl Gpu {
                 "constants": constants,
             }));
         }
-        if let Some((bg, uid)) = self.bind_groups.get(key.as_slice()) {
+        if let Some((bg, uid, last_frame)) = self.bind_groups.get_mut(key.as_slice()) {
+            *last_frame = self.presents;
             if *PERF_DIAGNOSTICS {
                 self.perf.bind_hits += 1;
+            }
+            if let Some(mut entry) = local.take() {
+                entry.key = key.clone();
+                let mut slots = prog.local_bg.borrow_mut();
+                if let Some(existing) = slots[stage].as_mut() {
+                    **existing = entry;
+                } else {
+                    slots[stage] = Some(Box::new(entry));
+                }
             }
             return Some(BgResult {
                 bg: bg.clone(),
@@ -5843,24 +6399,38 @@ impl Gpu {
         }
         if self.bind_groups.len() > BG_LIMIT * 3 / 2 {
             // Clearing everything makes the next frames recreate every group,
-            // a measurable CPU spike. Keep the newest half; uids are monotonic
-            // per worker because they are only handed out when a group is made.
+            // a measurable CPU spike. Keep the most recently used groups;
+            // unique creation IDs break ties within a frame.
             let keep = BG_LIMIT / 2;
-            let mut uids: Vec<u64> = self.bind_groups.values().map(|(_, uid)| *uid).collect();
-            uids.sort_unstable_by(|a, b| b.cmp(a));
-            if let Some(&cutoff) = uids.get(keep) {
-                let before = self.bind_groups.len();
-                self.bind_groups.retain(|_, (_, uid)| *uid >= cutoff);
-                log(&format!(
-                    "bind group cache trimmed {} -> {}",
-                    before,
-                    self.bind_groups.len()
-                ));
-                self.perf.bind_trims += 1;
-            }
+            let mut ages: Vec<(u64, u64)> = self
+                .bind_groups
+                .values()
+                .map(|(_, uid, frame)| (*frame, *uid))
+                .collect();
+            let (_, cutoff, _) = ages.select_nth_unstable_by(keep, |a, b| b.cmp(a));
+            let cutoff = *cutoff;
+            let before = self.bind_groups.len();
+            self.bind_groups
+                .retain(|_, (_, uid, frame)| (*frame, *uid) >= cutoff);
+            log(&format!(
+                "bind group cache trimmed {} -> {}",
+                before,
+                self.bind_groups.len()
+            ));
+            self.perf.bind_trims += 1;
         }
         let uid = self.uid();
-        self.bind_groups.insert(key.into_vec(), (bg.clone(), uid));
+        if let Some(mut entry) = local {
+            entry.key = key.clone();
+            let mut slots = prog.local_bg.borrow_mut();
+            if let Some(existing) = slots[stage].as_mut() {
+                **existing = entry;
+            } else {
+                slots[stage] = Some(Box::new(entry));
+            }
+        }
+        self.bind_groups
+            .insert(key.into_vec(), (bg.clone(), uid, self.presents));
         Some(BgResult { bg, uid, dyn_off })
     }
 
@@ -5885,16 +6455,19 @@ impl Gpu {
         };
         // A draw's sixteen vertex-stream strides have a fixed upper bound.
         // Compute them on the stack instead of allocating a Vec per draw.
-        let strides: [u32; 16] = std::array::from_fn(|i| {
+        let mut strides = [0u32; 16];
+        for &(slot, _) in &layout.slots {
+            let i = slot as usize;
+            if i >= strides.len() {
+                return None;
+            }
             let v = &self.s.vb[i];
             if v.buf != 0 && self.buf(v.buf).map(|b| b.gpu.is_some()).unwrap_or(false) {
-                v.stride
-            } else {
-                0
+                strides[i] = v.stride;
             }
-        });
-        let st = PipeStates {
-            sig: self.vs_sig()?,
+        }
+        let mut st = PipeStates {
+            sig: Vec::new(),
             rs: if self.s.rs != 0 {
                 self.state(self.s.rs)
             } else {
@@ -5968,17 +6541,20 @@ impl Gpu {
             None => {}
         }
         self.pipe_creates += 1;
+        st.sig = self.vs_sig()?;
         let Some((job, vb_req)) =
             self.create_pipeline(vs, ps, layout, &strides, topo, strip_fmt, &pi, &st)
         else {
             self.pipelines.insert(key.into_vec(), PipeEntry::Done(None));
             return None;
         };
-        self.record_recipe(vs, ps, layout, &strides, strip_code, &st, &pi);
+        let recipe_id = self.record_recipe(vs, ps, layout, &strides, strip_code, &st, &pi);
         if let Some(tx) = self.pipe_jobs.clone() {
             let id = self.uid();
-            self.pipe_pending
-                .insert(id, (key.clone().into_vec(), vb_req, job.label.clone()));
+            self.pipe_pending.insert(
+                id,
+                (key.clone().into_vec(), vb_req, job.label.clone(), recipe_id),
+            );
             self.pipelines
                 .insert(key.clone().into_vec(), PipeEntry::Pending);
             let _ = tx.send((id, job));
@@ -6002,15 +6578,19 @@ impl Gpu {
             self.pending_skips += 1;
             return None;
         }
-        let pl = compile_pipeline(&self.device, &job).map(|pipeline| {
-            let uid = self.uid();
-            Rc::new(Pl {
-                pipeline,
-                uid,
-                vb_req,
-                label: job.label,
-            })
-        });
+        let pl = compile_pipeline(&self.device, &job, self.driver_pipeline_cache.as_ref()).map(
+            |pipeline| {
+                let uid = self.uid();
+                Rc::new(Pl {
+                    pipeline,
+                    uid,
+                    used: std::cell::Cell::new(false),
+                    recipe_id,
+                    vb_req,
+                    label: job.label,
+                })
+            },
+        );
         self.pipelines
             .insert(key.into_vec(), PipeEntry::Done(pl.clone()));
         pl
@@ -6034,22 +6614,28 @@ impl Gpu {
             vs.label,
             ps.map(|p| p.label.as_str()).unwrap_or("-")
         );
-        let bgl0 = if vs.info.bindings.iter().any(|b| b.group == 0) {
-            self.bgl_for(vs, 0, 0).0
+        let (bgl0, uid0) = if vs.info.bindings.iter().any(|b| b.group == 0) {
+            self.bgl_for(vs, 0, 0)
         } else {
             self.empty_bgl()
         };
-        let bgl1 = match ps {
-            Some(p) if p.info.bindings.iter().any(|b| b.group == 1) => self.bgl_for(p, 1, 1).0,
+        let (bgl1, uid1) = match ps {
+            Some(p) if p.info.bindings.iter().any(|b| b.group == 1) => self.bgl_for(p, 1, 1),
             _ => self.empty_bgl(),
         };
-        let pl_layout = self
-            .device
-            .create_pipeline_layout(&PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[Some(&bgl0), Some(&bgl1)],
-                immediate_size: 0,
-            });
+        let pl_layout = if let Some(layout) = self.pipeline_layouts.get(&(uid0, uid1)) {
+            layout.clone()
+        } else {
+            let layout = self
+                .device
+                .create_pipeline_layout(&PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[Some(&bgl0), Some(&bgl1)],
+                    immediate_size: 0,
+                });
+            self.pipeline_layouts.insert((uid0, uid1), layout.clone());
+            layout
+        };
         let remap = self.inter_stage_remap(vs, ps.map(|p| p.as_ref()));
         let vmod = self.vertex_module(
             vs,
@@ -6376,13 +6962,9 @@ impl Gpu {
         strip_code: i64,
         st: &PipeStates,
         pi: &PassInfo,
-    ) {
-        if !*PIPE_CACHE
-            || vs.hash.is_empty()
-            || ps.is_some_and(|p| p.hash.is_empty())
-            || self.recipe_bytes > RECIPE_LIMIT
-        {
-            return;
+    ) -> Option<u64> {
+        if !*PIPE_CACHE || vs.hash.is_empty() || ps.is_some_and(|p| p.hash.is_empty()) {
+            return None;
         }
         let mask = |uid: u64| {
             self.unfilt
@@ -6401,14 +6983,35 @@ impl Gpu {
             "uv": mask(vs.uid), "up": ps.and_then(|p| mask(p.uid)),
         });
         let line = format!("{r}\n");
+        let id = stable_hash(&line.trim_end());
+        if self.recipe_ids.contains(&id) {
+            return Some(id);
+        }
+        if self.recipe_bytes > RECIPE_LIMIT {
+            return None;
+        }
+        self.recipe_ids.insert(id);
         self.recipe_bytes += line.len() as u64;
+        self.recipe_batch.push_str(&line);
+        if self.recipe_batch.len() >= 64 << 10 {
+            self.flush_recipe_batch();
+        }
+        Some(id)
+    }
+
+    fn flush_recipe_batch(&mut self) {
+        if self.recipe_batch.is_empty() {
+            return;
+        }
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.recipe_path())
         {
-            let _ = f.write_all(line.as_bytes());
+            if f.write_all(self.recipe_batch.as_bytes()).is_ok() {
+                self.recipe_batch.clear();
+            }
         }
     }
 
@@ -6419,6 +7022,55 @@ impl Gpu {
             .join("pipelines-v1.jsonl")
     }
 
+    fn hot_recipe_path(&self) -> PathBuf {
+        self.recipe_path().with_file_name("pipelines-hot-v1.json")
+    }
+
+    fn save_hot_recipes(&mut self) {
+        let mut used: Vec<u64> = self
+            .pipelines
+            .values()
+            .filter_map(|entry| match entry {
+                PipeEntry::Done(Some(pl)) if pl.used.get() => pl.recipe_id,
+                _ => None,
+            })
+            .collect();
+        let current = used.len();
+        if current == 0 {
+            return;
+        }
+        let mut seen = HashSet::new();
+        used.extend_from_slice(&self.hot_recipe_ids);
+        used.retain(|id| seen.insert(*id));
+        used.truncate(8192);
+        if let Ok(bytes) = serde_json::to_vec(&used) {
+            // This file is a disposable performance hint, never a source of
+            // compiled code or authority. A truncated file falls back to full warmup.
+            if std::fs::write(self.hot_recipe_path(), bytes).is_ok() {
+                self.hot_recipe_ids = used;
+            }
+        }
+        log(&format!(
+            "pipeline working set: total={} used={} hot_history={}",
+            self.pipelines.len(),
+            current,
+            self.hot_recipe_ids.len()
+        ));
+    }
+
+    fn schedule_warm_recipe(&mut self, id: u64, recipe: serde_json::Value) {
+        if *SHADER_AWARE_WARMUP {
+            if let Some(hash) = missing_recipe_shader(&recipe, &self.warm_seen) {
+                self.warm_waiting
+                    .entry(hash.to_owned())
+                    .or_default()
+                    .push((id, recipe));
+                return;
+            }
+        }
+        self.warm.push_back((id, recipe));
+    }
+
     fn load_recipes(&mut self) {
         if !*PIPE_CACHE {
             return;
@@ -6427,24 +7079,52 @@ impl Gpu {
             return;
         };
         self.recipe_bytes = text.len() as u64;
-        self.warm = text
-            .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
+        self.hot_recipe_ids = std::fs::read(self.hot_recipe_path())
+            .ok()
+            .filter(|b| b.len() <= 256 << 10)
+            .and_then(|bytes| serde_json::from_slice::<Vec<u64>>(&bytes).ok())
+            .unwrap_or_default();
+        self.hot_recipe_ids.truncate(8192);
+        let hot: HashSet<u64> = self.hot_recipe_ids.iter().copied().collect();
+        let selective =
+            std::env::var("WGR_HOT_PIPELINES").as_deref() == Ok("1") && hot.len() >= 128;
+        for line in text.lines() {
+            let id = stable_hash(&line);
+            if !self.recipe_ids.insert(id) {
+                continue;
+            }
+            if selective && !hot.contains(&id) {
+                continue;
+            }
+            if let Ok(recipe) = serde_json::from_str(line) {
+                self.schedule_warm_recipe(id, recipe);
+            }
+        }
+        log(&format!(
+            "pipeline recipe policy: selective={selective} indexed={} selected={}",
+            self.recipe_ids.len(),
+            self.warm.len()
+        ));
         log(&format!(
             "pipeline cache: {} recipes to build during loading",
             self.warm.len()
         ));
+        if *SHADER_AWARE_WARMUP {
+            log(&format!(
+                "shader-aware warmup: {} recipes waiting for shader declarations",
+                self.warm_waiting.values().map(Vec::len).sum::<usize>()
+            ));
+        }
         self.warm_t0 = Some(Instant::now());
     }
 
     fn warm_step(&mut self, budget: Duration) {
         let start = Instant::now();
         while start.elapsed() < budget && self.pipe_pending.len() < 8 {
-            let Some(r) = self.warm.pop_front() else {
+            let Some((id, r)) = self.warm.pop_front() else {
                 break;
             };
-            if self.warm_one(&r).is_some() {
+            if self.warm_one(&r, id).is_some() {
                 self.warmed += 1;
             }
         }
@@ -6459,7 +7139,7 @@ impl Gpu {
         }
     }
 
-    fn warm_one(&mut self, r: &serde_json::Value) -> Option<()> {
+    fn warm_one(&mut self, r: &serde_json::Value, recipe_id: u64) -> Option<()> {
         let u = |v: &serde_json::Value| v.as_u64().map(|x| x as u32);
         let arr = |v: &serde_json::Value| v.as_array().cloned().unwrap_or_default();
         let words = |v: &serde_json::Value| {
@@ -6546,7 +7226,7 @@ impl Gpu {
         };
         let rt_formats = arr(&r["rt"]).iter().map(fmt).collect::<Option<Vec<_>>>()?;
         let pi = PassInfo {
-            rt_formats,
+            rt_formats: rt_formats.into(),
             samples: u(&r["samples"])?,
             ds_format: fmt(&r["ds"])?,
             ro_depth: r["rod"].as_bool()?,
@@ -6587,8 +7267,15 @@ impl Gpu {
         )?;
         let tx = self.pipe_jobs.clone()?;
         let id = self.uid();
-        self.pipe_pending
-            .insert(id, (key.clone().into_vec(), vb_req, job.label.clone()));
+        self.pipe_pending.insert(
+            id,
+            (
+                key.clone().into_vec(),
+                vb_req,
+                job.label.clone(),
+                Some(recipe_id),
+            ),
+        );
         self.pipelines.insert(key.into_vec(), PipeEntry::Pending);
         let _ = tx.send((id, job));
         Some(())
@@ -6613,7 +7300,7 @@ impl Gpu {
     }
 
     fn finish_pipeline(&mut self, id: u64, pipeline: Option<RenderPipeline>) {
-        let Some((key, vb_req, label)) = self.pipe_pending.remove(&id) else {
+        let Some((key, vb_req, label, recipe_id)) = self.pipe_pending.remove(&id) else {
             return;
         };
         let entry = pipeline.map(|pipeline| {
@@ -6621,6 +7308,8 @@ impl Gpu {
             Rc::new(Pl {
                 pipeline,
                 uid,
+                used: std::cell::Cell::new(false),
+                recipe_id,
                 vb_req,
                 label,
             })
@@ -6935,7 +7624,7 @@ impl Gpu {
         let mut vb_binds: smallvec::SmallVec<[(u32, Buffer, u64, u64); 8]> =
             smallvec::SmallVec::new();
         for &(slot, cls) in &layout.slots {
-            let vb = self.s.vb[slot as usize].clone();
+            let vb = self.s.vb[slot as usize];
             match self
                 .buf(vb.buf)
                 .and_then(|b| b.gpu.clone().map(|g| (g, b.bytes)))
@@ -7108,9 +7797,6 @@ impl Gpu {
                 }
             }
         }
-        if st.vb.len() < 16 {
-            st.vb.resize(16, None);
-        }
         for (slot, g, off, ident) in &vb_binds {
             let key = (*ident, *off);
             if st.vb[*slot as usize] != Some(key) {
@@ -7178,6 +7864,7 @@ impl Gpu {
                 }
             }
         }
+        pl.used.set(true);
         self.draws += 1;
         // One-shot, opt-in G-buffer readback after a real ped draw. Unlike a
         // screenshot of the final swapchain, this reveals whether the
@@ -7413,10 +8100,13 @@ impl Gpu {
                                     })
                                     .collect(),
                                 size: p.size,
+                                layout_id: p.layout_id,
                             }),
                             text,
                             flat: vec![],
                             group_bindings: gb,
+                            depth_scan: std::cell::Cell::new([None; 3]),
+                            local_bg: RefCell::new(std::array::from_fn(|_| None)),
                             variants: RefCell::new(HashMap::new()),
                             label: prog.label.clone(),
                             uid,
@@ -8567,11 +9257,7 @@ impl Gpu {
             if copy > 0 {
                 self.encoder().copy_buffer_to_buffer(&g, from, &rb, 0, copy);
             }
-            if *PERF_DIAGNOSTICS {
-                self.perf.flush_readback += 1;
-            }
-            self.flush();
-            self.map_pending(
+            self.queue_readback(
                 rb,
                 MapKind::Readback {
                     flag,
@@ -8677,11 +9363,25 @@ impl Gpu {
                 ),
             );
         }
-        if *PERF_DIAGNOSTICS {
-            self.perf.flush_readback += 1;
+        self.queue_readback(rb, MapKind::Readback { flag, rows });
+    }
+
+    fn queue_readback(&mut self, buffer: Buffer, kind: MapKind) {
+        self.readback_batch.push((buffer, kind));
+        // Limit outstanding staging allocations even if the ring contains
+        // an unusually long consecutive sequence of readbacks.
+        if self.readback_batch.len() >= 8 {
+            self.flush_readbacks();
         }
-        self.flush();
-        self.map_pending(rb, MapKind::Readback { flag, rows });
+    }
+
+    fn flush_readbacks(&mut self) {
+        if !self.readback_batch.is_empty() {
+            if *PERF_DIAGNOSTICS {
+                self.perf.flush_readback += 1;
+            }
+            self.flush();
+        }
     }
 
     fn map_pending(&mut self, buf: Buffer, kind: MapKind) {
@@ -8748,10 +9448,10 @@ impl Gpu {
                         }
                     }
                     MapKind::Occlusion { list } => {
-                        for &(byte, cnt, addr, consecutive, seq) in list {
+                        for (offsets, addr, seq) in list {
                             let mut sum = 0u64;
-                            for k in 0..cnt as u64 {
-                                let at = (byte + k * if consecutive { 8 } else { 256 }) as usize;
+                            for &byte in offsets {
+                                let at = byte as usize;
                                 if at + 8 <= range.len() {
                                     sum +=
                                         u64::from_le_bytes(range[at..at + 8].try_into().unwrap());
@@ -8763,25 +9463,22 @@ impl Gpu {
                                 OCCLUSION_ZERO.fetch_add(1, Ordering::Relaxed);
                             }
                             self.query_store(
-                                addr,
+                                *addr,
                                 occlusion_guest_result(Some(sum), *FORCE_OCCLUSION_VISIBLE),
-                                seq as u32,
+                                *seq,
                             );
                         }
                     }
                 }
             }
             pm.buf.unmap();
-            let recycled = matches!(&pm.kind, MapKind::Readback { .. });
             if let MapKind::Readback { flag, .. } = pm.kind {
                 if flag != 0 {
                     atomic(&self.mem, flag).store(0, Ordering::SeqCst);
                     let _ = self.mem.atomic_notify(flag, u32::MAX);
                 }
             }
-            if recycled {
-                self.recycle_staging_readback(pm.buf);
-            }
+            self.recycle_staging_readback(pm.buf);
         }
     }
 
@@ -8898,7 +9595,7 @@ impl Gpu {
     fn record_resolves(&mut self) -> Option<PendingMap> {
         let list = std::mem::take(&mut self.pending_resolve);
         let mut layout = Vec::new();
-        let mut bytes = 0u64;
+        let mut query_slots = Vec::new();
         for (id, seq, slots) in list {
             let Some(addr) = (match self.obj(id) {
                 Some(Obj::Query(q)) => Some(q.addr),
@@ -8919,46 +9616,55 @@ impl Gpu {
                 ));
                 continue;
             }
-            let consecutive = slots.windows(2).all(|w| w[1] == w[0] + 1);
-            layout.push((slots, bytes, addr, consecutive, seq));
-            bytes += if consecutive {
-                (layout.last().unwrap().0.len() as u64 * 8).div_ceil(256) * 256
-            } else {
-                layout.last().unwrap().0.len() as u64 * 256
-            };
+            query_slots.extend_from_slice(&slots);
+            layout.push((slots, addr, seq));
         }
         if self.occlusion_next > OCCLUSION_CAPACITY - 256 && self.occlusion_active.is_none() {
             self.occlusion_next = 0;
         }
+        let (ranges, bytes) = pack_query_slots(&mut query_slots);
         if bytes == 0 {
             return None;
         }
         let size = bytes.next_power_of_two().max(256);
-        let rb = self.device.create_buffer(&BufferDescriptor {
-            label: Some("occlusion resolve"),
-            size,
-            usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let map = self.device.create_buffer(&BufferDescriptor {
-            label: Some("occlusion map"),
-            size,
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        // Queue execution is ordered: the resolve scratch can be reused
+        // after its recorded copy to a distinct, unmapped staging buffer.
+        if self
+            .occlusion_resolve_scratch
+            .as_ref()
+            .is_none_or(|b| b.size() < size)
+        {
+            self.occlusion_resolve_scratch = Some(self.device.create_buffer(&BufferDescriptor {
+                label: Some("occlusion resolve scratch"),
+                size,
+                usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }));
+        }
+        let rb = self.occlusion_resolve_scratch.as_ref()?.clone();
+        let map = self.staging_readback(size);
         let set = self.occlusion_set.clone()?;
         let enc = self.encoder();
-        let mut out = Vec::new();
-        for (slots, at, addr, consecutive, seq) in &layout {
-            if *consecutive {
-                enc.resolve_query_set(&set, slots[0]..slots[0] + slots.len() as u32, &rb, *at);
-            } else {
-                for (i, s) in slots.iter().enumerate() {
-                    enc.resolve_query_set(&set, *s..*s + 1, &rb, at + i as u64 * 256);
-                }
+        let mut offsets = [0u64; OCCLUSION_CAPACITY as usize];
+        for (range, at) in ranges {
+            for slot in range.clone() {
+                offsets[slot as usize] = at + u64::from(slot - range.start) * 8;
             }
-            out.push((*at, slots.len() as u32, *addr, *consecutive, *seq as usize));
+            enc.resolve_query_set(&set, range, &rb, at);
         }
+        let out = layout
+            .into_iter()
+            .map(|(slots, addr, seq)| {
+                (
+                    slots
+                        .into_iter()
+                        .map(|slot| offsets[slot as usize])
+                        .collect(),
+                    addr,
+                    seq,
+                )
+            })
+            .collect();
         enc.copy_buffer_to_buffer(&rb, 0, &map, 0, bytes);
         let done = Arc::new(AtomicBool::new(false));
         Some(PendingMap {
@@ -8975,16 +9681,6 @@ impl Gpu {
         }
     }
     fn on_submitted(&mut self) {
-        let unmapped: Vec<usize> = self
-            .pending_maps
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| {
-                matches!(m.kind, MapKind::Occlusion { .. }) && !m.done.load(Ordering::SeqCst)
-            })
-            .map(|(i, _)| i)
-            .collect();
-        let _ = unmapped;
         if !self.pending_events.is_empty() {
             let evs = std::mem::take(&mut self.pending_events);
             let mem = self.mem.clone();
@@ -9190,6 +9886,29 @@ impl Gpu {
             self.perf_frame_start = Instant::now();
         }
         self.presents += 1;
+        static LEARN_RECIPES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            matches!(
+                std::env::var("WGR_HOT_PIPELINES").as_deref(),
+                Ok("1" | "learn")
+            )
+        });
+        if self.presents.is_multiple_of(120)
+            && crate::bridge::world_ready()
+            && *PIPE_CACHE
+            && *LEARN_RECIPES
+        {
+            self.save_hot_recipes();
+        }
+        if self.presents.is_multiple_of(60) {
+            self.flush_recipe_batch();
+        }
+        // Streaming can leave thousands of obsolete groups holding resource
+        // handles. Drop only groups not used in the last 120 frames, well
+        // beyond the GPU's in-flight uniform ring.
+        if self.presents.is_multiple_of(60) && self.bind_groups.len() > 4096 {
+            let oldest = self.presents.saturating_sub(120);
+            self.bind_groups.retain(|_, (_, _, frame)| *frame >= oldest);
+        }
         self.pipe_wait_left = PIPELINE_WAIT;
         PRESENTS.store(self.presents, Ordering::Relaxed);
         self.log_fps();
@@ -9285,6 +10004,11 @@ impl Gpu {
                     self.perf.flush_readback,
                     self.perf.flush_idle_query,
                     self.uniform_cache_on
+                ));
+                log(&format!("perf-encode: finish_ms/frame={:.2} queue_submit_ms/frame={:.2} uniform_upload_ms/frame={:.2}", self.perf.finish_ms / n, self.perf.submit_ms / n, self.perf.uniform_upload_ms / n));
+                log(&format!(
+                    "perf-local: local_bind_hits={}",
+                    self.perf.local_bind_hits
                 ));
                 log(&format!(
                     "perf-ops: draws={} draw_ms/frame={:.2} readbacks={} readback_ms/frame={:.2} dispatch_ms/frame={:.2} buffer_upload_ms/frame={:.2} texture_upload_ms/frame={:.2} idle_wait_ms/frame={:.2} readback_pool_hits={} readback_pool_misses={} buffer_readbacks={} texture_readbacks={}",

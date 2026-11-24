@@ -560,7 +560,6 @@ impl VertexLimits {
 pub(crate) struct VertexSlot {
     pub(crate) buffer: Arc<Buffer>,
     pub(crate) range: Range<BufferAddress>,
-    pub(crate) is_dirty: bool,
 }
 
 /// Vertex buffer tracking state, shared between render passes and render bundles.
@@ -570,6 +569,8 @@ pub(crate) struct VertexSlot {
 #[derive(Debug, Default)]
 pub(crate) struct VertexState {
     slots: [Option<VertexSlot>; hal::MAX_VERTEX_BUFFERS],
+    assigned: u64,
+    dirty: u64,
     pub(crate) limits: VertexLimits,
 }
 
@@ -584,13 +585,16 @@ impl VertexState {
         self.slots[slot] = Some(VertexSlot {
             buffer,
             range,
-            is_dirty: true,
         });
+        self.assigned |= 1u64 << slot;
+        self.dirty |= 1u64 << slot;
     }
 
     /// Clear a vertex buffer slot.
     pub(crate) fn clear_buffer(&mut self, slot: usize) {
         self.slots[slot] = None;
+        self.assigned &= !(1u64 << slot);
+        self.dirty &= !(1u64 << slot);
     }
 
     /// Recompute the cached vertex and instance limits based on the current slots and pipeline.
@@ -604,11 +608,7 @@ impl VertexState {
     }
 
     fn last_assigned_index(&self) -> Option<usize> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.as_ref().map(|_| i))
-            .next_back()
+        (self.assigned != 0).then(|| 63 - self.assigned.leading_zeros() as usize)
     }
 
     pub(super) fn validate(
@@ -653,12 +653,11 @@ impl VertexState {
     where
         F: FnMut(u32, &Arc<Buffer>, BufferAddress, Option<BufferSize>),
     {
-        for (i, slot) in self.slots.iter_mut().enumerate() {
-            let Some(slot) = slot.as_mut() else { continue };
-            if !slot.is_dirty {
-                continue;
-            }
-            slot.is_dirty = false;
+        let mut dirty = core::mem::take(&mut self.dirty);
+        while dirty != 0 {
+            let i = dirty.trailing_zeros() as usize;
+            dirty &= dirty - 1;
+            let slot = self.slots[i].as_ref().expect("dirty vertex slot is assigned");
             let size = slot.range.end - slot.range.start;
             f(
                 i as u32,

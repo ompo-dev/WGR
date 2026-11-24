@@ -10,7 +10,7 @@ use wgr_core::security::{rooted_file, safe_relative, HttpClient, NetworkPolicy};
 const DISK_BUDGET: u64 = 6 << 30;
 const MIN_DISK_BUDGET: u64 = 2 << 30;
 const FREE_DISK_RESERVE: u64 = 12 << 30;
-const DEFAULT_HOT_BUDGET_MIB: usize = 128;
+const DEFAULT_HOT_BUDGET_MIB: usize = 256;
 const MAX_HOT_BUDGET_MIB: usize = 256;
 const BLOCK: u64 = 128 << 10;
 const FETCH_WINDOW: u64 = 1 << 20;
@@ -1436,7 +1436,13 @@ pub fn prefetch_data(path: &str, size: u64, offset: u64, length: u64, low: bool)
     }
 }
 
-pub fn read_data(path: &str, size: u64, offset: u64, length: u64) -> Result<Vec<u8>> {
+pub fn read_data_chunks(
+    path: &str,
+    size: u64,
+    offset: u64,
+    length: u64,
+    mut consume: impl FnMut(u64, &[u8]) -> Result<()>,
+) -> Result<()> {
     safe_relative(path)?;
     ensure!(
         length <= 16 << 20 && offset <= size && length <= size - offset,
@@ -1447,7 +1453,6 @@ pub fn read_data(path: &str, size: u64, offset: u64, length: u64) -> Result<Vec<
     let url = format!("{}{path}?v={}", assets.data_base, assets.version);
     let end = offset + length;
     let mut position = offset;
-    let mut output = Vec::with_capacity(length as usize);
     while position < end {
         let start = position / BLOCK * BLOCK;
         let finish = (start + BLOCK).min(size);
@@ -1458,10 +1463,10 @@ pub fn read_data(path: &str, size: u64, offset: u64, length: u64) -> Result<Vec<
         );
         let take = (end - position).min(finish - position) as usize;
         let from = (position - start) as usize;
-        output.extend_from_slice(&data[from..from + take]);
+        consume(position - offset, &data[from..from + take])?;
         position += take as u64;
     }
-    Ok(output)
+    Ok(())
 }
 
 pub fn enabled() -> bool {

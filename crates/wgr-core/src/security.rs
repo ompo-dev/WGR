@@ -281,7 +281,7 @@ impl HttpClient {
                 ensure!(!addresses.is_empty(), "DNS sem endereços");
                 validate_addresses(&addresses, self.policy.development_loopback)?;
                 // Pin the verified DNS answer to this connection; redirects re-enter validation.
-                let client = {
+                {
                     let mut clients = self
                         .clients
                         .lock()
@@ -309,8 +309,7 @@ impl HttpClient {
                         clients.insert(key, (addresses, client.clone(), Instant::now()));
                         client
                     }
-                };
-                client
+                }
             };
             let response = client
                 .request(method.clone(), url.clone())

@@ -34,6 +34,21 @@ static PENDING_MAILBOX: LazyLock<Mutex<HashSet<u64>>> =
 static ANY_PENDING: AtomicU64 = AtomicU64::new(0);
 static STUB_SEQ: AtomicU64 = AtomicU64::new(0);
 
+// Keep the existing default until a larger guest scheduler budget has
+// passed the real-game stress workload on this machine.
+static GUEST_CORES: LazyLock<i64> = LazyLock::new(|| {
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let requested = std::env::var("WGR_GUEST_CORES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(4);
+    let selected = requested.clamp(1, available.min(16));
+    eprintln!("[host] guest logical core budget: {selected}/{available}");
+    selected as i64
+});
+
 static STOPPED: AtomicBool = AtomicBool::new(false);
 static FATAL: Mutex<Option<String>> = Mutex::new(None);
 
@@ -265,12 +280,7 @@ pub fn call(
             std::process::exit(int(params, 0) as i32);
         }
         "_abort_js" => anyhow::bail!("engine called abort()"),
-        "emscripten_num_logical_cores" => set_int(
-            results,
-            std::thread::available_parallelism()
-                .map(|n| n.get().min(4) as i64)
-                .unwrap_or(2),
-        ),
+        "emscripten_num_logical_cores" => set_int(results, *GUEST_CORES),
         "emscripten_get_heap_max" => set_int(
             results,
             mem.ty()

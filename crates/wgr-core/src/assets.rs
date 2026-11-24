@@ -112,6 +112,7 @@ impl DiskCache {
             PRAGMA journal_size_limit=8388608;
             CREATE TABLE IF NOT EXISTS objects(hash TEXT PRIMARY KEY,size INTEGER NOT NULL,last_access INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS refs(key TEXT PRIMARY KEY,hash TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS cache_refs_hash ON refs(hash);
             CREATE INDEX IF NOT EXISTS cache_lru ON objects(last_access);
             -- This total is read for every downloaded 128-KiB asset block.
             -- Computing SUM(size) over thousands of files per INSERT made
@@ -211,7 +212,8 @@ impl DiskCache {
                 .map_err(|_| anyhow::anyhow!("Cache ocupado"))?;
             self.read_lock_wait_ns
                 .fetch_add(waited.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            db.query_row("SELECT hash FROM refs WHERE key=?1", [key], |r| r.get(0))
+            db.prepare_cached("SELECT hash FROM refs WHERE key=?1")?
+                .query_row([key], |r| r.get(0))
                 .optional()?
         };
         let Some(hash) = hash else { return Ok(None) };
@@ -248,7 +250,8 @@ impl DiskCache {
         self.read_lock_wait_ns
             .fetch_add(waited.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let current: Option<String> = db
-            .query_row("SELECT hash FROM refs WHERE key=?1", [key], |r| r.get(0))
+            .prepare_cached("SELECT hash FROM refs WHERE key=?1")?
+            .query_row([key], |r| r.get(0))
             .optional()?;
         if current.as_deref() != Some(hash.as_str()) {
             // A writer/evictor changed the mapping while the file was being
@@ -262,7 +265,7 @@ impl DiskCache {
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Fila LRU ocupada"))?;
                 accessed.insert(hash, next_cache_access_stamp());
-                accessed.len() >= 64
+                accessed.len() >= 512
             };
             if should_flush {
                 self.flush_accesses(&mut db)?;
@@ -368,7 +371,7 @@ impl DiskCache {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Cache ocupado"))?;
             // Eviction must see all recent verified reads, even when the
-            // normal 64-item batch has not filled yet.
+            // normal 512-item batch has not filled yet.
             self.flush_accesses(&mut db)?;
             let mut pinned = self
                 .pinned

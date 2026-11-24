@@ -1711,6 +1711,13 @@ pub fn script_tick(
             }
         }
 
+        // Local sandbox regression workload, never enabled by an ordinary
+        // launch. It drives the real guest vehicle/particle code rather than
+        // manufacturing FPS by benchmarking an empty screen.
+        if WORLD_REPORTED.load(Ordering::Relaxed) {
+            stress_probe(&mut c);
+        }
+
         if crate::pad::ACTIVE.load(Ordering::Relaxed) || cfg!(target_os = "ios") {
             let ped = c.i("PlayerPedId", &[]);
             let in_car =
@@ -1786,6 +1793,182 @@ fn call(caller: &mut Caller<'_, HostState>, name: &str, args: &[Val]) -> Option<
 struct Cmd<'a, 'b> {
     caller: &'a mut Caller<'b, HostState>,
     scratch: u64,
+}
+
+#[derive(Default)]
+struct StressProbe {
+    started: Option<Instant>,
+    last_spawn: Option<Instant>,
+    last_burst: Option<Instant>,
+    vehicles: Vec<i32>,
+    bursts: usize,
+    anchor: Option<([f32; 3], f32)>,
+    last_observation: Option<Instant>,
+    peak_existing: usize,
+    peak_on_screen: usize,
+    finished: bool,
+}
+
+const STRESS_VEHICLES: usize = 18;
+const STRESS_BURSTS: usize = 36;
+
+// Fixed formation in front of the initial camera, not a moving spawn point.
+// Three columns and six rows keep jets separated during the graphics test.
+fn stress_vehicle_offset(n: usize) -> (f32, f32, f32) {
+    (
+        32.0 + (n / 3) as f32 * 18.0,
+        ((n % 3) as f32 - 1.0) * 14.0,
+        6.0 + (n / 3) as f32 * 3.0,
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn stress_formation_has_eighteen_distinct_positions() {
+    assert_eq!(STRESS_VEHICLES, 18);
+    assert_eq!(STRESS_BURSTS, 36);
+    let positions: Vec<_> = (0..STRESS_VEHICLES).map(stress_vehicle_offset).collect();
+    for (n, p) in positions.iter().enumerate() {
+        assert!(!positions[..n].contains(p));
+    }
+}
+
+fn stress_probe(c: &mut Cmd) {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("WGR_TEST_STRESS").as_deref() == Ok("1"));
+    static STATE: Mutex<StressProbe> = Mutex::new(StressProbe {
+        started: None,
+        last_spawn: None,
+        last_burst: None,
+        vehicles: Vec::new(),
+        bursts: 0,
+        anchor: None,
+        last_observation: None,
+        peak_existing: 0,
+        peak_on_screen: 0,
+        finished: false,
+    });
+    if !*ENABLED {
+        return;
+    }
+    let mut state = STATE.lock().unwrap();
+    if state.finished {
+        return;
+    }
+    let now = Instant::now();
+    let elapsed = now.duration_since(*state.started.get_or_insert(now));
+    if elapsed < Duration::from_secs(4) {
+        return;
+    }
+    if elapsed >= Duration::from_secs(27) {
+        for vehicle in std::mem::take(&mut state.vehicles) {
+            delete_vehicle(c, vehicle);
+        }
+        state.finished = true;
+        crate::bridge::emit(
+            serde_json::json!({"type":"native_stress_finished","bursts":state.bursts,"peak_existing":state.peak_existing,"peak_on_screen":state.peak_on_screen}),
+        );
+        return;
+    }
+    let player = c.i("PlayerPedId", &[]);
+    if !c.exists(player) {
+        return;
+    }
+    let pos = c.v("GetEntityCoords", &[i(player), b(true)]);
+    let yaw = c.v("GetGameplayCamRot", &[i(2)])[2].to_radians();
+    if !pos.iter().all(|v| v.is_finite()) || !yaw.is_finite() {
+        return;
+    }
+    let (pos, yaw) = *state.anchor.get_or_insert((pos, yaw));
+    let at = |forward: f32, side: f32, height: f32| {
+        [
+            pos[0] - yaw.sin() * forward + yaw.cos() * side,
+            pos[1] + yaw.cos() * forward + yaw.sin() * side,
+            pos[2] + height,
+        ]
+    };
+    // Use the jet verified to exist in this port. An unavailable second
+    // model must not prevent the remaining stress vehicles from spawning.
+    const MODEL: u32 = 0xb39b0ae6;
+    if state.vehicles.len() < STRESS_VEHICLES
+        && elapsed < Duration::from_secs(17)
+        && state
+            .last_spawn
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(250))
+    {
+        let n = state.vehicles.len();
+        let model = MODEL;
+        if model_ready(c, model) {
+            state.last_spawn = Some(now);
+            let (forward, side, height) = stress_vehicle_offset(n);
+            let position = c.vec_arg(1, at(forward, side, height));
+            let vehicle = c.i(
+                "CreateVehicle",
+                &[
+                    i(model as i32),
+                    position,
+                    f(yaw.to_degrees()),
+                    b(false),
+                    b(false),
+                    b(false),
+                ],
+            );
+            if c.exists(vehicle) && !state.vehicles.contains(&vehicle) {
+                // Keep the synthetic render workload resident instead of
+                // allowing the explosion probe to remove its own fixtures.
+                // Only test-created entities are affected and deleted below.
+                c.i("FreezeEntityPosition", &[i(vehicle), b(true)]);
+                c.i("SetEntityInvincible", &[i(vehicle), b(true)]);
+                state.vehicles.push(vehicle);
+                crate::bridge::emit(
+                    serde_json::json!({"type":"native_stress_vehicle","count":state.vehicles.len(),"model":model}),
+                );
+            }
+        }
+    }
+    if elapsed >= Duration::from_secs(10)
+        && state.bursts < STRESS_BURSTS
+        && state
+            .last_burst
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(333))
+    {
+        state.last_burst = Some(now);
+        let position = c.vec_arg(
+            1,
+            at(
+                38.0 + (state.bursts % 3) as f32 * 8.0,
+                if state.bursts % 2 == 0 { -10.0 } else { 10.0 },
+                2.0,
+            ),
+        );
+        c.i(
+            "AddExplosion",
+            &[position, i(2), f(1.0), b(true), b(false), f(0.0), b(false)],
+        );
+        state.bursts += 1;
+        crate::bridge::emit(serde_json::json!({"type":"native_stress_burst","count":state.bursts}));
+    }
+    if state
+        .last_observation
+        .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
+    {
+        state.last_observation = Some(now);
+        let mut existing = 0;
+        let mut on_screen = 0;
+        for &vehicle in &state.vehicles {
+            if c.exists(vehicle) {
+                existing += 1;
+                if c.i("IsEntityOnScreen", &[i(vehicle)]) != 0 {
+                    on_screen += 1;
+                }
+            }
+        }
+        state.peak_existing = state.peak_existing.max(existing);
+        state.peak_on_screen = state.peak_on_screen.max(on_screen);
+        crate::bridge::emit(
+            serde_json::json!({"type":"native_stress_observation","existing":existing,"on_screen":on_screen,"bursts":state.bursts}),
+        );
+    }
 }
 
 impl Cmd<'_, '_> {

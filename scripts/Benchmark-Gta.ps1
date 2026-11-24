@@ -45,7 +45,7 @@ try {
         $savedEnv[$key]=[Environment]::GetEnvironmentVariable($key,'Process')
         [Environment]::SetEnvironmentVariable($key,$overrides[$key],'Process')
     }
-    foreach($key in @('WGR_PARALLEL_FINISH','WGR_ENCODER_WORKERS','WGR_ENCODER_BATCH_PASSES','WGR_LOCAL_BIND_CACHE','WGR_LOCAL_BIND_EPOCHS','WGR_SHARED_UNIFORM_LAYOUTS','WGR_UNIFORM_CHUNK_MIB','WGR_SHADER_AWARE_WARMUP','WGR_HOT_PIPELINES','MUGUET_PERF_DIAGNOSTICS')) {
+    foreach($key in @('WGR_PARALLEL_FINISH','WGR_ENCODER_WORKERS','WGR_ENCODER_BATCH_PASSES','WGR_ENCODER_BATCH_DRAWS','WGR_LOCAL_BIND_CACHE','WGR_LOCAL_BIND_EPOCHS','WGR_SHARED_UNIFORM_LAYOUTS','WGR_UNIFORM_CHUNK_MIB','WGR_SHADER_AWARE_WARMUP','WGR_HOT_PIPELINES','MUGUET_PERF_DIAGNOSTICS','WGR_FRAME_PHASES','WGR_ASYNC_STATS')) {
         $rendererConfig[$key]=[Environment]::GetEnvironmentVariable($key,'Process')
     }
     $process = Start-Process -FilePath $exe -ArgumentList $arguments -WindowStyle Normal -PassThru

@@ -198,6 +198,25 @@ mod occlusion_regression_tests {
 const BG_LIMIT: usize = 48000;
 static PERF_DIAGNOSTICS: LazyLock<bool> =
     LazyLock::new(|| std::env::var("MUGUET_PERF_DIAGNOSTICS").as_deref() == Ok("1"));
+static FRAME_PHASES: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("WGR_FRAME_PHASES").as_deref() == Ok("1"));
+
+#[derive(Default)]
+struct FramePhases {
+    idle_us: u64,
+    upload_us: u64,
+    finish_us: u64,
+    submit_us: u64,
+    acquire_us: u64,
+    present_us: u64,
+    fence_us: u64,
+    completion_us: u64,
+    maintenance_us: u64,
+    flushes: u64,
+}
+fn phase_us(start: Option<Instant>) -> u64 {
+    start.map_or(0, |t| t.elapsed().as_micros() as u64)
+}
 // These diagnostics were previously checking the Windows process environment
 // on the critical path of *every* draw (often thousands per frame). Read each
 // switch once at GPU initialization; all are immutable after process start.
@@ -392,6 +411,45 @@ pub fn start(mem: &SharedMemory, ring: u64, size: u64, dbg: u64) {
 
 fn log(s: &str) {
     eprintln!("[wgpu] {s}");
+}
+
+// Periodic statistics are informational, not part of GPU ordering. A full
+// stderr pipe or a slow process-memory query must not block presentation.
+type StatsJob = Box<dyn FnOnce() + Send>;
+static STATS_LOG: LazyLock<Option<std::sync::mpsc::SyncSender<StatsJob>>> = LazyLock::new(|| {
+    if std::env::var("WGR_ASYNC_STATS").as_deref() == Ok("0") {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel::<StatsJob>(8);
+    std::thread::Builder::new()
+        .name("gpu-stats".into())
+        .spawn(move || {
+            while let Ok(job) = rx.recv() {
+                job();
+            }
+        })
+        .ok()
+        .map(|_| tx)
+});
+static DROPPED_STATS: AtomicU64 = AtomicU64::new(0);
+
+fn periodic_stats(job: impl FnOnce() + Send + 'static) {
+    if let Some(tx) = &*STATS_LOG {
+        if tx
+            .try_send(Box::new(move || {
+                let dropped = DROPPED_STATS.swap(0, Ordering::Relaxed);
+                if dropped != 0 {
+                    log(&format!("periodic statistics dropped: {dropped}"));
+                }
+                job();
+            }))
+            .is_err()
+        {
+            DROPPED_STATS.fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        job();
+    }
 }
 
 fn mark_resource_created(generations: &mut Vec<u64>, id: usize) {
@@ -1769,6 +1827,26 @@ static ENCODER_BATCH_PASSES: LazyLock<u64> = LazyLock::new(|| {
         .filter(|n| (8..=128).contains(n))
         .unwrap_or(16)
 });
+static ENCODER_BATCH_DRAWS: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("WGR_ENCODER_BATCH_DRAWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| (64..=2048).contains(n))
+        .unwrap_or(u64::MAX)
+});
+
+fn encoder_batch_full(passes: u64, draws: u64, pass_limit: u64, draw_limit: u64) -> bool {
+    passes >= pass_limit || draws >= draw_limit
+}
+
+#[cfg(test)]
+#[test]
+fn encoder_batches_split_on_either_work_limit() {
+    assert!(!encoder_batch_full(15, 255, 16, 256));
+    assert!(encoder_batch_full(16, 1, 16, 256));
+    assert!(encoder_batch_full(1, 256, 16, 256));
+    assert!(!encoder_batch_full(1, 256, 16, u64::MAX));
+}
 #[derive(Clone, Copy)]
 struct El {
     sem: u32,
@@ -2347,6 +2425,7 @@ pub struct Gpu {
     // submitted in original order in the same queue submission.
     sealed_encoders: Vec<CommandEncoder>,
     encoder_pass_start: u64,
+    encoder_draw_start: u64,
     finish_pool: Option<rayon::ThreadPool>,
     enc_epoch: u64,
     pass: Option<RenderPass<'static>>,
@@ -2450,6 +2529,8 @@ pub struct Gpu {
     fps_d0: u64,
     perf: PerfCounters,
     perf_frame_start: Instant,
+    frame_phases: FramePhases,
+    phase_frame_start: Instant,
     errors: Arc<AtomicU64>,
 
     inflight: Arc<AtomicU64>,
@@ -2501,6 +2582,8 @@ impl Gpu {
         dbg: u64,
         handoff: Option<SurfaceHandoff>,
     ) -> anyhow::Result<Gpu> {
+        // Start the bounded logger before entering the render loop.
+        let _ = &*STATS_LOG;
         log(&format!("renderer profile: parallel={} workers={} batch_passes={} uniform_chunk_mib={} local_bind_cache={} shared_uniform_layouts={} local_bind_epochs={} shader_aware_warmup={}", *PARALLEL_FINISH,*ENCODER_WORKERS,*ENCODER_BATCH_PASSES,*UNIFORM_CHUNK_BYTES >> 20,*LOCAL_BG_CACHE,*SHARED_UNIFORM_LAYOUTS,*LOCAL_BG_EPOCHS,*SHADER_AWARE_WARMUP));
         let (base, _) = mem_base_len(&mem);
         let (instance, surface) = match handoff {
@@ -2671,6 +2754,8 @@ impl Gpu {
             pending_skips0: 0,
             perf: PerfCounters::default(),
             perf_frame_start: Instant::now(),
+            frame_phases: FramePhases::default(),
+            phase_frame_start: Instant::now(),
             pipe_wait_left: PIPELINE_WAIT,
             lighting_waited: HashSet::new(),
             base,
@@ -2691,6 +2776,7 @@ impl Gpu {
             enc: None,
             sealed_encoders: Vec::new(),
             encoder_pass_start: 0,
+            encoder_draw_start: 0,
             finish_pool: if *PARALLEL_FINISH {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(*ENCODER_WORKERS)
@@ -2937,6 +3023,7 @@ impl Gpu {
     fn encoder(&mut self) -> &mut CommandEncoder {
         if self.enc.is_none() {
             self.encoder_pass_start = self.passes;
+            self.encoder_draw_start = self.draws;
             self.enc = Some(
                 self.device
                     .create_command_encoder(&CommandEncoderDescriptor::default()),
@@ -2955,7 +3042,12 @@ impl Gpu {
             self.pass_st = PassSt::default();
             if self.finish_pool.is_some()
                 && self.sealed_encoders.len() < *ENCODER_WORKERS * 2 - 1
-                && self.passes.saturating_sub(self.encoder_pass_start) >= *ENCODER_BATCH_PASSES
+                && encoder_batch_full(
+                    self.passes.saturating_sub(self.encoder_pass_start),
+                    self.draws.saturating_sub(self.encoder_draw_start),
+                    *ENCODER_BATCH_PASSES,
+                    *ENCODER_BATCH_DRAWS,
+                )
             {
                 if let Some(enc) = self.enc.take() {
                     self.sealed_encoders.push(enc);
@@ -2967,8 +3059,13 @@ impl Gpu {
         self.flush_astc();
         self.astc_in_encoder = 0;
         self.end_pass();
+        let phase_start = (*FRAME_PHASES).then(Instant::now);
         let uniform_start = (*PERF_DIAGNOSTICS).then(Instant::now);
         self.flush_uniforms();
+        if *FRAME_PHASES {
+            self.frame_phases.upload_us += phase_us(phase_start);
+            self.frame_phases.flushes += 1;
+        }
         if let Some(start) = uniform_start {
             self.perf.uniform_upload_ms += start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -2979,6 +3076,7 @@ impl Gpu {
         };
         if self.enc.is_some() || !self.sealed_encoders.is_empty() {
             let finish_start = (*PERF_DIAGNOSTICS).then(Instant::now);
+            let phase_start = (*FRAME_PHASES).then(Instant::now);
             let commands: smallvec::SmallVec<[CommandBuffer; 8]> =
                 if self.sealed_encoders.is_empty() {
                     self.enc
@@ -3008,8 +3106,15 @@ impl Gpu {
             if let Some(start) = finish_start {
                 self.perf.finish_ms += start.elapsed().as_secs_f64() * 1000.0;
             }
+            if *FRAME_PHASES {
+                self.frame_phases.finish_us += phase_us(phase_start);
+            }
             let submit_start = (*PERF_DIAGNOSTICS).then(Instant::now);
+            let phase_start = (*FRAME_PHASES).then(Instant::now);
             let idx = self.queue.submit(commands);
+            if *FRAME_PHASES {
+                self.frame_phases.submit_us += phase_us(phase_start);
+            }
             if let Some(start) = submit_start {
                 self.perf.submit_ms += start.elapsed().as_secs_f64() * 1000.0;
             }
@@ -3086,6 +3191,9 @@ impl Gpu {
                 );
                 if *PERF_DIAGNOSTICS {
                     self.perf.idle_wait_ns += idle_start.elapsed().as_nanos() as u64;
+                }
+                if *FRAME_PHASES {
+                    self.frame_phases.idle_us += idle_start.elapsed().as_micros() as u64;
                 }
                 self.hdr(5).store(0, Ordering::SeqCst);
                 continue;
@@ -9590,6 +9698,7 @@ impl Gpu {
     }
 
     fn service_completions(&mut self) {
+        let phase_start = (*FRAME_PHASES).then(Instant::now);
         // Poll once for both mappings and queue callbacks. Publish all
         // ready query results *after* polling, before the next ring wait.
         if !self.pending_maps.is_empty() || self.inflight.load(Ordering::SeqCst) > 0 {
@@ -9597,6 +9706,9 @@ impl Gpu {
         }
         self.process_maps();
         self.apply_query_results();
+        if *FRAME_PHASES {
+            self.frame_phases.completion_us += phase_us(phase_start);
+        }
     }
 
     fn process_maps(&mut self) {
@@ -10033,6 +10145,9 @@ impl Gpu {
             if *PERF_DIAGNOSTICS {
                 self.perf.acquire_ms += perf_acquire.elapsed().as_secs_f64() * 1000.0;
             }
+            if *FRAME_PHASES {
+                self.frame_phases.acquire_us += perf_acquire.elapsed().as_micros() as u64;
+            }
             if let Some(frame) = frame {
                 let view = frame.texture.create_view(&TextureViewDescriptor::default());
                 self.use_tex(id);
@@ -10060,7 +10175,18 @@ impl Gpu {
                     p.draw(0..3, 0..1);
                 }
                 self.flush();
+                let phase_start = (*FRAME_PHASES).then(Instant::now);
                 self.queue.present(frame);
+                if *FRAME_PHASES {
+                    self.frame_phases.present_us += phase_us(phase_start);
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(self.phase_frame_start).as_micros() as u64;
+                    let phases = std::mem::take(&mut self.frame_phases);
+                    self.phase_frame_start = now;
+                    if elapsed > 16667 && crate::bridge::world_ready() {
+                        log(&format!("frame-phases: frame={} total_us={} idle_us={} upload_us={} finish_us={} submit_us={} acquire_us={} present_us={} fence_us={} completion_us={} maintenance_us={} flushes={}",self.presents,elapsed,phases.idle_us,phases.upload_us,phases.finish_us,phases.submit_us,phases.acquire_us,phases.present_us,phases.fence_us,phases.completion_us,phases.maintenance_us,phases.flushes));
+                    }
+                }
                 crate::bridge::presented();
             } else {
                 self.flush();
@@ -10068,6 +10194,7 @@ impl Gpu {
         } else {
             self.flush();
         }
+        let phase_start = (*FRAME_PHASES).then(Instant::now);
         self.collect_pipelines();
         if *PERF_DIAGNOSTICS {
             let frame_ms = self.perf_frame_start.elapsed().as_secs_f64() * 1000.0;
@@ -10111,6 +10238,9 @@ impl Gpu {
         self.packed_uniform_cache.clear();
         self.ubo_chunk = 0;
         self.ubo_off = 0;
+        if *FRAME_PHASES {
+            self.frame_phases.maintenance_us += phase_us(phase_start);
+        }
         if let Some(idx) = self.frame_slot_done[self.ubo_slot].take() {
             let fence_start = Instant::now();
             let _ = self.device.poll(PollType::Wait {
@@ -10119,6 +10249,9 @@ impl Gpu {
             });
             if *PERF_DIAGNOSTICS {
                 self.perf.fence_wait_ms += fence_start.elapsed().as_secs_f64() * 1000.0;
+            }
+            if *FRAME_PHASES {
+                self.frame_phases.fence_us += fence_start.elapsed().as_micros() as u64;
             }
         }
         self.service_completions();
@@ -10146,30 +10279,32 @@ impl Gpu {
             } else {
                 format!("{} MB", crate::gpu_allocated_mb())
             };
-            log(&format!(
-                "fps: {:.1} ({} MB memory, game heap {} MB{resident}, gpu {gpu_memory}, compressed {} MB{malloc}, surface {}x{} game {}x{}, {} frames, {} clears folded, {} draws/frame, {} draws waiting for a compiling pipeline, {:.1} submits/frame, {:.1} passes/frame, {} skipped total, pipelines {}, bind groups cached {}, validation errors {})",
-                frames as f64 / dt,
-                crate::footprint_mb(),
-                crate::RT
-                    .get()
-                    .map(|r| r.mem.data_size() >> 20)
-                    .unwrap_or(0),
-                crate::compressed_mb(),
-                self.surface_size.0,
-                self.surface_size.1,
-                self.frame_size.0,
-                self.frame_size.1,
-                frames,
-                self.clears_folded,
-                (self.draws - self.fps_d0) / frames.max(1),
-                self.pending_skips - self.pending_skips0,
-                (self.submits - self.submits0) as f64 / frames.max(1) as f64,
-                (self.passes - self.passes0) as f64 / frames.max(1) as f64,
-                self.skipped,
-                self.pipe_creates,
-                self.bind_groups.len(),
-                self.errors.load(Ordering::Relaxed)
-            ));
+            let fps = frames as f64 / dt;
+            let heap = crate::RT
+                .get()
+                .map(|r| r.mem.data_size() >> 20)
+                .unwrap_or(0);
+            let (sw, sh) = self.surface_size;
+            let (fw, fh) = self.frame_size;
+            let clears = self.clears_folded;
+            let draws = (self.draws - self.fps_d0) / frames.max(1);
+            let pending = self.pending_skips - self.pending_skips0;
+            let submits = (self.submits - self.submits0) as f64 / frames.max(1) as f64;
+            let passes = (self.passes - self.passes0) as f64 / frames.max(1) as f64;
+            let skipped = self.skipped;
+            let pipelines = self.pipe_creates;
+            let groups = self.bind_groups.len();
+            let errors = self.errors.load(Ordering::Relaxed);
+            let report = move || {
+                log(&format!("fps: {fps:.1} ({} MB memory, game heap {heap} MB{resident}, gpu {gpu_memory}, compressed {} MB{malloc}, surface {sw}x{sh} game {fw}x{fh}, {frames} frames, {clears} clears folded, {draws} draws/frame, {pending} draws waiting for a compiling pipeline, {submits:.1} submits/frame, {passes:.1} passes/frame, {skipped} skipped total, pipelines {pipelines}, bind groups cached {groups}, validation errors {errors})", crate::footprint_mb(),crate::compressed_mb()))
+            };
+            // Preserve the ordering of verbose diagnostic blocks. Normal
+            // gameplay uses only a snapshot of the counters on this thread.
+            if *PERF_DIAGNOSTICS || *MEM_STATS {
+                report();
+            } else {
+                periodic_stats(report);
+            }
             if *PERF_DIAGNOSTICS {
                 let n = self.perf.frames.max(1) as f64;
                 log(&format!(

@@ -21,6 +21,8 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/windows.yml
+    with:
+      portable: true
 
   package:
     needs: validate

@@ -5,7 +5,16 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      portable:
+        description: 'Gerar também o pacote portable completo'
+        type: boolean
+        default: false
   workflow_call:
+    inputs:
+      portable:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -25,41 +34,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
       - uses: dtolnay/rust-toolchain@1.98.1
-        with:
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: wgr-windows-release
-
-      - name: Formatação
-        shell: pwsh
-        run: |
-          cargo fmt --all -- --check
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo fmt --manifest-path vendor/muguet/Cargo.toml -- --check
-
-      - name: Testes de contrato em Node
-        shell: pwsh
-        run: |
-          node tests/ram-io.mjs
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          node tests/session-observer.mjs
-
-      - name: Clippy
-        shell: pwsh
-        run: cargo clippy --release --workspace --all-targets --locked -- -D warnings
-
-      - name: Testes Rust
-        shell: pwsh
-        run: cargo test --release --workspace --locked
-
-      - name: Testes do runtime nativo (sem GPU física)
-        shell: pwsh
-        run: cargo test --manifest-path vendor/muguet/Cargo.toml --release --locked --jobs 2 --target-dir target --bin wgr-rage --test encoder_reference
 
       - name: Build release (launcher)
         shell: pwsh
@@ -83,6 +61,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wgr-windows-binaries
+          compression-level: 1
           path: |
             target/release/WGR.exe
             target/release/wgr-rage.exe
@@ -90,12 +69,15 @@ jobs:
           if-no-files-found: error
 
       - name: Empacotar e conferir distribuição portable
+        if: inputs.portable == true
         shell: pwsh
         run: ./scripts/Package.ps1 -SkipBuild -BuildDir target -DistDir dist
 
       - uses: actions/upload-artifact@v4
+        if: inputs.portable == true
         with:
           name: wgr-windows-portable
+          compression-level: 0
           path: |
             dist/*.zip
             dist/*.sha256

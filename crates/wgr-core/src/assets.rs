@@ -205,18 +205,20 @@ impl DiskCache {
         // content-addressed hash first; verify bytes outside the DB lock;
         // then revalidate the key before touching the LRU timestamp.
         let waited = Instant::now();
-        let hash: Option<String> = {
+        let entry: Option<(String, Option<u64>)> = {
             let db = self
                 .db
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Cache ocupado"))?;
             self.read_lock_wait_ns
                 .fetch_add(waited.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            db.prepare_cached("SELECT hash FROM refs WHERE key=?1")?
-                .query_row([key], |r| r.get(0))
+            db.prepare_cached("SELECT refs.hash, objects.size FROM refs LEFT JOIN objects ON objects.hash=refs.hash WHERE refs.key=?1")?
+                .query_row([key], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?
         };
-        let Some(hash) = hash else { return Ok(None) };
+        let Some((hash, size_hint)) = entry else {
+            return Ok(None);
+        };
         let path = self.path(&hash)?;
         let started_verify = Instant::now();
         let bytes = (|| -> Result<Option<Vec<u8>>> {
@@ -229,7 +231,10 @@ impl DiskCache {
             // Avoid a separate metadata syscall on every content-addressed
             // 128-KiB block; Windows may otherwise incur another filesystem
             // and antivirus roundtrip before it starts reading the bytes.
-            let mut bytes = Vec::with_capacity(limit.min(128 << 10));
+            // The SQLite size is only an allocation hint, never evidence of
+            // integrity. Retain the read bound and hash validation below.
+            let capacity = size_hint.unwrap_or(128 << 10).min(128 << 10) as usize;
+            let mut bytes = Vec::with_capacity(limit.min(capacity));
             file.take(limit.saturating_add(1) as u64)
                 .read_to_end(&mut bytes)?;
             ensure!(
@@ -830,6 +835,31 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn verified_reads_use_small_allocation_hints_without_trusting_index_size() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cache = DiskCache::open(temp.path().into(), 1 << 20)?;
+        let small = vec![7u8; 23];
+        cache.put("small", &small)?;
+        cache.unpin_all();
+        let data = cache.read("small", 8 << 20)?.unwrap();
+        assert_eq!(data, small);
+        assert!(
+            data.capacity() <= 256,
+            "small file reserved {} bytes",
+            data.capacity()
+        );
+        // Corrupt size metadata is not a trusted length or a validation bypass.
+        cache
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE objects SET size=1 WHERE hash=?1", [sha256(&small)])?;
+        assert_eq!(cache.read("small", 8 << 20)?, Some(small));
+        assert!(cache.read("small", 3).is_err());
+        Ok(())
+    }
+
     #[test]
     fn batched_lru_touches_are_applied_before_eviction() -> Result<()> {
         let temp = tempfile::tempdir()?;

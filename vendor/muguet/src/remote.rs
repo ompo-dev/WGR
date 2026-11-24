@@ -558,19 +558,18 @@ impl Hot {
     }
 
     fn get(&mut self, key: &str) -> Option<Arc<Vec<u8>>> {
-        let (owned_key, data, old_age) = self
-            .entries
-            .get_key_value(key)
-            .map(|(owned_key, (data, age))| (owned_key.clone(), data.clone(), *age))?;
+        let (data, age) = self.entries.get_mut(key)?;
+        let data = data.clone();
         // Repeated reads of the newest block do not change exact LRU order.
-        if old_age == self.clock {
+        if *age == self.clock {
             return Some(data);
         }
-        self.oldest.remove(&old_age);
+        let owned_key = self
+            .oldest
+            .remove(age)
+            .expect("live cache entry missing LRU index");
         self.clock = self.clock.saturating_add(1);
-        if let Some((_, age)) = self.entries.get_mut(key) {
-            *age = self.clock;
-        }
+        *age = self.clock;
         self.oldest.insert(self.clock, owned_key);
         Some(data)
     }

@@ -59,3 +59,43 @@ Fixture Vulkan na RTX 4060 Laptop: 320 passes/3200 draws, mediana de finalizaç�
 | VRAM dedicada pico (GiB) | 2,27 | 2,03 |
 
 Ambas as sessões confirmaram carga tripla completa, mas reprovaram o gate estrito. A pressão de memória e o streaming variaram entre sessões; a redução de VRAM não comprova causalidade. O ganho sintético não se traduziu em ganho de FPS nesta comparação. Manter o controle como padrão. Resumos: `artifacts/perf-resource3-early-{control,finish}-20261124-summary.json`.
+
+## Rodada após 498e67c: metadados gráficos e cache quente
+
+Os quatro proxies opcionais de `Tex` foram movidos para alocação sob demanda. Na build x64 local, `Obj` passou de 744 para 296 bytes (448 bytes a menos por objeto, 60,22%); cada proxy criado aloca 120 bytes além do objeto. Isso não representa a economia de RAM total. O cache quente passa a atualizar a idade com uma busca no mapa e reutiliza a chave já retida pelo índice LRU, preservando a ordem exata de expulsão. O I/O remoto deixa de clonar o caminho de todo arquivo antes de saber se a leitura foi lenta. Nenhuma mudança na política de validação de assets, qualidade ou resolução.
+
+| Métrica | Controle 498e67c | Objetos compactos | Compactos + I/O |
+|---|---:|---:|---:|
+| FPS mínimo amostrado | 70,43 | 64,61 | 63,67 |
+| FPS mediano | 74,56 | 70,48 | 69,64 |
+| FPS máximo amostrado | 83,80 | 79,51 | 125,79 |
+| Frames lentos | 3/1969 | 11/1853 | 28/1933 |
+| Pior intervalo (ms) | 18,188 | 18,116 | 102,028 |
+| CPU (%) | 17,33 | 16,94 | 17,11 |
+| CPU ms-núcleo/frame | 46,02 | 47,86 | 46,39 |
+| Mundo (s) | 15,305 | 13,520 | 16,811 |
+| RAM residente pico (GiB) | 4,89 | 4,94 | 4,99 |
+| VRAM dedicada pico (GiB) | 2,27 | 2,27 | 2,40 |
+| Leitura do processo (MiB/s) | 12,06 | 6,09 | 9,83 |
+
+Todas as sessões completaram a carga de 18 jatos e 36 explosões; nenhuma passou no gate estrito. A sessão combinada teve 511,93 MB de blocos verificados na janela amostrada, contra 133,60 MB no controle: a carga de streaming não foi idêntica. O pico acima de 100 FPS é apenas amostrado e não implica estabilidade. A redução de metadados é comprovada pelo layout, mas não houve melhora sustentada no FPS ou na RAM total nas amostras. Candidata não publicada; preservar o executável de controle para uso normal. Resumos: `artifacts/perf-resource3-{objects-control,compact-objects,compact-iohot}-20261124-summary.json`. Backup de controle: `artifacts/wgr-rage-before-compact-objects.exe`.
+
+## Alocação de leitura proporcional ao tamanho do objeto
+
+Consulta somente leitura ao índice real: 43.063 objetos, 2.782 menores que 128 KiB e 18 maiores. A soma das diferenças entre 128 KiB e o tamanho desses objetos pequenos é 249.923.784 bytes; não é economia de RAM residente. `DiskCache::read` usa o tamanho do índice apenas como sugestão de capacidade, limitado a 128 KiB e ao limite do chamador. SHA-256, limite efetivo da leitura, revalidação da chave e política de LRU continuam obrigatórios. O teste de um objeto de 23 bytes limita a capacidade a 256 bytes e confirma leitura correta mesmo com tamanho incorreto no índice.
+
+| Métrica | Controle anterior | Candidato | Repetição |
+|---|---:|---:|---:|
+| FPS mínimo | 70,43 | 82,31 | 59,74 |
+| FPS mediano | 74,56 | 86,29 | 64,61 |
+| FPS máximo | 83,80 | 93,57 | 74,09 |
+| Frames lentos | 3/1969 | 0/2260 | 142/1707 |
+| Pior intervalo (ms) | 18,188 | 16,087 | 49,759 |
+| CPU (%) | 17,33 | 17,08 | 16,79 |
+| CPU ms-núcleo/frame | 46,02 | 39,53 | 51,52 |
+| Mundo (s) | 15,305 | 15,272 | 15,080 |
+| RAM residente pico (GiB) | 4,89 | 4,85 | 4,87 |
+| VRAM dedicada pico (GiB) | 2,27 | 2,27 | 2,27 |
+| Leitura do processo (MiB/s) | 12,06 | 12,17 | 11,29 |
+
+Primeira aprovação do gate estrito observada nesta série, com carga completa. A repetição, no mesmo binário e perfil, reprovou; a última janela registrou 3804 draws/frame e 209,1 passes/frame, sem skips ou erros de validação no log. Sem replay idêntico ou log preservado da primeira execução, não atribuir o ganho exclusivamente à mudança de alocação. Candidato não publicado e binário de controle restaurado com SHA-256 conferido. 10 testes do módulo de cache e 50 testes do runtime passaram; build release concluído. Resumos: `artifacts/perf-resource3-cache-size{,-repeat}-20261124-summary.json`; candidato: `artifacts/wgr-rage-cache-size-candidate.exe`.

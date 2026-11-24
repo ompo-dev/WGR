@@ -1741,10 +1741,12 @@ struct Tex {
     half: usize,
     enc: u64,
     in_bg: bool,
-    proxy_depth: Option<Proxy>,
-    proxy_stencil: Option<Proxy>,
-    proxy_fdepth: Option<Proxy>,
-    proxy_half: Option<Proxy>,
+    // Most textures never need a proxy. Keep the rare payload out of every
+    // texture and every other variant of Obj stored in the resource table.
+    proxy_depth: Option<Box<Proxy>>,
+    proxy_stencil: Option<Box<Proxy>>,
+    proxy_fdepth: Option<Box<Proxy>>,
+    proxy_half: Option<Box<Proxy>>,
     blit_bg: Option<BindGroup>,
     mip_passes: Option<Vec<(TextureView, BindGroup)>>,
     astc: bool,
@@ -1917,6 +1919,20 @@ enum Obj {
     Srv(ViewObj),
     Uav(ViewObj),
     Query(QueryObj),
+}
+
+#[cfg(test)]
+#[test]
+fn resource_metadata_keeps_optional_proxies_out_of_line() {
+    use std::mem::size_of;
+    assert_eq!(size_of::<Option<Box<Proxy>>>(), size_of::<usize>());
+    assert!(size_of::<Obj>() < 512);
+    println!(
+        "resource metadata: Obj={} Tex={} Proxy={} bytes",
+        size_of::<Obj>(),
+        size_of::<Tex>(),
+        size_of::<Proxy>()
+    );
 }
 
 #[derive(Clone, Copy, Default)]
@@ -5302,12 +5318,12 @@ impl Gpu {
                     passes.push((dst, bg));
                 }
             }
-            *slot = Some(Proxy {
+            *slot = Some(Box::new(Proxy {
                 tex: ptex,
                 format: fmt,
                 dirty: true,
                 passes,
-            });
+            }));
         }
         let px = slot.as_mut().unwrap();
         let out = (px.tex.clone(), px.format);
@@ -5414,12 +5430,12 @@ impl Gpu {
                     passes.push((dst, bg));
                 }
             }
-            t.proxy_fdepth = Some(Proxy {
+            t.proxy_fdepth = Some(Box::new(Proxy {
                 tex: ptex,
                 format: TextureFormat::Depth32Float,
                 dirty: true,
                 passes,
-            });
+            }));
         }
         let px = t.proxy_fdepth.as_mut().unwrap();
         let out = (px.tex.clone(), px.format);
@@ -5581,12 +5597,12 @@ impl Gpu {
                     passes.push((dst, bg));
                 }
             }
-            t.proxy_half = Some(Proxy {
+            t.proxy_half = Some(Box::new(Proxy {
                 tex: ptex,
                 format: half,
                 dirty: true,
                 passes,
-            });
+            }));
         }
         let px = t.proxy_half.as_mut().unwrap();
         let out = (px.tex.clone(), px.format);

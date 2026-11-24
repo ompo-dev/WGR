@@ -81,6 +81,13 @@ static UNIFORM_CHUNK_BYTES: LazyLock<u64> = LazyLock::new(|| {
 });
 const UBO_WINDOW: u64 = 65536;
 const FRAME_SLOTS: usize = 3;
+static UNIFORM_FRAME_SLOTS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("WGR_UNIFORM_FRAME_SLOTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n == 2 || n == 3)
+        .unwrap_or(FRAME_SLOTS)
+});
 const PIPELINE_WAIT: Duration = Duration::from_millis(8);
 const SHADER_RETRY_DELAY: Duration = Duration::from_secs(5);
 
@@ -1834,6 +1841,8 @@ static ENCODER_BATCH_DRAWS: LazyLock<u64> = LazyLock::new(|| {
         .filter(|n| (64..=2048).contains(n))
         .unwrap_or(u64::MAX)
 });
+static EARLY_ENCODER_FINISH: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("WGR_EARLY_ENCODER_FINISH").as_deref() == Ok("1"));
 
 fn encoder_batch_full(passes: u64, draws: u64, pass_limit: u64, draw_limit: u64) -> bool {
     passes >= pass_limit || draws >= draw_limit
@@ -2321,6 +2330,29 @@ struct Chunk {
     lo: u64,
     hi: u64,
 }
+
+static SHARED_CPU_STAGE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("WGR_SHARED_CPU_STAGE").as_deref() == Ok("1"));
+static RING_STATS: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("WGR_RING_STATS").as_deref() == Ok("1"));
+
+// Queue::write_buffer copies its input before returning. CPU staging is
+// therefore reusable once all dirty ranges have been uploaded; the GPU
+// buffer regions and their submission fences remain independent.
+fn recycle_cpu_stage(chunks: &mut [Chunk], pool: &mut Vec<Vec<u8>>) {
+    while pool.len() < chunks.len() {
+        pool.push(Vec::new());
+    }
+    for (chunk, spare) in chunks.iter_mut().zip(pool.iter_mut()) {
+        if chunk.lo < chunk.hi {
+            continue;
+        }
+        if chunk.stage.capacity() > spare.capacity() {
+            std::mem::swap(&mut chunk.stage, spare);
+        }
+        chunk.stage = Vec::new();
+    }
+}
 struct BgResult {
     bg: BindGroup,
     uid: u64,
@@ -2451,6 +2483,7 @@ pub struct Gpu {
     // Batches end at render-pass boundaries; all command buffers are
     // submitted in original order in the same queue submission.
     sealed_encoders: Vec<CommandEncoder>,
+    finishing_encoders: Vec<std::sync::mpsc::Receiver<CommandBuffer>>,
     encoder_pass_start: u64,
     encoder_draw_start: u64,
     finish_pool: Option<rayon::ThreadPool>,
@@ -2495,6 +2528,7 @@ pub struct Gpu {
     bind_groups: FxHashMap<Vec<u64>, (BindGroup, u64, u64)>,
     ubo_slots: Vec<Vec<Chunk>>,
     ubo_shared: Vec<(Buffer, u64)>,
+    ubo_cpu_spares: Vec<Vec<u8>>,
     ubo_slot: usize,
     ubo_chunk: usize,
     ubo_off: u64,
@@ -2802,6 +2836,7 @@ impl Gpu {
             srv_epoch: [0; 3],
             enc: None,
             sealed_encoders: Vec::new(),
+            finishing_encoders: Vec::new(),
             encoder_pass_start: 0,
             encoder_draw_start: 0,
             finish_pool: if *PARALLEL_FINISH {
@@ -2849,8 +2884,9 @@ impl Gpu {
             pipelines: FxHashMap::default(),
             compute: HashMap::new(),
             bind_groups: FxHashMap::default(),
-            ubo_slots: (0..FRAME_SLOTS).map(|_| Vec::new()).collect(),
+            ubo_slots: (0..*UNIFORM_FRAME_SLOTS).map(|_| Vec::new()).collect(),
             ubo_shared: Vec::new(),
+            ubo_cpu_spares: Vec::new(),
             ubo_slot: 0,
             ubo_chunk: 0,
             ubo_off: 0,
@@ -2898,7 +2934,7 @@ impl Gpu {
             readback_pool_items: 0,
             counter_src: None,
             counter_slot: 0,
-            frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(),
+            frame_slot_done: (0..*UNIFORM_FRAME_SLOTS).map(|_| None).collect(),
             last_submit: None,
             vb_avail: [0; 16],
             dbg_idx: if dbg != 0 { dbg + 424 } else { 0 },
@@ -3068,7 +3104,8 @@ impl Gpu {
             self.pass_info = None;
             self.pass_st = PassSt::default();
             if self.finish_pool.is_some()
-                && self.sealed_encoders.len() < *ENCODER_WORKERS * 2 - 1
+                && self.sealed_encoders.len() + self.finishing_encoders.len()
+                    < *ENCODER_WORKERS * 2 - 1
                 && encoder_batch_full(
                     self.passes.saturating_sub(self.encoder_pass_start),
                     self.draws.saturating_sub(self.encoder_draw_start),
@@ -3077,7 +3114,15 @@ impl Gpu {
                 )
             {
                 if let Some(enc) = self.enc.take() {
-                    self.sealed_encoders.push(enc);
+                    if *EARLY_ENCODER_FINISH {
+                        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                        self.finish_pool.as_ref().unwrap().spawn(move || {
+                            let _ = tx.send(enc.finish());
+                        });
+                        self.finishing_encoders.push(rx);
+                    } else {
+                        self.sealed_encoders.push(enc);
+                    }
                 }
             }
         }
@@ -3101,11 +3146,23 @@ impl Gpu {
         } else {
             self.record_resolves()
         };
-        if self.enc.is_some() || !self.sealed_encoders.is_empty() {
+        if self.enc.is_some()
+            || !self.sealed_encoders.is_empty()
+            || !self.finishing_encoders.is_empty()
+        {
             let finish_start = (*PERF_DIAGNOSTICS).then(Instant::now);
             let phase_start = (*FRAME_PHASES).then(Instant::now);
             let commands: smallvec::SmallVec<[CommandBuffer; 8]> =
-                if self.sealed_encoders.is_empty() {
+                if !self.finishing_encoders.is_empty() {
+                    // Finish the tail while workers validate earlier batches.
+                    // Receive in recording order, never completion order.
+                    let tail = self.enc.take().map(CommandEncoder::finish);
+                    self.finishing_encoders
+                        .drain(..)
+                        .map(|rx| rx.recv().expect("encoder finish worker disconnected"))
+                        .chain(tail)
+                        .collect()
+                } else if self.sealed_encoders.is_empty() {
                     self.enc
                         .take()
                         .map(CommandEncoder::finish)
@@ -5771,7 +5828,7 @@ impl Gpu {
                 while self.ubo_shared.len() <= self.ubo_chunk {
                     let buf = self.device.create_buffer(&BufferDescriptor {
                         label: Some("uniform ring"),
-                        size: *UNIFORM_CHUNK_BYTES * FRAME_SLOTS as u64,
+                        size: *UNIFORM_CHUNK_BYTES * *UNIFORM_FRAME_SLOTS as u64,
                         // The browser's safe buffer-update path reuses this
                         // fenced ring to copy data in GPU command order.
                         usage: BufferUsages::UNIFORM
@@ -5793,6 +5850,11 @@ impl Gpu {
                         hi: 0,
                     });
                 }
+            }
+        }
+        if *SHARED_CPU_STAGE && self.ubo_slots[slot][self.ubo_chunk].stage.capacity() == 0 {
+            if let Some(spare) = self.ubo_cpu_spares.get_mut(self.ubo_chunk) {
+                self.ubo_slots[slot][self.ubo_chunk].stage = std::mem::take(spare);
             }
         }
         let off = self.ubo_off;
@@ -10290,7 +10352,10 @@ impl Gpu {
         self.log_fps();
 
         self.frame_slot_done[self.ubo_slot] = self.last_submit.clone();
-        self.ubo_slot = (self.ubo_slot + 1) % FRAME_SLOTS;
+        if *SHARED_CPU_STAGE {
+            recycle_cpu_stage(&mut self.ubo_slots[self.ubo_slot], &mut self.ubo_cpu_spares);
+        }
+        self.ubo_slot = (self.ubo_slot + 1) % *UNIFORM_FRAME_SLOTS;
         // Reusing dynamic offsets is only safe within the same logical frame.
         // Other frame slots can be concurrently owned by the GPU.
         self.packed_uniform_cache.clear();
@@ -10319,6 +10384,21 @@ impl Gpu {
         let now = Instant::now();
         let dt = now.duration_since(self.fps_t0).as_secs_f64();
         if dt >= 10.0 {
+            if *RING_STATS || *SHARED_CPU_STAGE || *MEM_STATS {
+                let stage_bytes: usize = self
+                    .ubo_slots
+                    .iter()
+                    .flatten()
+                    .map(|c| c.stage.capacity())
+                    .sum::<usize>()
+                    + self.ubo_cpu_spares.iter().map(Vec::capacity).sum::<usize>();
+                let gpu_ring_bytes = self.ubo_shared.len() as u64
+                    * *UNIFORM_CHUNK_BYTES
+                    * *UNIFORM_FRAME_SLOTS as u64;
+                periodic_stats(move || {
+                    log(&format!("uniform ring memory: cpu_stage_bytes={stage_bytes} gpu_ring_bytes={gpu_ring_bytes}"))
+                });
+            }
             let frames = self.presents - self.fps_n0;
             let resident = if *MEM_STATS {
                 format!(" ({} MB resident)", crate::heap_resident_mb())

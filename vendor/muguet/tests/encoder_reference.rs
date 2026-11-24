@@ -5,6 +5,76 @@ use wgpu::*;
 
 #[test]
 #[ignore = "requires physical GPU"]
+fn shared_cpu_stage_preserves_ordered_uploads() {
+    let mut desc = InstanceDescriptor::new_without_display_handle();
+    desc.backends = Backends::VULKAN;
+    let instance = Instance::new(desc);
+    let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+        power_preference: PowerPreference::HighPerformance,
+        ..Default::default()
+    }))
+    .unwrap();
+    let (device, queue) =
+        pollster::block_on(adapter.request_device(&DeviceDescriptor::default())).unwrap();
+    const BYTES: usize = 256 << 10;
+    const SLOTS: usize = 3;
+    const FRAMES: usize = 12;
+    let ring = device.create_buffer(&BufferDescriptor {
+        label: None,
+        size: (BYTES * SLOTS) as u64,
+        usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::UNIFORM,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&BufferDescriptor {
+        label: None,
+        size: (BYTES * FRAMES) as u64,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut stage = vec![0u8; BYTES];
+    let mut fences = [None, None, None];
+    for frame in 0..FRAMES {
+        let slot = frame % SLOTS;
+        if let Some(idx) = fences[slot].take() {
+            device
+                .poll(PollType::Wait {
+                    submission_index: Some(idx),
+                    timeout: None,
+                })
+                .unwrap();
+        }
+        let offset = (slot * BYTES) as u64;
+        stage.fill(frame as u8 + 1);
+        queue.write_buffer(&ring, offset, &stage);
+        // Reuse the same CPU allocation even before submitting the GPU copy.
+        stage.fill(0xff);
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        enc.copy_buffer_to_buffer(
+            &ring,
+            offset,
+            &readback,
+            (frame * BYTES) as u64,
+            BYTES as u64,
+        );
+        fences[slot] = Some(queue.submit([enc.finish()]));
+    }
+    readback.slice(..).map_async(MapMode::Read, |r| r.unwrap());
+    device
+        .poll(PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .unwrap();
+    let view = readback.slice(..).get_mapped_range().unwrap();
+    for (frame, bytes) in view.chunks_exact(BYTES).enumerate() {
+        assert!(bytes.iter().all(|&b| b == frame as u8 + 1));
+    }
+    drop(view);
+    readback.unmap();
+}
+
+#[test]
+#[ignore = "requires physical GPU"]
 fn large_uniform_upload_reference() {
     let mut desc = InstanceDescriptor::new_without_display_handle();
     desc.backends = Backends::VULKAN;
@@ -191,6 +261,7 @@ fn encoder_reference() {
             "serial",
             "split_serial",
             "parallel_finish",
+            "early_finish",
             "parallel_record",
         ] {
             if passes == 1 && mode != "serial" {
@@ -258,13 +329,26 @@ fn encoder_reference() {
                 let ranges: Vec<_> = (0..count)
                     .map(|i| (passes * i / count, passes * (i + 1) / count))
                     .collect();
-                let encoders: Vec<_> = if mode == "parallel_record" {
+                let mut early = Vec::new();
+                let encoders: Vec<_> = if mode == "early_finish" {
+                    for (a, b) in ranges {
+                        let enc = record(a, b);
+                        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                        pool.spawn(move || {
+                            let _ = tx.send(enc.finish());
+                        });
+                        early.push(rx);
+                    }
+                    Vec::new()
+                } else if mode == "parallel_record" {
                     pool.install(|| ranges.into_par_iter().map(|(a, b)| record(a, b)).collect())
                 } else {
                     ranges.into_iter().map(|(a, b)| record(a, b)).collect()
                 };
                 let encoded = Instant::now();
-                let commands: Vec<_> = if mode == "parallel_record" || mode == "parallel_finish" {
+                let commands: Vec<_> = if mode == "early_finish" {
+                    early.into_iter().map(|rx| rx.recv().unwrap()).collect()
+                } else if mode == "parallel_record" || mode == "parallel_finish" {
                     pool.install(|| {
                         encoders
                             .into_par_iter()

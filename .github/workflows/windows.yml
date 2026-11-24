@@ -5,12 +5,13 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -36,12 +37,16 @@ jobs:
 
       - name: Formatação
         shell: pwsh
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo fmt --manifest-path vendor/muguet/Cargo.toml -- --check
 
       - name: Testes de contrato em Node
         shell: pwsh
         run: |
           node tests/ram-io.mjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           node tests/session-observer.mjs
 
       - name: Clippy
@@ -52,13 +57,17 @@ jobs:
         shell: pwsh
         run: cargo test --release --workspace --locked
 
+      - name: Testes do runtime nativo (sem GPU física)
+        shell: pwsh
+        run: cargo test --manifest-path vendor/muguet/Cargo.toml --release --locked --jobs 2 --target-dir target --bin wgr-rage --test encoder_reference
+
       - name: Build release (launcher)
         shell: pwsh
         run: cargo build --release --workspace --locked
 
       - name: Build release (runtime nativo)
         shell: pwsh
-        run: cargo build --manifest-path vendor/muguet/Cargo.toml --bin wgr-rage --release --locked --target-dir target
+        run: cargo build --manifest-path vendor/muguet/Cargo.toml --bin wgr-rage --release --locked --jobs 2 --target-dir target
 
       - name: Conferir binários
         shell: pwsh
@@ -78,4 +87,16 @@ jobs:
             target/release/WGR.exe
             target/release/wgr-rage.exe
             target/release/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Empacotar e conferir distribuição portable
+        shell: pwsh
+        run: ./scripts/Package.ps1 -SkipBuild -BuildDir target -DistDir dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wgr-windows-portable
+          path: |
+            dist/*.zip
+            dist/*.sha256
           if-no-files-found: error

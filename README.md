@@ -17,6 +17,8 @@ O resultado é salvo como `native-check.json` nessa pasta de dados.
 
 Use `WGR.exe` na raiz, mantendo `wgr-rage.exe` ao lado para o adaptador GTA. `scripts/Package.ps1 -SkipBuild` gera a distribuição portable com documentação, licenças e código-fonte. O caminho padrão não requer WebView2. O adaptador GTA está em validação; consulte as evidências antes de considerá-lo jogável.
 
+O GTA já é cadastrado na biblioteca na primeira abertura, com o manifesto nativo incorporado ao launcher. Basta selecionar a entrada GTA; os dados são obtidos da origem configurada durante a execução (é necessário acesso autorizado e internet quando não estiverem em cache). Não é preciso importar outro port ou configurar variáveis de ambiente. O perfil gráfico nativo usa resolução integral, FPS sem limite, cache de bindings, uniformes compartilhados e blocos de 4 MiB. Em CPUs com 12 ou mais threads lógicas, usa seis workers de codificação em lotes de 16 passes; com 8–11, quatro; em CPUs menores, finalização serial por padrão. Variáveis `WGR_*` de diagnóstico continuam disponíveis para testes e opt-out. Esse perfil não implica garantia de 60 FPS em todas as máquinas ou paridade visual completa.
+
 A fixture original **Órbita** funciona sem internet: Wasmtime executa `math.wasm` e GPUI desenha a cena nativa. Setas/WASD e clique movimentam o objeto; o save é restaurado entre sessões. Esta fixture comprova o host Rust, sem representar um benchmark do GTA ou paridade completa com a versão web da fixture.
 
 ## Biblioteca e fontes
@@ -48,6 +50,8 @@ pwsh -File scripts/Package.ps1 -SkipBuild
 ```
 
 O validador compila em uma pasta temporária fora do OneDrive, copia os executáveis `WGR.exe` e `wgr-rage.exe` e limpa os intermediários. `-KeepBuild` conserva a pasta. O workspace tem cinco crates (incluindo o `wgr-player`); o adaptador RAGE é um fork GPL separado em `vendor/muguet`. Não há dependência em tempo de execução dos diretórios de referência MomorRust, Servo, Surfman, MozJS, WebRender ou 5-web-port.
+
+A CI Windows verifica formatação, contratos, Clippy, testes Rust do launcher e do runtime nativo e compila os dois executáveis. Cada execução aprovada gera o artefato `wgr-windows-portable`, com SHA-256 do ZIP e de ambos os binários. A release por tag reutiliza o pacote validado, sem um segundo build. Para empacotar um diretório de compilação específico, use `scripts/Package.ps1 -SkipBuild -BuildDir target`; para verificar um download, use `scripts/Verify-Package.ps1 -Zip caminho/do/pacote.zip`. As fixtures com GPU física e o stress GTA são executados separadamente em hardware real; a CI hospedada não comprova FPS nem acessa os arquivos do jogo.
 
 ## Estado e limites
 

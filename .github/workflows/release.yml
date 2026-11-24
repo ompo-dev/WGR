@@ -17,40 +17,30 @@ env:
   CMAKE_POLICY_VERSION_MINIMUM: '3.5'
 
 jobs:
+  validate:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/windows.yml
+
   package:
+    needs: validate
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
         with:
-          shared-key: wgr-windows-release
-
-      - name: Build release (launcher)
-        shell: pwsh
-        run: cargo build --release --workspace --locked
-
-      - name: Build release (runtime nativo)
-        shell: pwsh
-        run: cargo build --manifest-path vendor/muguet/Cargo.toml --bin wgr-rage --release --locked --target-dir target
-
-      - name: Empacotar portable
-        shell: pwsh
-        run: |
-          Copy-Item -LiteralPath target/release/wgr-rage.exe -Destination wgr-rage.exe -Force
-          ./scripts/Package.ps1 -SkipBuild
+          name: wgr-windows-portable
+          path: dist
 
       - name: Conferir pacote
         shell: pwsh
         run: |
-          $zip = Get-ChildItem -LiteralPath dist -Filter '*.zip' | Select-Object -First 1
-          if (-not $zip) { throw 'Pacote portable não foi gerado.' }
-          $sums = Join-Path $dist ($zip.BaseName + '.sha256')
-          if (-not (Test-Path -LiteralPath $sums)) { throw 'Arquivo de checksums ausente.' }
-          Get-Content -LiteralPath $sums
+          $zips = @(Get-ChildItem -LiteralPath dist -Filter '*.zip' -File)
+          if ($zips.Count -ne 1) { throw 'Esperado exatamente um pacote validado.' }
+          ./scripts/Verify-Package.ps1 -Zip $zips[0].FullName
 
       - name: Publicar release
         shell: pwsh
@@ -59,16 +49,12 @@ jobs:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           $files = Get-ChildItem -LiteralPath dist -File | Select-Object -ExpandProperty FullName
+          if ($env:RELEASE_TAG -notmatch '^v[0-9][A-Za-z0-9._-]*$') { throw 'Tag de release inválida.' }
+          $tagCommit = git rev-parse --verify --quiet "refs/tags/$($env:RELEASE_TAG)^{commit}"
+          if ($LASTEXITCODE -eq 0 -and $tagCommit -ne '${{ github.sha }}') { throw 'A tag existente aponta para outro commit.' }
           if (gh release view $env:RELEASE_TAG 2>$null) {
             gh release upload $env:RELEASE_TAG @files --clobber
           } else {
             gh release create $env:RELEASE_TAG --target '${{ github.sha }}' --title "WGR $env:RELEASE_TAG" --generate-notes @files
           }
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wgr-windows-portable
-          path: |
-            dist/*.zip
-            dist/*.sha256
-          if-no-files-found: error
+          if ($LASTEXITCODE) { throw 'Publicação da release falhou.' }

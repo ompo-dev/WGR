@@ -32,12 +32,52 @@ const BIND_RT: u32 = 0x20;
 const BIND_DS: u32 = 0x40;
 const BIND_UAV: u32 = 0x80;
 const RING_CHUNK: u64 = 8 << 20;
+const DEFAULT_UNIFORM_CHUNK: u64 = 4 << 20;
+static LOGICAL_CPUS: LazyLock<usize> =
+    LazyLock::new(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+
+fn default_encoder_workers(logical_cpus: usize) -> usize {
+    if logical_cpus >= 12 {
+        6
+    } else if logical_cpus >= 8 {
+        4
+    } else {
+        2
+    }
+}
+
+fn renderer_switch(raw: Option<&str>, default: bool) -> bool {
+    match raw {
+        Some("1") => true,
+        Some("0") => false,
+        _ => default,
+    }
+}
+
+static PARALLEL_FINISH: LazyLock<bool> = LazyLock::new(|| {
+    renderer_switch(
+        std::env::var("WGR_PARALLEL_FINISH").ok().as_deref(),
+        *LOGICAL_CPUS >= 8,
+    )
+});
+
+#[cfg(test)]
+#[test]
+fn default_renderer_profile_scales_workers_and_preserves_opt_out() {
+    assert_eq!(default_encoder_workers(20), 6);
+    assert_eq!(default_encoder_workers(8), 4);
+    assert_eq!(default_encoder_workers(4), 2);
+    assert!(renderer_switch(None, true));
+    assert!(!renderer_switch(Some("0"), true));
+    assert!(renderer_switch(Some("1"), false));
+    assert!(!renderer_switch(Some("invalid"), false));
+}
 static UNIFORM_CHUNK_BYTES: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("WGR_UNIFORM_CHUNK_MIB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| matches!(v, 2 | 4 | 8))
-        .map_or(RING_CHUNK, |v| v << 20)
+        .map_or(DEFAULT_UNIFORM_CHUNK, |v| v << 20)
 });
 const UBO_WINDOW: u64 = 65536;
 const FRAME_SLOTS: usize = 3;
@@ -955,6 +995,26 @@ static RE_VS_LOC_MEMBER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"@location\((\d+)u\)(\s*\n\s*\w+\s*:)").unwrap());
 static RE_VS_MAIN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"@vertex\s*fn\s+main\s*\([\s\S]*?\)\s*->\s*(\w+)\s*\{").unwrap());
+// Null D3D input layouts are valid for procedural vertices. Accept only
+// scalar builtin arguments; never infer missing vertex attributes from a
+// shader name or from an empty D3D signature alone.
+static RE_PROCEDURAL_VS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+    r"@vertex\s*fn\s+main\s*\(\s*(?:@builtin\(\s*(?:vertex_index|instance_index)\s*\)\s*\w+\s*:\s*u32\s*,?\s*)*\)\s*->"
+).unwrap()
+});
+
+#[cfg(test)]
+#[test]
+fn procedural_vertex_entry_rejects_attribute_and_struct_inputs() {
+    assert!(RE_PROCEDURAL_VS
+        .is_match("@vertex\nfn main(@builtin(vertex_index) index : u32) -> Output {"));
+    assert!(RE_PROCEDURAL_VS.is_match(
+        "@vertex fn main(@builtin(vertex_index) v:u32, @builtin(instance_index) i:u32) -> Output {"
+    ));
+    assert!(!RE_PROCEDURAL_VS.is_match("@vertex fn main(@location(0) p:vec3f) -> Output {"));
+    assert!(!RE_PROCEDURAL_VS.is_match("@vertex fn main(input:VertexInput) -> Output {"));
+}
 static RE_PS_MAIN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(@fragment\s*fn\s+main\s*\()([\s\S]*?)(\)\s*->)").unwrap());
 
@@ -1300,8 +1360,12 @@ struct Pack {
     layout_id: u64,
 }
 
-static SHARED_UNIFORM_LAYOUTS: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("WGR_SHARED_UNIFORM_LAYOUTS").as_deref() == Ok("1"));
+static SHARED_UNIFORM_LAYOUTS: LazyLock<bool> = LazyLock::new(|| {
+    renderer_switch(
+        std::env::var("WGR_SHARED_UNIFORM_LAYOUTS").ok().as_deref(),
+        true,
+    )
+});
 
 fn intern_uniform_layout(layouts: &mut FxHashMap<Vec<(u32, u64, u64)>, u64>, pack: &Pack) -> u64 {
     // Exact structural equality, not just a hash fingerprint. A layout ID
@@ -1667,6 +1731,7 @@ struct Program {
     hash: String,
     vid: bool,
     iid: bool,
+    procedural_vertices: bool,
     out_locs: Vec<u32>,
     in_locs: Vec<u32>,
     clip: bool,
@@ -1687,7 +1752,7 @@ struct LocalBg {
 }
 
 static LOCAL_BG_CACHE: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("WGR_LOCAL_BIND_CACHE").as_deref() == Ok("1"));
+    LazyLock::new(|| renderer_switch(std::env::var("WGR_LOCAL_BIND_CACHE").ok().as_deref(), true));
 static LOCAL_BG_EPOCHS: LazyLock<bool> =
     LazyLock::new(|| std::env::var("WGR_LOCAL_BIND_EPOCHS").as_deref() == Ok("1"));
 static ENCODER_WORKERS: LazyLock<usize> = LazyLock::new(|| {
@@ -1695,14 +1760,14 @@ static ENCODER_WORKERS: LazyLock<usize> = LazyLock::new(|| {
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|n| (2..=8).contains(n))
-        .unwrap_or(4)
+        .unwrap_or_else(|| default_encoder_workers(*LOGICAL_CPUS))
 });
 static ENCODER_BATCH_PASSES: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("WGR_ENCODER_BATCH_PASSES")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|n| (8..=128).contains(n))
-        .unwrap_or(32)
+        .unwrap_or(16)
 });
 #[derive(Clone, Copy)]
 struct El {
@@ -1838,12 +1903,100 @@ impl State {
 #[derive(Clone)]
 struct PassInfo {
     rt_formats: smallvec::SmallVec<[Option<TextureFormat>; 8]>,
+    pipeline_suffix: smallvec::SmallVec<[i64; 13]>,
     samples: u32,
     ds_format: Option<TextureFormat>,
     ro_depth: bool,
     ro_stencil: bool,
     width: u32,
     height: u32,
+}
+impl PassInfo {
+    fn new(
+        rt_formats: smallvec::SmallVec<[Option<TextureFormat>; 8]>,
+        samples: u32,
+        ds_format: Option<TextureFormat>,
+        ro_depth: bool,
+        ro_stencil: bool,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        // Attachment formats and read-only flags are invariant throughout
+        // the pass. Preserve the existing pipeline-key representation but
+        // compute it once instead of formatting every attachment on each
+        // draw that changes the pipeline state.
+        let mut pipeline_suffix = smallvec::SmallVec::new();
+        pipeline_suffix.extend(rt_formats.iter().map(|f| f.map(format_id).unwrap_or(-1)));
+        pipeline_suffix.extend([
+            -7,
+            ds_format.map(format_id).unwrap_or(-1),
+            samples as i64,
+            ro_depth as i64,
+            ro_stencil as i64,
+        ]);
+        Self {
+            rt_formats,
+            pipeline_suffix,
+            samples,
+            ds_format,
+            ro_depth,
+            ro_stencil,
+            width,
+            height,
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn attachment_pipeline_key_preserves_formats_holes_and_read_only_flags() {
+    let formats = smallvec::smallvec![
+        Some(TextureFormat::Rgba8Unorm),
+        None,
+        Some(TextureFormat::Rgba16Float)
+    ];
+    let p = PassInfo::new(
+        formats.clone(),
+        4,
+        Some(TextureFormat::Depth32Float),
+        true,
+        false,
+        1920,
+        1200,
+    );
+    assert_eq!(
+        p.pipeline_suffix.as_slice(),
+        &[
+            format_id(TextureFormat::Rgba8Unorm),
+            -1,
+            format_id(TextureFormat::Rgba16Float),
+            -7,
+            format_id(TextureFormat::Depth32Float),
+            4,
+            1,
+            0
+        ]
+    );
+    let warm = PassInfo::new(
+        formats.clone(),
+        4,
+        Some(TextureFormat::Depth32Float),
+        true,
+        false,
+        1,
+        1,
+    );
+    assert_eq!(p.pipeline_suffix, warm.pipeline_suffix);
+    let writable = PassInfo::new(
+        formats,
+        4,
+        Some(TextureFormat::Depth32Float),
+        false,
+        false,
+        1,
+        1,
+    );
+    assert_ne!(p.pipeline_suffix, writable.pipeline_suffix);
 }
 #[derive(Default)]
 struct PassSt {
@@ -2141,6 +2294,32 @@ struct AstcJob {
     first_block: u32,
 }
 
+#[derive(Default)]
+struct QueryCompletions {
+    results: Vec<(u64, u64, u32)>,
+    batches: u64,
+}
+
+impl QueryCompletions {
+    fn complete(&mut self, results: Vec<(u64, u64, u32)>) {
+        self.results.extend(results);
+        // Even a batch whose queries were deleted has a completion.
+        self.batches += 1;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn query_completion_counts_empty_batches() {
+    let mut done = QueryCompletions::default();
+    done.complete(vec![(8, 1, 2)]);
+    done.complete(vec![]);
+    let drained = std::mem::take(&mut done);
+    assert_eq!(drained.batches, 2);
+    assert_eq!(drained.results, vec![(8, 1, 2)]);
+    assert_eq!(done.batches, 0);
+}
+
 pub struct Gpu {
     mem: SharedMemory,
     base: *mut u8,
@@ -2148,7 +2327,7 @@ pub struct Gpu {
     device: Device,
     queue: Queue,
     live_queries: std::collections::HashSet<u64>,
-    query_done: Arc<Mutex<Vec<(u64, u64, u32)>>>,
+    query_done: Arc<Mutex<QueryCompletions>>,
     stale_query_writes: u64,
     bc_live: HashMap<u32, (TextureFormat, u64, u64)>,
     adapter: Adapter,
@@ -2178,6 +2357,7 @@ pub struct Gpu {
     s: State,
     pdirty: bool,
     last_pl: Option<Rc<Pl>>,
+    empty_vertex_layout: Rc<LayoutObj>,
     shader_index: HashMap<String, serde_json::Value>,
     shader_dir: PathBuf,
     map_programs: HashMap<String, Rc<Program>>,
@@ -2321,6 +2501,7 @@ impl Gpu {
         dbg: u64,
         handoff: Option<SurfaceHandoff>,
     ) -> anyhow::Result<Gpu> {
+        log(&format!("renderer profile: parallel={} workers={} batch_passes={} uniform_chunk_mib={} local_bind_cache={} shared_uniform_layouts={} local_bind_epochs={} shader_aware_warmup={}", *PARALLEL_FINISH,*ENCODER_WORKERS,*ENCODER_BATCH_PASSES,*UNIFORM_CHUNK_BYTES >> 20,*LOCAL_BG_CACHE,*SHARED_UNIFORM_LAYOUTS,*LOCAL_BG_EPOCHS,*SHADER_AWARE_WARMUP));
         let (base, _) = mem_base_len(&mem);
         let (instance, surface) = match handoff {
             Some(h) => (h.instance, Some((h.surface, h.window))),
@@ -2510,7 +2691,7 @@ impl Gpu {
             enc: None,
             sealed_encoders: Vec::new(),
             encoder_pass_start: 0,
-            finish_pool: if std::env::var("WGR_PARALLEL_FINISH").as_deref() == Ok("1") {
+            finish_pool: if *PARALLEL_FINISH {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(*ENCODER_WORKERS)
                     .thread_name(|i| format!("gpu-encode-{i}"))
@@ -2542,6 +2723,11 @@ impl Gpu {
             s: State::new(),
             pdirty: true,
             last_pl: None,
+            empty_vertex_layout: Rc::new(LayoutObj {
+                els: Vec::new(),
+                slots: Vec::new(),
+                stable: layout_stable(&[], &[]),
+            }),
             shader_index,
             shader_dir,
             next_uid: 1,
@@ -2864,11 +3050,7 @@ impl Gpu {
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
-            self.process_maps(false);
-            self.apply_query_results();
-            if self.inflight.load(Ordering::SeqCst) > 0 {
-                let _ = self.device.poll(PollType::Poll);
-            }
+            self.service_completions();
             let head = self.hdr(0).load(Ordering::SeqCst);
             if head == tail {
                 if !self.pending_events.is_empty() || !self.pending_resolve.is_empty() {
@@ -2951,10 +3133,7 @@ impl Gpu {
                 executed = 0;
                 self.hdr(1).store(tail, Ordering::SeqCst);
                 let _ = self.mem.atomic_notify(self.ring + 4, u32::MAX);
-                self.process_maps(false);
-                if self.inflight.load(Ordering::SeqCst) > 0 {
-                    let _ = self.device.poll(PollType::Poll);
-                }
+                self.service_completions();
             }
         }
         self.flush_readbacks();
@@ -4233,6 +4412,7 @@ impl Gpu {
         let uid = self.uid();
         let vid = text.contains("vertex_index");
         let iid = text.contains("instance_index");
+        let procedural_vertices = stage == 0 && RE_PROCEDURAL_VS.is_match(&text);
         let out_locs = if stage == 0 {
             locations_in(&text, true)
         } else {
@@ -4266,6 +4446,7 @@ impl Gpu {
             },
             vid,
             iid,
+            procedural_vertices,
             out_locs,
             in_locs,
             clip,
@@ -4768,15 +4949,15 @@ impl Gpu {
         self.pass_key = Some(key);
         self.pass_targets_dirty = false;
         self.pdirty = true;
-        self.pass_info = Some(PassInfo {
-            rt_formats: colors.iter().map(|c| c.as_ref().map(|x| x.1)).collect(),
+        self.pass_info = Some(PassInfo::new(
+            colors.iter().map(|c| c.as_ref().map(|x| x.1)).collect(),
             samples,
             ds_format,
-            ro_depth: ds_att.is_some() && ro_d,
-            ro_stencil: ds_att.is_some() && ro_s,
-            width: pw,
-            height: ph,
-        });
+            ds_att.is_some() && ro_d,
+            ds_att.is_some() && ro_s,
+            pw,
+            ph,
+        ));
         self.pass_st = PassSt::default();
         self.begin_occlusion_in_pass();
         for i in 0..colors.len() {
@@ -6939,16 +7120,7 @@ impl Gpu {
             sid(&st.dss),
             sid(&st.rs),
         ]);
-        for f in &pi.rt_formats {
-            key.push(f.map(format_id).unwrap_or(-1));
-        }
-        key.extend([
-            -7,
-            pi.ds_format.map(format_id).unwrap_or(-1),
-            pi.samples as i64,
-            pi.ro_depth as i64,
-            pi.ro_stencil as i64,
-        ]);
+        key.extend_from_slice(&pi.pipeline_suffix);
         key
     }
 
@@ -7225,15 +7397,15 @@ impl Gpu {
             }
         };
         let rt_formats = arr(&r["rt"]).iter().map(fmt).collect::<Option<Vec<_>>>()?;
-        let pi = PassInfo {
-            rt_formats: rt_formats.into(),
-            samples: u(&r["samples"])?,
-            ds_format: fmt(&r["ds"])?,
-            ro_depth: r["rod"].as_bool()?,
-            ro_stencil: r["ros"].as_bool()?,
-            width: 1,
-            height: 1,
-        };
+        let pi = PassInfo::new(
+            rt_formats.into(),
+            u(&r["samples"])?,
+            fmt(&r["ds"])?,
+            r["rod"].as_bool()?,
+            r["ros"].as_bool()?,
+            1,
+            1,
+        );
         let topo_raw = u(&r["topo"])?;
         let (topo, _) = topology(topo_raw);
         let strip_code = r["strip"].as_i64()?;
@@ -7489,6 +7661,16 @@ impl Gpu {
         };
         let layout = match self.obj(self.s.layout) {
             Some(Obj::Layout(l)) => l.clone(),
+            None if self.s.layout == 0 && vs.procedural_vertices => {
+                // A null layout is not a missing resource when the vertex
+                // shader declares only builtins. This restores postfx draws
+                // such as BokehSprites rather than silently discarding them.
+                log_once(
+                    "procedural-null-layout",
+                    "rendering procedural vertices with a null input layout",
+                );
+                self.empty_vertex_layout.clone()
+            }
             _ => {
                 self.skip();
                 return;
@@ -7615,7 +7797,12 @@ impl Gpu {
         }
 
         let indexed = kind == 4 || (kind < 4 && (kind & 1) != 0);
-        let (fold_v, fold_i) = (vs.vid, vs.iid);
+        // Without vertex streams there is no offset to fold the builtins
+        // into. Pass the original draw offsets to WebGPU for these shaders.
+        let (fold_v, fold_i) = (
+            vs.vid && !layout.slots.is_empty(),
+            vs.iid && !layout.slots.is_empty(),
+        );
         let v_first = if indexed || fold_v { 0 } else { start };
         let i_first = if fold_i { 0 } else { start_instance };
 
@@ -8114,6 +8301,7 @@ impl Gpu {
                             hash: String::new(),
                             vid: false,
                             iid: false,
+                            procedural_vertices: false,
                             out_locs: vec![],
                             in_locs: vec![],
                             clip: false,
@@ -9401,18 +9589,17 @@ impl Gpu {
         });
     }
 
-    fn process_maps(&mut self, wait: bool) {
-        if self.pending_maps.is_empty() {
-            return;
+    fn service_completions(&mut self) {
+        // Poll once for both mappings and queue callbacks. Publish all
+        // ready query results *after* polling, before the next ring wait.
+        if !self.pending_maps.is_empty() || self.inflight.load(Ordering::SeqCst) > 0 {
+            let _ = self.device.poll(PollType::Poll);
         }
-        let _ = self.device.poll(if wait {
-            PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            }
-        } else {
-            PollType::Poll
-        });
+        self.process_maps();
+        self.apply_query_results();
+    }
+
+    fn process_maps(&mut self) {
         let mut i = 0;
         while i < self.pending_maps.len() {
             if !self.pending_maps[i].done.load(Ordering::SeqCst) {
@@ -9676,16 +9863,21 @@ impl Gpu {
     }
     fn apply_query_results(&mut self) {
         let done = std::mem::take(&mut *self.query_done.lock().unwrap());
-        for (addr, v, seq) in done {
+        for (addr, v, seq) in done.results {
             self.query_store(addr, v, seq);
+        }
+        // A callback is not finished from the guest's perspective until its
+        // results have been written. Keep the short idle wait active until
+        // that point, even if a callback fires just before atomic_wait32.
+        if done.batches != 0 {
+            self.inflight.fetch_sub(done.batches, Ordering::SeqCst);
         }
     }
     fn on_submitted(&mut self) {
         if !self.pending_events.is_empty() {
             let evs = std::mem::take(&mut self.pending_events);
             let mem = self.mem.clone();
-            let inflight = self.inflight.clone();
-            inflight.fetch_add(1, Ordering::SeqCst);
+            self.inflight.fetch_add(1, Ordering::SeqCst);
             let addrs: Vec<(u64, u64, u32)> = evs
                 .iter()
                 .filter_map(|(id, seq, v)| match self.obj(*id) {
@@ -9696,8 +9888,7 @@ impl Gpu {
             let results = self.query_done.clone();
             let ring = self.ring;
             self.queue.on_submitted_work_done(move || {
-                results.lock().unwrap().extend(addrs);
-                inflight.fetch_sub(1, Ordering::SeqCst);
+                results.lock().unwrap().complete(addrs);
                 let _ = mem.atomic_notify(ring, u32::MAX);
             });
         }
@@ -9930,7 +10121,7 @@ impl Gpu {
                 self.perf.fence_wait_ms += fence_start.elapsed().as_secs_f64() * 1000.0;
             }
         }
-        self.process_maps(false);
+        self.service_completions();
     }
 
     fn log_fps(&mut self) {

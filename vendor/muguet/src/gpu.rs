@@ -2121,6 +2121,33 @@ struct PipeStates {
 }
 
 const RECIPE_LIMIT: u64 = 32 << 20;
+
+// Match str::lines for LF, CRLF and a final line without a terminator.
+fn recipe_record(line: &str) -> &str {
+    match line.strip_suffix('\n') {
+        Some(record) => record.strip_suffix('\r').unwrap_or(record),
+        None => line,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn compact_recipe_records_preserve_previous_hashes_and_json() {
+    let catalog = "{\"vs\":\"a\"}\r\n{\"vs\":\"b\"}\n{\"vs\":\"c\"}";
+    let expected: Vec<_> = catalog.lines().collect();
+    let compact: Vec<Box<str>> = catalog
+        .split_inclusive('\n')
+        .map(|l| recipe_record(l).into())
+        .collect();
+    assert_eq!(expected.len(), compact.len());
+    for (old, new) in expected.iter().zip(&compact) {
+        assert_eq!(stable_hash(old), stable_hash(&new.as_ref()));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(old).unwrap(),
+            serde_json::from_str::<serde_json::Value>(new).unwrap()
+        );
+    }
+}
 static PIPE_CACHE: LazyLock<bool> =
     LazyLock::new(|| std::env::var("MUGUET_PIPE_CACHE").map_or(true, |v| v != "0"));
 static SHADER_AWARE_WARMUP: LazyLock<bool> =
@@ -2440,9 +2467,9 @@ pub struct Gpu {
     shader_index: HashMap<String, serde_json::Value>,
     shader_dir: PathBuf,
     map_programs: HashMap<String, Rc<Program>>,
-    warm: std::collections::VecDeque<(u64, serde_json::Value)>,
+    warm: std::collections::VecDeque<(u64, Box<str>)>,
     warm_seen: HashSet<String>,
-    warm_waiting: HashMap<String, Vec<(u64, serde_json::Value)>>,
+    warm_waiting: HashMap<String, Vec<(u64, Box<str>)>>,
     warm_programs: HashMap<String, Rc<Program>>,
     shader_failures: HashMap<String, Instant>,
     warmed: u64,
@@ -7338,9 +7365,12 @@ impl Gpu {
         ));
     }
 
-    fn schedule_warm_recipe(&mut self, id: u64, recipe: serde_json::Value) {
+    fn schedule_warm_recipe(&mut self, id: u64, recipe: Box<str>) {
         if *SHADER_AWARE_WARMUP {
-            if let Some(hash) = missing_recipe_shader(&recipe, &self.warm_seen) {
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&recipe) else {
+                return;
+            };
+            if let Some(hash) = missing_recipe_shader(&parsed, &self.warm_seen) {
                 self.warm_waiting
                     .entry(hash.to_owned())
                     .or_default()
@@ -7355,10 +7385,17 @@ impl Gpu {
         if !*PIPE_CACHE {
             return;
         }
-        let Ok(text) = std::fs::read_to_string(self.recipe_path()) else {
+        use std::io::{BufRead, Read};
+        let Ok(file) = std::fs::File::open(self.recipe_path()) else {
             return;
         };
-        self.recipe_bytes = text.len() as u64;
+        self.recipe_bytes = file.metadata().map_or(0, |m| m.len());
+        // The catalog is a disposable optimization hint. Refuse a damaged
+        // or unexpectedly huge catalog rather than allocate unbounded RAM.
+        if self.recipe_bytes > RECIPE_LIMIT + (1 << 20) {
+            log("pipeline recipe catalog exceeds budget; compiling on demand");
+            return;
+        }
         self.hot_recipe_ids = std::fs::read(self.hot_recipe_path())
             .ok()
             .filter(|b| b.len() <= 256 << 10)
@@ -7368,16 +7405,30 @@ impl Gpu {
         let hot: HashSet<u64> = self.hot_recipe_ids.iter().copied().collect();
         let selective =
             std::env::var("WGR_HOT_PIPELINES").as_deref() == Ok("1") && hot.len() >= 128;
-        for line in text.lines() {
-            let id = stable_hash(&line);
+        let mut reader =
+            std::io::BufReader::with_capacity(64 << 10, file.take(RECIPE_LIMIT + (1 << 20)));
+        let mut line = String::new();
+        let mut queued_bytes = 0usize;
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let record = recipe_record(&line);
+            let id = stable_hash(&record);
             if !self.recipe_ids.insert(id) {
                 continue;
             }
             if selective && !hot.contains(&id) {
                 continue;
             }
-            if let Ok(recipe) = serde_json::from_str(line) {
-                self.schedule_warm_recipe(id, recipe);
+            // Queue only the compact JSON text; parsing thousands of arrays
+            // and maps up front expands the catalog several times in RAM.
+            // The same record is decoded once, immediately before warm_one.
+            if record.len() <= 256 << 10 && !record.is_empty() {
+                queued_bytes += record.len();
+                self.schedule_warm_recipe(id, record.into());
             }
         }
         log(&format!(
@@ -7388,6 +7439,10 @@ impl Gpu {
         log(&format!(
             "pipeline cache: {} recipes to build during loading",
             self.warm.len()
+        ));
+        log(&format!(
+            "pipeline recipe queue: {} bytes of compact records",
+            queued_bytes
         ));
         if *SHADER_AWARE_WARMUP {
             log(&format!(
@@ -7404,7 +7459,10 @@ impl Gpu {
             let Some((id, r)) = self.warm.pop_front() else {
                 break;
             };
-            if self.warm_one(&r, id).is_some() {
+            let Ok(recipe) = serde_json::from_str::<serde_json::Value>(&r) else {
+                continue;
+            };
+            if self.warm_one(&recipe, id).is_some() {
                 self.warmed += 1;
             }
         }

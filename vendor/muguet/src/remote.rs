@@ -422,6 +422,21 @@ mod tests {
     }
 
     #[test]
+    fn newest_hot_block_needs_no_lru_mutation() {
+        let mut cache = Hot::new(4);
+        cache.insert("a".into(), Arc::new(vec![1, 2]));
+        cache.insert("b".into(), Arc::new(vec![3, 4]));
+        let before = cache.clock;
+        assert_eq!(&cache.get("b").unwrap()[..], &[3, 4]);
+        assert_eq!(cache.clock, before);
+        cache.get("a").unwrap();
+        assert_eq!(cache.clock, before + 1);
+        cache.insert("c".into(), Arc::new(vec![5, 6]));
+        assert!(cache.get("b").is_none());
+        assert_eq!(cache.bytes, 4);
+    }
+
+    #[test]
     fn recently_loaded_hints_are_coalesced_without_permanently_suppressing_retries() {
         let now = std::time::Instant::now();
         assert!(!hint_recently_satisfied(None, now));
@@ -457,6 +472,10 @@ static HINTS_LOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 static HINTS_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HINTS_DUPLICATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DISK_LOOKUP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DISK_COALESCED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DISK_READ_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DISK_SINGLEFLIGHT: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("WGR_DISK_SINGLEFLIGHT").as_deref() == Ok("1"));
 static DISK_STORE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static NETWORK_FETCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn metrics() -> Value {
@@ -485,6 +504,7 @@ pub fn metrics() -> Value {
         "live_io_active":LIVE_IO_ACTIVE.load(Relaxed),"hot_cache_bytes":hot_bytes,
         "hot_cache_entries":hot_entries,"hot_cache_capacity_bytes":hot_capacity_bytes,
         "disk_lookup_ms":DISK_LOOKUP_NS.load(Relaxed)/1_000_000,
+        "disk_coalesced_reads":DISK_COALESCED.load(Relaxed),"disk_verified_payload_bytes":DISK_READ_BYTES.load(Relaxed),
         "disk_db_wait_ms":cache_db_wait_ms,"disk_verify_ms":cache_verify_ms,
         "disk_lru_batches":cache_lru_batches,"disk_lru_entries":cache_lru_entries,
         "disk_store_ms":DISK_STORE_NS.load(Relaxed)/1_000_000,
@@ -542,6 +562,10 @@ impl Hot {
             .entries
             .get_key_value(key)
             .map(|(owned_key, (data, age))| (owned_key.clone(), data.clone(), *age))?;
+        // Repeated reads of the newest block do not change exact LRU order.
+        if old_age == self.clock {
+            return Some(data);
+        }
         self.oldest.remove(&old_age);
         self.clock = self.clock.saturating_add(1);
         if let Some((_, age)) = self.entries.get_mut(key) {
@@ -580,6 +604,7 @@ struct Assets {
     cache: RwLock<DiskCache>,
     hot: Mutex<Hot>,
     locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    disk_reads: [Mutex<()>; 256],
     prefetching: Mutex<HashSet<String>>,
     hinting: Mutex<HashMap<String, bool>>,
     recent_hints: Mutex<HashMap<String, std::time::Instant>>,
@@ -693,6 +718,7 @@ pub fn prepare(support: &Path) -> Result<Option<PathBuf>> {
         )?),
         hot: Mutex::new(Hot::new(hot_budget())),
         locks: Mutex::new(HashMap::new()),
+        disk_reads: std::array::from_fn(|_| Mutex::new(())),
         prefetching: Mutex::new(HashSet::new()),
         hinting: Mutex::new(HashMap::new()),
         recent_hints: Mutex::new(HashMap::new()),
@@ -1093,6 +1119,24 @@ impl Assets {
             HOT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(Some(data));
         }
+        // Only disk misses acquire a stripe, never network fetches. A reader
+        // sharing a key can reuse the already verified immutable Arc rather
+        // than allocate, read and hash the same block again. Stripe collisions
+        // may serialize unrelated reads, so measure before enabling by default.
+        let _read_guard = if *DISK_SINGLEFLIGHT {
+            use std::hash::{Hash, Hasher};
+            let mut h = rustc_hash::FxHasher::default();
+            key.hash(&mut h);
+            let guard = self.disk_reads[(h.finish() as usize) & 255].lock().unwrap();
+            if let Some(data) = self.hot(key) {
+                HOT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                DISK_COALESCED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(Some(data));
+            }
+            Some(guard)
+        } else {
+            None
+        };
         let cache = self.cache.read().unwrap();
         let disk_started = std::time::Instant::now();
         let result = cache.read(key, 8 << 20);
@@ -1104,6 +1148,7 @@ impl Assets {
         );
         if let Some(bytes) = result? {
             DISK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            DISK_READ_BYTES.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let data = Arc::new(bytes);
             self.remember(key.to_string(), data.clone());
             return Ok(Some(data));
